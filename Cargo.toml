@@ -1,0 +1,111 @@
+# tobro workspace
+#
+# Member crates are added as M0 progresses:
+#   crates/tobro-ipc, crates/tobro-tor, crates/tobrod, crates/tobroctl,
+#   apps/desktop
+#
+# Dependency versions are declared here so every crate uses the same
+# versions and feature sets. Arti and its companion crates are pinned
+# exactly: Arti is pre-1.0 and its APIs still move between releases.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/tobro-ipc",
+    "crates/tobro-tor",
+    "crates/tobrod",
+    "crates/tobroctl",
+    "apps/desktop",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+# --- Tor / Arti -----------------------------------------------------------
+# `experimental-api` exposes the proxy/DNS server APIs we need.
+arti = { version = "=2.8.0", features = ["experimental-api", "http-connect"] }
+arti-client = "=0.48.0"
+tor-config = "=0.48.0"
+tor-rtcompat = { version = "=0.48.0", features = ["tokio", "native-tls"] }
+
+# --- Async runtime --------------------------------------------------------
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+    "process",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- Serialization / config ----------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# --- Errors / logging -----------------------------------------------------
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# --- CLI / paths / time ---------------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# --- Storage / secrets ----------------------------------------------------
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+keyring = "4"
+zeroize = "1"
+
+# --- HTTP (Moat, bridge data, updates) -----------------------------------
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "socks",
+] }
+
+# --- Desktop shell --------------------------------------------------------
+tauri = "2"
+tauri-build = "2"
+
+# --- Dev / test -----------------------------------------------------------
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+insta = "1"
+wiremock = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+# Dependencies (especially Arti's crypto) are painfully slow in a pure
+# debug build. Build them with light optimization while keeping our own
+# crates debuggable.
+[profile.dev.package."*"]
+opt-level = 1

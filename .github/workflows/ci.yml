@@ -1,0 +1,58 @@
+# CI per M0 deliverable: lint/format/test on macOS/Windows/Linux.
+#
+# The toolchain (1.92, with rustfmt and clippy) is pinned in
+# rust-toolchain.toml; rustup installs it automatically, and
+# Swatinem/rust-cache caches against it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+
+  build:
+    name: clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # System deps for the Tauri desktop app (webkit2gtk etc.). Needed once
+      # the M0 window spike depends on tauri; kept here so the same matrix
+      # keeps passing without CI edits.
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Workspace lints are `warn`; -D warnings turns them into hard
+      # failures so the CI bar matches the lint config in Cargo.toml.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
