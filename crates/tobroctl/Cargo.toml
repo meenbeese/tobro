@@ -9,5 +9,11 @@ publish.workspace = true
 [dependencies]
 tobro-ipc = { path = "../tobro-ipc" }
 
+anyhow = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
 [lints]
 workspace = true

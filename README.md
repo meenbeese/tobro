@@ -2,8 +2,8 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0 spike in progress. Arti bootstrap/listeners are implemented;
-IPC and the Tauri shell are next.
+**Status:** M0 spike in progress. Arti bootstrap/listeners and the local IPC
+socket/client are implemented; the Tauri window, ADRs, and benchmarks are next.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -26,6 +26,20 @@ page through Tor, starts SOCKS/HTTP on `9050` and DNS on `9053`, then fetches a
 page through the local SOCKS listener. Drop `--exit-after-check` to keep
 serving until Ctrl-C. Use `--state-dir` and `--cache-dir` to keep Arti state
 inside the checkout instead of the platform data directory.
+
+## Try the IPC endpoint
+
+```sh
+# terminal 1: bootstrap, then serve SOCKS/HTTP + DNS and the IPC socket
+cargo run -p tobrod -- spike
+
+# terminal 2
+cargo run -p tobroctl -- status   # JSON snapshot (handshake + daemon.status)
+cargo run -p tobroctl -- watch    # stream bootstrap.progress / state changes
+```
+
+The socket defaults to `<platform data dir>/tobro/state/tobrod.sock`. Pass
+`--socket <path>` to both commands when using a custom `--state-dir`.
 
 ## License
 

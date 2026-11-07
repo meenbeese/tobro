@@ -719,6 +719,13 @@ system.proxy_changed
 
 The Tauri layer exposes thin commands that call the same IPC client; the React app uses TanStack Query for request/response and a typed event subscription for pushes. No business logic in the UI beyond presentation and validation.
 
+> **M0 implementation (verified 2026-11-07):** length-prefixed JSON frames
+> (4-byte big-endian, 1 MiB cap) over a Unix socket at
+> `<state-dir>/tobrod.sock`. `daemon.hello`, `daemon.status`,
+> `bootstrap.progress`, and `daemon.state_changed` are implemented in
+> `tobro-ipc`/`tobrod`; `tobroctl status|watch` are the reference clients.
+> Windows named pipes, peer-credential auth, and the full method list remain.
+
 ### 5.7 Configuration and reconfiguration flow
 
 1. UI sends a **patch**, not a whole config.

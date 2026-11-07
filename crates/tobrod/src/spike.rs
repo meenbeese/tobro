@@ -10,11 +10,15 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Args;
 use serde::Serialize;
+#[cfg(unix)]
+use tobro_ipc::DaemonState;
 use tobro_tor::{Tor, parse_http_status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -50,6 +54,11 @@ pub struct SpikeArgs {
     /// Timeout for bootstrapping and for the SOCKS listener check.
     #[arg(long, default_value_t = 180)]
     pub timeout_secs: u64,
+
+    /// IPC socket path (defaults to `<state-dir>/tobrod.sock`).
+    #[cfg(unix)]
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +82,8 @@ enum Event {
     Serving {
         socks_http: String,
         dns: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ipc_socket: Option<String>,
     },
     SocksCheck {
         target: String,
@@ -87,11 +98,46 @@ enum Event {
 
 /// Run the spike until the listener is shut down with Ctrl-C.
 pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> anyhow::Result<()> {
+    // Start IPC first so clients can watch bootstrap progress.
+    #[cfg(unix)]
+    let hub = crate::ipc::Hub::new(args.socks_port, args.dns_port);
+
+    #[cfg(unix)]
+    let socket_path = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| tobro_ipc::socket_path(&state_dir));
+
+    #[cfg(unix)]
+    match tobro_ipc::Server::bind(&socket_path).await {
+        Ok(server) => {
+            let hub = Arc::clone(&hub);
+            tokio::spawn(async move {
+                if let Err(error) = crate::ipc::serve(server, hub).await {
+                    eprintln!("tobrod: IPC server stopped: {error:#}");
+                }
+            });
+        }
+        Err(error) => {
+            eprintln!(
+                "tobrod: could not start IPC on {}: {error}",
+                socket_path.display()
+            );
+        }
+    }
+
     let tor = Tor::create(&state_dir, &cache_dir)
         .await
         .context("could not create the Arti client")?;
 
     let bootstrap = tor.bootstrap(|event| {
+        #[cfg(unix)]
+        hub.report_bootstrap(
+            event.percent,
+            event.ready,
+            event.blocked.clone(),
+            event.detail.clone(),
+        );
         emit(&Event::Bootstrap {
             percent: event.percent,
             ready: event.ready,
@@ -124,10 +170,19 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
     // observer first. The consensus stays cached on disk for a fast rebootstrap.
     drop(tor);
 
+    #[cfg(unix)]
+    hub.set_state(DaemonState::Serving);
+
+    #[cfg(unix)]
+    let ipc_socket = Some(socket_path.display().to_string());
+    #[cfg(not(unix))]
+    let ipc_socket = None;
+
     let socks_addr = SocketAddr::from(([127, 0, 0, 1], args.socks_port));
     emit(&Event::Serving {
         socks_http: socks_addr.to_string(),
         dns: SocketAddr::from(([127, 0, 0, 1], args.dns_port)).to_string(),
+        ipc_socket,
     });
 
     let check = if args.no_check {

@@ -6,6 +6,9 @@
 
 mod spike;
 
+#[cfg(unix)]
+mod ipc;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;

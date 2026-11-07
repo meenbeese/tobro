@@ -36,6 +36,9 @@ use tor_config::{ConfigurationSources, ConfigurationTree, Listen};
 use tor_rtcompat::PreferredRuntime;
 use tracing::debug;
 
+/// Arti release this crate is built against; keep in sync with the workspace pin.
+pub const ARTI_VERSION: &str = "2.8.0";
+
 /// Default local SOCKS/HTTP CONNECT port (Orbot-compatible).
 pub const DEFAULT_SOCKS_PORT: u16 = 9050;
 
@@ -136,8 +139,17 @@ impl Tor {
                 biased;
                 result = &mut bootstrap => {
                     result.context("Arti bootstrap failed")?;
-                    // Report the authoritative final status, not our last guess.
-                    on_event(BootstrapEvent::from_status(&self.client.bootstrap_status()));
+                    // Bootstrap success means the client can carry traffic, but
+                    // the status snapshot can lag by one update. Report the
+                    // authoritative outcome, not a stale percentage.
+                    let mut event = BootstrapEvent::from_status(&self.client.bootstrap_status());
+                    if !event.ready {
+                        event.detail = "bootstrap complete".to_owned();
+                    }
+                    event.percent = 100;
+                    event.ready = true;
+                    event.blocked = None;
+                    on_event(event);
                     return Ok(started.elapsed());
                 }
                 maybe = events.next(), if events_open => {

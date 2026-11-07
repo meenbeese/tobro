@@ -4136,6 +4136,16 @@ version = "0.0.0"
 [[package]]
 name = "tobro-ipc"
 version = "0.0.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "tobro-tor"
@@ -4156,7 +4166,12 @@ dependencies = [
 name = "tobroctl"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "directories",
+ "serde_json",
  "tobro-ipc",
+ "tokio",
 ]
 
 [[package]]
@@ -4166,6 +4181,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "futures",
  "serde",
  "serde_json",
  "tobro-ipc",
@@ -4212,6 +4228,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
