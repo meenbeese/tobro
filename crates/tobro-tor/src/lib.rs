@@ -1,9 +1,283 @@
-//! Arti integration boundary.
+//! Arti integration boundary for tobro.
 //!
-//! M0 scaffold: `TorClient` construction, bootstrap events, proxy listeners,
-//! and configuration mapping live here next.
+//! This is the M0 feasibility spike: it bootstraps a [`TorClient`], streams
+//! bootstrap progress, verifies a request over Tor, and hosts Arti's
+//! SOCKS/HTTP and DNS listeners.
+//!
+//! # M0 finding: where listeners live
+//!
+//! Arti 2.8.0 exposes `bind_proxy`/`run_proxy_with_listeners` and the DNS
+//! `bind_dns_resolver`, but not the methods that actually *run* a bound
+//! listener (`StreamProxy::run_proxy`, `DnsProxy::run_dns_proxy` are
+//! `pub(crate)`). The only supported way to host SOCKS + HTTP CONNECT + DNS
+//! from a library is [`arti::run_proxy`], which owns the `TorClient` it serves.
+//!
+//! That is why [`Tor`] (bootstrap events, connectivity checks) and [`serve`]
+//! (long-running listeners) are separate phases: a `TorClient` holds an
+//! exclusive lock on its state directory, so the observation client must be
+//! dropped before the serving client is created.
 
-/// Crate version from `Cargo.toml`.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+#![forbid(unsafe_code)]
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Context as _;
+use arti::proxy::ListenProtocols;
+use arti_client::config::{CfgPath, TorClientConfig, TorClientConfigBuilder};
+use arti_client::status::BootstrapStatus;
+use arti_client::{BootstrapBehavior, TorClient};
+use futures::StreamExt as _;
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+use serde::Serialize;
+use tokio::time::timeout;
+use tor_config::{ConfigurationSources, ConfigurationTree, Listen};
+use tor_rtcompat::PreferredRuntime;
+use tracing::debug;
+
+/// Default local SOCKS/HTTP CONNECT port (Orbot-compatible).
+pub const DEFAULT_SOCKS_PORT: u16 = 9050;
+
+/// Default local DNS proxy port (Orbot-compatible).
+pub const DEFAULT_DNS_PORT: u16 = 9053;
+
+/// The concrete Arti client type used by tobro.
+pub type Client = TorClient<PreferredRuntime>;
+
+/// One bootstrap progress notification.
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapEvent {
+    /// Rough progress from 0 to 100.
+    pub percent: u8,
+    /// True once the client can carry traffic.
+    pub ready: bool,
+    /// Set when Arti believes it is stuck, with Arti's explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
+    /// Human-readable status, including connection and directory detail.
+    pub detail: String,
+}
+
+impl BootstrapEvent {
+    fn from_status(status: &BootstrapStatus) -> Self {
+        let percent = (status.as_frac() * 100.0).round().clamp(0.0, 100.0) as u8;
+        Self {
+            percent: if status.ready_for_traffic() {
+                100
+            } else {
+                percent
+            },
+            ready: status.ready_for_traffic(),
+            blocked: status.blocked().map(|b| b.message().to_string()),
+            detail: status.to_string(),
+        }
+    }
+}
+
+/// Result of requesting a URL through the Tor network.
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpCheck {
+    /// Host and port that were contacted.
+    pub target: String,
+    /// HTTP status code from the first response line.
+    pub status: u16,
+    /// Wall-clock time for connect, request, and response.
+    pub elapsed_ms: u64,
+}
+
+/// A bootstrapped (or bootstrapping) Arti client, plus progress reporting.
+pub struct Tor {
+    client: Arc<Client>,
+}
+
+impl std::fmt::Debug for Tor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tor").finish_non_exhaustive()
+    }
+}
+
+impl Tor {
+    /// Create an unbootstrapped client with tobro-controlled state directories.
+    pub async fn create(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<Self> {
+        let config = client_config(state_dir, cache_dir)?;
+        let client = Client::builder()
+            .config(config)
+            .bootstrap_behavior(BootstrapBehavior::Manual)
+            .create_unbootstrapped_async()
+            .await?;
+        Ok(Self { client })
+    }
+
+    /// The underlying Arti client handle.
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
+    }
+
+    /// Bootstrap, invoking `on_event` whenever progress changes.
+    ///
+    /// Returns how long bootstrapping took once the client is usable.
+    pub async fn bootstrap<F>(&self, mut on_event: F) -> anyhow::Result<Duration>
+    where
+        F: FnMut(BootstrapEvent),
+    {
+        let started = Instant::now();
+        let mut events = self.client.bootstrap_events();
+        let bootstrap = self.client.bootstrap();
+        tokio::pin!(bootstrap);
+
+        let mut last: Option<(u8, Option<String>)> = None;
+        let mut events_open = true;
+
+        loop {
+            tokio::select! {
+                // Poll the bootstrap future first so the initial "waiting to
+                // be told to bootstrap" status is not reported as a problem.
+                biased;
+                result = &mut bootstrap => {
+                    result.context("Arti bootstrap failed")?;
+                    // Report the authoritative final status, not our last guess.
+                    on_event(BootstrapEvent::from_status(&self.client.bootstrap_status()));
+                    return Ok(started.elapsed());
+                }
+                maybe = events.next(), if events_open => {
+                    match maybe {
+                        Some(status) => {
+                            let event = BootstrapEvent::from_status(&status);
+                            let key = (event.percent, event.blocked.clone());
+                            if last.as_ref() != Some(&key) {
+                                on_event(event);
+                                last = Some(key);
+                            }
+                        }
+                        // The status stream ends only when the client is dropped.
+                        None => events_open = false,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Request `/` from `host:port` through Tor and return the HTTP status.
+    ///
+    /// This deliberately speaks raw HTTP/1.0 over the Tor stream so the spike
+    /// needs no TLS or HTTP stack of its own.
+    pub async fn check_http(
+        &self,
+        host: &str,
+        port: u16,
+        limit: Duration,
+    ) -> anyhow::Result<HttpCheck> {
+        let target = format!("{host}:{port}");
+        let started = Instant::now();
+
+        let mut stream = timeout(limit, self.client.connect((host, port)))
+            .await
+            .with_context(|| format!("timed out connecting to {target}"))??;
+
+        let request = format!("GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        timeout(limit, async {
+            stream.write_all(request.as_bytes()).await?;
+            stream.flush().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .with_context(|| format!("timed out sending request to {target}"))??;
+
+        let mut response = Vec::new();
+        timeout(
+            limit,
+            (&mut stream).take(64 * 1024).read_to_end(&mut response),
+        )
+        .await
+        .with_context(|| format!("timed out reading response from {target}"))??;
+
+        let status = parse_http_status(&response)
+            .with_context(|| format!("no HTTP status line in response from {target}"))?;
+
+        debug!(%target, status, "request over Tor succeeded");
+
+        Ok(HttpCheck {
+            target,
+            status,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// Host Arti's SOCKS + HTTP CONNECT and DNS listeners until shutdown.
+///
+/// `state_dir` and `cache_dir` must be the same directories the observing
+/// [`Tor`] client used; Arti caches the network consensus there, so the
+/// serving client bootstraps from disk instead of re-downloading.
+pub async fn serve(
+    state_dir: &Path,
+    cache_dir: &Path,
+    socks_port: u16,
+    dns_port: u16,
+) -> anyhow::Result<()> {
+    let config = client_config(state_dir, cache_dir)?;
+
+    // `arti::run_proxy` would otherwise write its port-info file into the
+    // standalone Arti application's data directory. Keep it with tobro state.
+    let mut arti_config = arti::ArtiConfigBuilder::default();
+    arti_config
+        .storage()
+        .port_info_file(CfgPath::new_literal(state_dir.join("port_info.json")));
+    let arti_config = arti_config.build()?;
+
+    let runtime = PreferredRuntime::current()?;
+
+    arti::run_proxy(
+        runtime,
+        Listen::new_localhost(socks_port),
+        Listen::new_localhost(dns_port),
+        ListenProtocols::SocksAndHttpConnect,
+        ConfigurationSources::new_empty(),
+        ConfigurationTree::default(),
+        arti_config,
+        config,
+    )
+    .await
+}
+
+fn client_config(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<TorClientConfig> {
+    let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir).build()?;
+
+    // Arti refuses state/cache directories that are accessible to other users.
+    // `make_directory` creates them with 0700 (Unix) and verifies the result.
+    let mistrust = config.fs_mistrust().clone();
+    mistrust.make_directory(state_dir)?;
+    mistrust.make_directory(cache_dir)?;
+
+    Ok(config)
+}
+
+/// Extract the status code from the first line of an HTTP response.
+pub fn parse_http_status(response: &[u8]) -> Option<u16> {
+    let line = response.split(|&b| b == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?.trim_end();
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_http_status;
+
+    #[test]
+    fn parses_http_status_lines() {
+        assert_eq!(parse_http_status(b"HTTP/1.0 200 OK\r\n\r\n"), Some(200));
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 301 Moved\r\nLocation: /x\r\n"),
+            Some(301)
+        );
+        assert_eq!(parse_http_status(b"garbage\r\n"), None);
+        assert_eq!(parse_http_status(b"HTTP/1.0 nope\r\n"), None);
+        assert_eq!(parse_http_status(b""), None);
+    }
 }

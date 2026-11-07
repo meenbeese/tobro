@@ -1590,8 +1590,27 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 - **Onion services:** `create_onion_service`, `launch_onion_service`, `launch_onion_service_with_hsid`; restricted discovery via `generate_service_discovery_key`/`insert_service_discovery_key`/`rotate_service_discovery_key`; `KeyMgr` for client keys. APIs are evolving; wrap them.
 - **Bridges/PTs:** `BridgesConfig` (bridges, enabled, transports) and `pt-client`; `TransportConfig` describes the sidecar command/args. Verify the exact PT manager API on 0.48 during M0.
 - **Outbound proxy:** `ChannelConfig::outbound_proxy` exposes `ProxyProtocol`; confirm supported schemes (HTTP CONNECT/SOCKS) and auth in M3. Shadowsocks via a local SOCKS5 sidecar.
-- **DNS:** Arti's DNS proxy supports UDP and TCP; use it for `.onion` and optional DNS routing. Do not claim system-wide DNS protection in proxy mode.
+- **DNS (verified 2026-11-07):** Arti's DNS proxy is UDP-only — `bind_dns_resolver` binds UDP sockets and no TCP listener, despite the docs. Use it for `.onion` and optional DNS routing; the first query after startup can take several seconds while a circuit is built. Do not claim system-wide DNS protection in proxy mode.
 - **Failure mode:** Arti may call `exit(1)` on an obsolete consensus; the daemon must supervise and restart, not assume a clean error.
+- **Listener APIs (verified against 2.8.0 on 2026-11-07):** `bind_proxy`,
+  `run_proxy_with_listeners`, and `bind_dns_resolver` become public with
+  `experimental-api`, but `StreamProxy::run_proxy` and `DnsProxy::run_dns_proxy`
+  stay `pub(crate)`. Serving SOCKS + HTTP CONNECT + DNS from a library requires
+  `arti::run_proxy`, which owns the client it serves. A client holds an
+  exclusive lock on its state directory, so an observer client must be dropped
+  before the serving client starts. `run_proxy` also reconfigures its client
+  from the supplied config sources at startup, so any non-default
+  `TorClientConfig` (bridges, exit country, ports) must be supplied through
+  those sources or it will be reset to defaults. Either upstream a visibility
+  fix, feed `run_proxy` matching config, or build M1's listener ownership
+  around `run_proxy_with_listeners` plus a DNS solution.
+- **HTTP CONNECT (verified 2026-11-07):** HTTP CONNECT shares the SOCKS
+  listener and is protocol-sniffed (`ListenProtocols::SocksAndHttpConnect`);
+  there is no HTTP-only listener. Orbot's separate `9050`/`8118` split needs an
+  explicit port-policy decision: one combined port, or a second listener that
+  also accepts SOCKS. Plain `GET http://...` is not supported as a proxy
+  request; clients must use CONNECT (curl needs `--proxytunnel` for `http://`).
+
 - **RPC:** `arti-rpcserver` exists but is not a C Tor control port; do not build compatibility shims that imply `GETINFO`/`SIGNAL` support.
 - **Relay:** not supported for 1.0; do not expose relay settings.
 

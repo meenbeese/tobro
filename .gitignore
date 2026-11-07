@@ -28,3 +28,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Local build/dev state
+.cargo-home/
+.tobro-dev/

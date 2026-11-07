@@ -10,5 +10,14 @@ publish.workspace = true
 tobro-ipc = { path = "../tobro-ipc" }
 tobro-tor = { path = "../tobro-tor" }
 
+anyhow = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true
