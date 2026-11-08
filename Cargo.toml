@@ -30,7 +30,7 @@ publish = false
 [workspace.dependencies]
 # --- Tor / Arti -----------------------------------------------------------
 # `experimental-api` exposes the proxy/DNS server APIs we need.
-arti = { version = "=2.8.0", features = ["experimental-api", "http-connect"] }
+arti = { version = "=2.8.0", features = ["experimental-api", "http-connect", "dns-proxy"] }
 arti-client = "=0.48.0"
 tor-config = "=0.48.0"
 tor-rtcompat = { version = "=0.48.0", features = ["tokio", "native-tls"] }
@@ -46,7 +46,7 @@ tokio = { version = "1.54", features = [
     "signal",
     "process",
 ] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "compat"] }
 futures = "0.3"
 async-trait = "0.1"
 

@@ -19,7 +19,31 @@ use tokio::sync::{broadcast, watch};
 
 use crate::{BootstrapEvent, Tor};
 
-/// Listener configuration for the local proxies.
+/// Stream isolation policy (F-42/F-43).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamIsolationPolicy {
+    /// Isolate by destination address.
+    pub isolate_destination: bool,
+    /// Isolate by destination port.
+    pub isolate_port: bool,
+    /// Isolate by client protocol (SOCKS vs HTTP CONNECT).
+    pub isolate_protocol: bool,
+    /// SOCKS auth keep-alive isolation: treat SOCKS auth as a persistent
+    /// isolation key (Arti natively isolates by provided auth; this keeps the
+    /// policy explicit).
+    pub keep_alive_isolation: bool,
+}
+
+impl StreamIsolationPolicy {
+    /// True when destination/port isolation requires tobro's thin proxy
+    /// front-end behavior beyond Arti's built-in auth/header isolation.
+    pub fn needs_frontend(self) -> bool {
+        self.isolate_destination || self.isolate_port
+    }
+}
+
+/// Listener and proxy behavior configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerConfig {
     /// SOCKS5 port (also carries HTTP CONNECT while listeners are combined).
@@ -31,6 +55,9 @@ pub struct ListenerConfig {
     /// Bind listeners on all interfaces instead of loopback only (opt-in).
     #[serde(default)]
     pub bind_all_interfaces: bool,
+    /// Stream isolation policy (F-42/F-43).
+    #[serde(default)]
+    pub stream_isolation: StreamIsolationPolicy,
 }
 
 impl Default for ListenerConfig {
@@ -40,6 +67,7 @@ impl Default for ListenerConfig {
             http_port: crate::DEFAULT_HTTP_PORT,
             dns_port: crate::DEFAULT_DNS_PORT,
             bind_all_interfaces: false,
+            stream_isolation: StreamIsolationPolicy::default(),
         }
     }
 }
@@ -155,6 +183,7 @@ impl PreparedService {
             self.listeners.socks_port,
             self.listeners.dns_port,
             self.listeners.bind_all_interfaces,
+            self.listeners.stream_isolation,
         );
         tokio::pin!(serve);
 

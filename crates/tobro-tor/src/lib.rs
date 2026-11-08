@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod isolation;
+pub mod proxy;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -225,22 +227,39 @@ impl Tor {
     }
 }
 
-/// Host Arti's SOCKS + HTTP CONNECT and DNS listeners until shutdown.
+/// Host local SOCKS/HTTP CONNECT and DNS listeners until shutdown.
 ///
 /// `state_dir` and `cache_dir` must be the same directories the observing
-/// [`Tor`] client used; Arti caches the network consensus there, so the
-/// serving client bootstraps from disk instead of re-downloading.
+/// [`Tor`] client used; Arti caches the network consensus there, so a serving
+/// client can bootstrap from disk/state.
 ///
-/// When `bind_all_interfaces` is true, listeners bind to `0.0.0.0` (opt-in;
-/// exposes proxies to reachable networks and requires firewall care).
+/// When `bind_all_interfaces` is true, listeners bind to `0.0.0.0` (opt-in).
+///
+/// If `stream_isolation` requires destination/port isolation (F-42), a thin
+/// proxy front-end applies isolation keys per stream and DNS is served via
+/// `arti::dns`. Otherwise, Arti's built-in `run_proxy` path is used.
 pub async fn serve(
     state_dir: &Path,
     cache_dir: &Path,
     socks_port: u16,
     dns_port: u16,
     bind_all_interfaces: bool,
+    stream_isolation: adapter::StreamIsolationPolicy,
 ) -> anyhow::Result<()> {
     let config = client_config(state_dir, cache_dir)?;
+
+    if stream_isolation.needs_frontend() {
+        return serve_with_isolation(
+            state_dir,
+            cache_dir,
+            config,
+            socks_port,
+            dns_port,
+            bind_all_interfaces,
+            stream_isolation,
+        )
+        .await;
+    }
 
     // `arti::run_proxy` would otherwise write its port-info file into the
     // standalone Arti application's data directory. Keep it with tobro state.
@@ -263,6 +282,71 @@ pub async fn serve(
         config,
     )
     .await
+}
+
+async fn serve_with_isolation(
+    state_dir: &Path,
+    _cache_dir: &Path,
+    config: TorClientConfig,
+    socks_port: u16,
+    dns_port: u16,
+    bind_all_interfaces: bool,
+    stream_isolation: adapter::StreamIsolationPolicy,
+) -> anyhow::Result<()> {
+    // Reserve an ephemeral localhost port for the backend arti::run_proxy
+    // SOCKS/HTTP listener. Our isolation front-end binds the user-facing port
+    // and forwards with isolation injection; arti handles DNS and the actual
+    // Tor proxying on the backend port. This preserves a single Arti client and
+    // state lock.
+    let backend_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("could not reserve backend proxy port")?;
+    let backend_socks_port = backend_listener.local_addr()?.port();
+    drop(backend_listener);
+
+    let mut arti_config = arti::ArtiConfigBuilder::default();
+    arti_config
+        .storage()
+        .port_info_file(CfgPath::new_literal(state_dir.join("port_info.json")));
+    let arti_config = arti_config.build()?;
+    let runtime = PreferredRuntime::current()?;
+
+    let backend = arti::run_proxy(
+        runtime,
+        Listen::new_localhost(backend_socks_port),
+        listen_for_port(dns_port, bind_all_interfaces)?,
+        ListenProtocols::SocksAndHttpConnect,
+        ConfigurationSources::new_empty(),
+        ConfigurationTree::default(),
+        arti_config,
+        config,
+    );
+    tokio::pin!(backend);
+
+    let bind_ip = if bind_all_interfaces {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let frontend = proxy::run_isolation_frontend(
+        stream_isolation,
+        std::net::SocketAddr::new(bind_ip, socks_port),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), backend_socks_port),
+        shutdown_rx,
+    );
+    tokio::pin!(frontend);
+
+    tokio::select! {
+        biased;
+        res = &mut frontend => {
+            let _ = shutdown_tx.send(());
+            res.context("isolation front-end failed")
+        }
+        res = &mut backend => {
+            let _ = shutdown_tx.send(());
+            res.context("backend Tor proxy failed")
+        }
+    }
 }
 
 fn listen_for_port(port: u16, bind_all_interfaces: bool) -> anyhow::Result<Listen> {

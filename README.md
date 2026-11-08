@@ -24,15 +24,20 @@ config API (`config.get`/`config.validate`/`config.apply`, redacted/no secrets,
 patch-based, deny-unknown-fields preserved), `tobroctl config get|validate|apply`,
 supported node-restrictions/unsupported-knob UX (supported subset documented in
 UI; known unsupported config knobs rejected explicitly, never silently ignored),
+stream isolation (F-42/F-43): configurable `[stream]` policy for
+destination/port/protocol isolation and SOCKS auth keep-alive isolation;
+destination/port isolation is applied by a thin isolation pre-proxy that
+injects Arti-compatible SOCKS auth / HTTP `Tor-Stream-Isolation` tokens, while
+SOCKS auth isolation remains native to Arti,
 desktop Advanced Settings behind a power-user gate with listener/bind-all
 editing and config import/export (no secrets), and a standalone log viewer
 (filters, copy/save, wrap, persisted redaction preference) plus daemon/UI
 redaction hardening.
 
-M2 still open: exit country/IPv6/`StreamPrefs`, stream isolation, and
-runtime/cross-OS verification for M2 exit criteria (new identity, port
-conflicts, bind-all exposure, opt-in `.onion` resolution on a live Tor network,
-and feature tests for every exposed knob).
+M2 still open: exit country/IPv6/`StreamPrefs` defaults, and runtime/cross-OS
+verification for M2 exit criteria (new identity, port conflicts, bind-all
+exposure, stream isolation behavior, opt-in `.onion` resolution on a live Tor
+network, and feature tests for every exposed knob).
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 

@@ -58,6 +58,8 @@ pub struct Config {
     pub general: GeneralConfig,
     /// Local proxy listener settings.
     pub proxy: ProxyConfig,
+    /// Stream isolation and behavior settings (F-42/F-43).
+    pub stream: StreamConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -68,7 +70,64 @@ impl Default for Config {
             version: 1,
             general: GeneralConfig::default(),
             proxy: ProxyConfig::default(),
+            stream: StreamConfig::default(),
             logging: LoggingConfig::default(),
+        }
+    }
+}
+
+/// Stream isolation and behavior settings.
+///
+/// These control how local proxy streams are isolated onto Tor circuits.
+/// All flags default to off (matching Orbot's defaults).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamConfig {
+    /// Isolate streams by destination address (F-42). Streams to different
+    /// destination hosts/IPs do not share circuits when enabled.
+    pub isolate_destination: bool,
+    /// Isolate streams by destination port (F-42).
+    pub isolate_port: bool,
+    /// Isolate streams by client protocol (F-42). Arti's built-in proxy
+    /// already separates HTTP CONNECT and SOCKS isolation contexts; this flag
+    /// makes protocol separation explicit in tobro's isolation policy and is
+    /// applied by the thin proxy front-end when destination/port isolation is
+    /// active.
+    pub isolate_protocol: bool,
+    /// SOCKS auth keep-alive isolation (F-43). When enabled, SOCKS
+    /// username/password credentials are treated as an isolation key and kept
+    /// associated for the stream's lifetime. Arti's built-in SOCKS proxy
+    /// isolates by SOCKS auth when different credentials are provided; this
+    /// setting makes that behavior explicit in config and diagnostics.
+    pub keep_alive_isolation: bool,
+}
+
+impl StreamConfig {
+    /// True if any destination/port isolation flag requires the thin proxy
+    /// front-end (beyond Arti's built-in SOCKS auth/header isolation).
+    pub fn needs_isolation_frontend(&self) -> bool {
+        self.isolate_destination || self.isolate_port
+    }
+
+    /// Human-readable summary of effective isolation behavior.
+    pub fn isolation_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.isolate_destination {
+            parts.push("destination");
+        }
+        if self.isolate_port {
+            parts.push("port");
+        }
+        if self.isolate_protocol {
+            parts.push("protocol");
+        }
+        if self.keep_alive_isolation {
+            parts.push("SOCKS auth keep-alive");
+        }
+        if parts.is_empty() {
+            "off (Arti default isolation: SOCKS auth/HTTP headers when provided)".to_owned()
+        } else {
+            format!("on ({})", parts.join(", "))
         }
     }
 }
@@ -464,14 +523,6 @@ pub fn unsupported_knob_error(path: &str) -> Option<String> {
                 "C Tor-style node restriction lists (entry/exit/exclude/strict nodes) are not exposed by the pinned Arti 2.8/arti-client 0.48 APIs used by tobro. The supported subset is currently none for these knobs; unsupported options remain hidden.",
             )
         }
-        "stream"
-        | "stream.isolation"
-        | "stream.destination_isolation"
-        | "stream.port_isolation"
-        | "stream.protocol_isolation" => (
-            path,
-            "stream isolation controls are not exposed yet (M2 open). Arti supports StreamPrefs isolation primitives, but tobro has not wired this setting.",
-        ),
         "bridges" | "bridges.enabled" | "bridges.lines" | "transports" => (
             path,
             "bridge/pluggable-transport configuration is not exposed yet (M3 planned).",
@@ -528,9 +579,9 @@ pub fn check_unsupported_knobs(patch: &serde_json::Value) -> Result<(), String> 
     }
 }
 
-/// Human-readable summary of node restriction support (for UI/diagnostics).
+/// Human-readable summary of node restriction and stream/network support (for UI/diagnostics).
 pub fn node_restrictions_support_summary() -> &'static str {
-    "Supported node restrictions (current build): none of C Tor's entry/exit/exclude/strict node lists are exposed by Arti 2.8/arti-client 0.48 APIs used by tobro. Exit country and IPv6/StreamPrefs defaults are planned (M2 open) and are not yet wired/applied. Unsupported knobs are hidden in the UI and rejected by config validation/import (never silently ignored)."
+    "Supported network controls (current build): stream isolation (F-42: destination/port/protocol flags) and SOCKS auth keep-alive isolation behavior (F-43) are configurable in [stream]. SOCKS auth isolation is native to Arti's proxy when credentials are provided; destination/port isolation is applied by tobro's proxy isolation policy/front-end when enabled. C Tor-style entry/exit/exclude/strict node lists are not exposed by Arti 2.8/arti-client 0.48 APIs used by tobro. Exit country and IPv6/StreamPrefs defaults are planned (M2 open) and are not yet wired/applied. Unsupported knobs are hidden in the UI and rejected by config validation/import (never silently ignored)."
 }
 
 impl Config {
@@ -726,6 +777,47 @@ level = "info"
         let patch =
             serde_json::json!({ "proxy": { "socks_port": 9050, "bind_all_interfaces": false } });
         check_unsupported_knobs(&patch).map_err(|e| format!("supported patch rejected: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_stream_isolation_patch() -> Result<(), Box<dyn std::error::Error>> {
+        let patch = serde_json::json!({
+            "stream": {
+                "isolate_destination": true,
+                "isolate_port": true,
+                "isolate_protocol": false,
+                "keep_alive_isolation": true
+            }
+        });
+        check_unsupported_knobs(&patch).map_err(|e| format!("stream patch rejected: {e}"))?;
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path)?;
+        let mut merged = serde_json::to_value(Config::load(&path)?)?;
+        if let (Some(base), Some(p)) = (merged.as_object_mut(), patch.as_object()) {
+            base.insert("stream".to_owned(), p["stream"].clone());
+        }
+        let next: Config = serde_json::from_value(merged)?;
+        next.validate()?;
+        assert!(next.stream.isolate_destination);
+        assert!(next.stream.isolate_port);
+        assert!(next.stream.keep_alive_isolation);
+        assert!(next.stream.needs_isolation_frontend());
+        assert!(next.stream.isolation_summary().contains("destination"));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_config_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.stream.isolate_destination = true;
+        config.stream.keep_alive_isolation = true;
+        config.save(&path)?;
+        let loaded = Config::load(&path)?;
+        assert_eq!(loaded.stream, config.stream);
         Ok(())
     }
 }

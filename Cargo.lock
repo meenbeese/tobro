@@ -7106,8 +7106,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tor-config",
  "tor-rtcompat",
+ "tor-socksproto",
  "tracing",
 ]
 

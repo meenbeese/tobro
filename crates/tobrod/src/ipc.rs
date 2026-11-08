@@ -286,17 +286,25 @@ fn config_effects(
         || current.proxy.effective_http_port() != next.proxy.effective_http_port()
         || current.proxy.dns_port != next.proxy.dns_port
         || current.proxy.bind_all_interfaces != next.proxy.bind_all_interfaces;
-    let restart_required = listeners_changed;
+    let stream_changed = current.stream != next.stream;
+    let restart_required = listeners_changed || stream_changed;
     let mut warnings = tobro_config::proxy_warnings(&next.proxy);
+    if next.stream.needs_isolation_frontend() {
+        warnings.push(
+            "stream isolation (destination/port) is enabled: tobro applies an isolation policy to proxy streams; verify behavior with your client and use SOCKS auth/HTTP Tor-Stream-Isolation headers for per-application separation when needed"
+                .to_owned(),
+        );
+    }
     if running && restart_required {
         warnings.push(
-            "active listeners require stop/connect (or restart) for network listener changes to take effect"
+            "active runtime requires stop/connect (or restart) for listener or stream isolation changes to take effect"
                 .to_owned(),
         );
     }
     json!({
         "restart_required": restart_required,
         "listeners_changed": listeners_changed,
+        "stream_changed": stream_changed,
         "runtime_active": running,
         "warnings": warnings,
     })
@@ -346,6 +354,12 @@ fn config_apply_patch(
         http_port: next.proxy.effective_http_port(),
         dns_port: next.proxy.dns_port,
         bind_all_interfaces: next.proxy.bind_all_interfaces,
+        stream_isolation: tobro_tor::adapter::StreamIsolationPolicy {
+            isolate_destination: next.stream.isolate_destination,
+            isolate_port: next.stream.isolate_port,
+            isolate_protocol: next.stream.isolate_protocol,
+            keep_alive_isolation: next.stream.keep_alive_isolation,
+        },
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -362,6 +376,13 @@ fn config_apply_patch(
             "http_port": next_listeners.effective_http_port(),
             "dns_port": next_listeners.dns_port,
             "bind_all_interfaces": next_listeners.bind_all_interfaces,
+        },
+        "stream": {
+            "isolate_destination": next.stream.isolate_destination,
+            "isolate_port": next.stream.isolate_port,
+            "isolate_protocol": next.stream.isolate_protocol,
+            "keep_alive_isolation": next.stream.keep_alive_isolation,
+            "summary": next.stream.isolation_summary(),
         },
         "effects": effects,
     }))
@@ -461,13 +482,19 @@ impl DaemonControl for SupervisorControl {
                 http_port: config.proxy.effective_http_port(),
                 dns_port: config.proxy.dns_port,
                 bind_all_interfaces: config.proxy.bind_all_interfaces,
+                stream_isolation: tobro_tor::adapter::StreamIsolationPolicy {
+                    isolate_destination: config.stream.isolate_destination,
+                    isolate_port: config.stream.isolate_port,
+                    isolate_protocol: config.stream.isolate_protocol,
+                    keep_alive_isolation: config.stream.keep_alive_isolation,
+                },
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
                 Err(poisoned) => *poisoned.into_inner() = next.clone(),
             }
             let apply = if running {
-                "validated and saved for next connection; active listeners require stop/connect to apply"
+                "validated and saved for next connection; active listeners/stream isolation require stop/connect to apply"
             } else {
                 "validated and applied for next connection"
             };
@@ -481,6 +508,13 @@ impl DaemonControl for SupervisorControl {
                     "http_port": next.effective_http_port(),
                     "dns_port": next.dns_port,
                     "bind_all_interfaces": next.bind_all_interfaces
+                },
+                "stream": {
+                    "isolate_destination": config.stream.isolate_destination,
+                    "isolate_port": config.stream.isolate_port,
+                    "isolate_protocol": config.stream.isolate_protocol,
+                    "keep_alive_isolation": config.stream.keep_alive_isolation,
+                    "summary": config.stream.isolation_summary(),
                 },
             });
             if !warnings.is_empty() {
@@ -1312,6 +1346,31 @@ mod config_tests {
         let err = config_validate_patch(&path, &json!({ "proxy": { "nope": 1 } }), false)
             .expect_err("should reject unknown field");
         assert!(err.contains("invalid config patch") || err.contains("unknown field"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_apply_stream_isolation_requires_restart_when_running(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        tobro_config::Config::default().save(&path)?;
+        let listeners = Arc::new(RwLock::new(ListenerConfig::default()));
+        let result = config_apply_patch(
+            &path,
+            &json!({ "stream": { "isolate_destination": true, "isolate_port": true } }),
+            true,
+            &listeners,
+        )
+        .map_err(|e| format!("{e}"))?;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["effects"]["stream_changed"], true);
+        assert_eq!(result["effects"]["restart_required"], true);
+        assert_eq!(result["stream"]["isolate_destination"], true);
+        let loaded = tobro_config::Config::load(&path)?;
+        assert!(loaded.stream.isolate_destination);
+        let ls = listeners.read().unwrap().clone();
+        assert!(ls.stream_isolation.isolate_destination);
         Ok(())
     }
 }

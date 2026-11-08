@@ -22,8 +22,16 @@ function writePowerUser(value: boolean) {
 interface ConfigEffects {
   restart_required?: boolean;
   listeners_changed?: boolean;
+  stream_changed?: boolean;
   runtime_active?: boolean;
   warnings?: string[];
+}
+
+interface StreamSettings {
+  isolate_destination: boolean;
+  isolate_port: boolean;
+  isolate_protocol: boolean;
+  keep_alive_isolation: boolean;
 }
 
 interface ConfigResponse {
@@ -90,14 +98,15 @@ function summarizeEffects(effects?: ConfigEffects): string[] {
   if (!effects) return [];
   const lines: string[] = [];
   if (effects.listeners_changed) lines.push("Listener settings changed.");
+  if (effects.stream_changed) lines.push("Stream isolation settings changed.");
   if (effects.restart_required) {
     lines.push(
       effects.runtime_active
-        ? "Restart required for active runtime/listeners: use Stop then Connect after applying."
+        ? "Restart required for active runtime: use Stop then Connect after applying."
         : "Changes apply on the next connection/start.",
     );
-  } else if (!effects.listeners_changed) {
-    lines.push("No listener restart flagged by validation.");
+  } else if (!effects.listeners_changed && !effects.stream_changed) {
+    lines.push("No restart flagged by validation.");
   }
   if (effects.warnings?.length) {
     for (const w of effects.warnings) lines.push(`Warning: ${w}`);
@@ -127,6 +136,18 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
   const [portsMessage, setPortsMessage] = useState("");
   const [portsError, setPortsError] = useState("");
 
+  // Stream isolation (F-42/F-43)
+  const [stream, setStream] = useState<StreamSettings>({
+    isolate_destination: false,
+    isolate_port: false,
+    isolate_protocol: false,
+    keep_alive_isolation: false,
+  });
+  const [streamDirty, setStreamDirty] = useState(false);
+  const [streamBusy, setStreamBusy] = useState(false);
+  const [streamMessage, setStreamMessage] = useState("");
+  const [streamError, setStreamError] = useState("");
+
   // Config import/export
   const [configPath, setConfigPath] = useState("");
   const [currentConfig, setCurrentConfig] = useState<unknown>(null);
@@ -137,6 +158,20 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
 
   function log(text: string, level: "info" | "error" = "info") {
     appendLog?.(text, level, "ui");
+  }
+
+  function applyStreamFromConfig(config: unknown) {
+    const s = (config as { stream?: Partial<StreamSettings> } | null)?.stream;
+    if (s && typeof s === "object") {
+      setStream({
+        isolate_destination: Boolean(s.isolate_destination),
+        isolate_port: Boolean(s.isolate_port),
+        isolate_protocol: Boolean(s.isolate_protocol),
+        keep_alive_isolation: Boolean(s.keep_alive_isolation),
+      });
+      setStreamDirty(false);
+      setStreamError("");
+    }
   }
 
   async function loadPorts() {
@@ -156,8 +191,22 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
     }
   }
 
+  async function loadConfigState() {
+    try {
+      const result = await invoke<ConfigResponse>("daemon_get_config");
+      setCurrentConfig(result.config ?? null);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyStreamFromConfig(result.config ?? null);
+    } catch {
+      // best-effort; listener loading may still work from local config
+    }
+  }
+
   useEffect(() => {
-    if (powerUser) void loadPorts();
+    if (powerUser) {
+      void loadPorts();
+      void loadConfigState();
+    }
   }, [powerUser]);
 
   function enablePowerUser() {
@@ -258,6 +307,7 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
       const result = await invoke<ConfigResponse>("daemon_get_config");
       setCurrentConfig(result.config ?? null);
       if (typeof result.path === "string") setConfigPath(result.path);
+      applyStreamFromConfig(result.config ?? null);
       setConfigMessages(["Loaded current daemon config (redacted; no secrets)."]);
       log("config: loaded current config");
     } catch (e) {
@@ -338,6 +388,7 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
       const result = await invoke<ConfigResponse>("daemon_apply_config", { patch });
       if (result.config) setCurrentConfig(result.config);
       if (typeof result.path === "string") setConfigPath(result.path);
+      applyStreamFromConfig(result.config ?? null);
       const lines = ["Config validated and saved (daemon config API)."];
       lines.push(...summarizeEffects(result.effects));
       lines.push("Redacted config contains no secrets; secrets remain in the OS keychain/store when used.");
@@ -351,6 +402,38 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
     } finally {
       setBusy(false);
     }
+  }
+
+  async function onSaveStream() {
+    setStreamBusy(true);
+    setStreamError("");
+    setStreamMessage("");
+    try {
+      const result = await invoke<ConfigResponse>("daemon_apply_config", {
+        patch: { stream },
+      });
+      if (result.config) setCurrentConfig(result.config);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyStreamFromConfig(result.config ?? null);
+      const warnings = result.effects?.warnings ?? [];
+      const msg = summarizeEffects(result.effects).join(" ");
+      setStreamMessage(warnings.length ? `${msg} Warnings: ${warnings.join(" | ")}` : msg || "Saved.");
+      log(`stream isolation saved (${JSON.stringify(stream)})`);
+      onApplied?.();
+    } catch (e) {
+      const message = String(e);
+      setStreamError(message);
+      log(`stream isolation save failed: ${message}`, "error");
+    } finally {
+      setStreamBusy(false);
+    }
+  }
+
+  function onStreamToggle(key: keyof StreamSettings, value: boolean) {
+    setStream((prev) => ({ ...prev, [key]: value }));
+    setStreamDirty(true);
+    setStreamError("");
+    setStreamMessage("");
   }
 
   return (
@@ -435,16 +518,52 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
             </div>
           </form>
 
+          <div className="settings-section stream-isolation">
+            <h3>Stream isolation (F-42/F-43)</h3>
+            <p className="muted">
+              Controls how proxy streams are isolated onto Tor circuits. Defaults are off. SOCKS auth isolation is
+              native to Arti when credentials are provided; destination/port isolation is applied by tobro’s isolation
+              front-end when enabled. Changes require Stop/Connect while Tor is running.
+            </p>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={stream.isolate_destination} disabled={streamBusy}
+                onChange={(e) => onStreamToggle("isolate_destination", e.target.checked)} />
+              <span><strong>Isolate by destination</strong> — streams to different destinations do not share circuits.</span>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={stream.isolate_port} disabled={streamBusy}
+                onChange={(e) => onStreamToggle("isolate_port", e.target.checked)} />
+              <span><strong>Isolate by port</strong> — streams to different destination ports do not share circuits.</span>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={stream.isolate_protocol} disabled={streamBusy}
+                onChange={(e) => onStreamToggle("isolate_protocol", e.target.checked)} />
+              <span><strong>Isolate by protocol</strong> — separate isolation by client protocol context (explicit policy; Arti already separates HTTP/SOCKS contexts).</span>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={stream.keep_alive_isolation} disabled={streamBusy}
+                onChange={(e) => onStreamToggle("keep_alive_isolation", e.target.checked)} />
+              <span><strong>SOCKS auth keep-alive isolation</strong> (F-43) — keep SOCKS username/password isolation explicit for stream lifetime/circuit association.</span>
+            </label>
+            {streamError ? <p className="error">{streamError}</p> : null}
+            {streamMessage ? <p className="muted">{streamMessage}</p> : null}
+            <div className="actions">
+              <button className="primary" type="button" disabled={streamBusy || !streamDirty} onClick={() => void onSaveStream()}>
+                {streamBusy ? "Saving…" : "Save stream isolation"}
+              </button>
+              <button type="button" disabled={streamBusy} onClick={() => void loadConfigState()}>Reset</button>
+            </div>
+          </div>
+
           <div className="settings-section node-restrictions">
             <h3>Node restrictions / exit selection (supported subset)</h3>
             <p className="muted">
-              <strong>Supported now:</strong> none of C Tor’s node restriction lists are exposed by the pinned Arti backend
-              (entry/exit/exclude/strict nodes are unavailable). Unsupported knobs remain hidden in the UI and are rejected
-              if supplied in config import/patches (never silently ignored).
+              <strong>Supported now:</strong> stream isolation (F-42/F-43) is configurable above. C Tor’s node restriction
+              lists (entry/exit/exclude/strict nodes) are not exposed by the pinned Arti backend. Unsupported knobs remain
+              hidden and are rejected if supplied in config import/patches (never silently ignored).
             </p>
             <ul className="muted">
               <li><strong>Exit country / IPv6 / StreamPrefs defaults:</strong> planned (M2 open) — not yet wired or applied.</li>
-              <li><strong>Stream isolation controls:</strong> planned (M2 open).</li>
               <li><strong>Entry/exit/exclude/strict node lists:</strong> not supported by current Arti APIs used here; hidden.</li>
             </ul>
           </div>

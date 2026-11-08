@@ -128,6 +128,12 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             http_port: config.proxy.effective_http_port(),
             dns_port: config.proxy.dns_port,
             bind_all_interfaces: config.proxy.bind_all_interfaces,
+            stream_isolation: tobro_tor::adapter::StreamIsolationPolicy {
+                isolate_destination: config.stream.isolate_destination,
+                isolate_port: config.stream.isolate_port,
+                isolate_protocol: config.stream.isolate_protocol,
+                keep_alive_isolation: config.stream.keep_alive_isolation,
+            },
         }));
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),

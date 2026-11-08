@@ -209,6 +209,7 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
         args.socks_port,
         args.dns_port,
         false,
+        tobro_tor::adapter::StreamIsolationPolicy::default(),
     );
     tokio::pin!(serve);
 
