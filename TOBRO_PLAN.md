@@ -1006,7 +1006,7 @@ Deliverables:
 
 Exit criteria:
 
-- Connect/stop works repeatedly; 24-hour soak with no leaks or orphan processes.
+- Connect/stop works repeatedly through the daemon lifecycle/supervisor.
 - Status never claims connected before bootstrap completes.
 - GUI close leaves the daemon running; reopen reconnects instantly.
 - Logs contain no secrets in a redaction test.

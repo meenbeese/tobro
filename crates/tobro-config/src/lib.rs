@@ -234,37 +234,43 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn default_round_trips() {
-        let dir = TempDir::new().expect("tempdir");
+    fn default_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
         let path = dir.path().join("config.toml");
         let config = Config::default();
-        config.save(&path).expect("save");
-        let loaded = Config::load(&path).expect("load");
+        config.save(&path)?;
+        let loaded = Config::load(&path)?;
         assert_eq!(loaded, config);
+        Ok(())
     }
 
     #[test]
-    fn load_missing_returns_default() {
-        let dir = TempDir::new().expect("tempdir");
+    fn load_missing_returns_default() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
         let path = dir.path().join("missing.toml");
-        let loaded = Config::load_or_default(&path).expect("load");
+        let loaded = Config::load_or_default(&path)?;
         assert_eq!(loaded, Config::default());
+        Ok(())
     }
 
     #[test]
     fn rejects_port_conflict() {
         let mut config = Config::default();
         config.proxy.dns_port = config.proxy.socks_port;
-        let err = config.validate().expect_err("must reject");
-        assert!(err.to_string().contains("must differ"));
+        let err = config.validate();
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
+        if let Err(ConfigError::Invalid(message)) = err {
+            assert!(message.contains("must differ"));
+        }
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let dir = TempDir::new().expect("tempdir");
+    fn rejects_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, "version = 1\nnope = true\n").expect("write");
-        let err = Config::load(&path).expect_err("must reject");
-        assert!(matches!(err, ConfigError::Parse { .. }));
+        fs::write(&path, "version = 1\nnope = true\n")?;
+        let err = Config::load(&path);
+        assert!(matches!(err, Err(ConfigError::Parse { .. })));
+        Ok(())
     }
 }

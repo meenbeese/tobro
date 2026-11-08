@@ -6,6 +6,7 @@
 
 mod ipc;
 mod lifecycle;
+pub(crate) mod redact;
 mod spike;
 mod supervisor;
 
@@ -94,16 +95,21 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         .await
         .with_context(|| format!("failed to bind IPC at {}", socket_path.display()))?;
 
-    let default_listeners = tobro_tor::adapter::ListenerConfig {
-        socks_port: config.proxy.socks_port,
-        dns_port: config.proxy.dns_port,
-    };
-    let ipc_control = ipc::SupervisorControl::new(handle.clone(), config_path.clone());
+    let listeners =
+        std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
+            socks_port: config.proxy.socks_port,
+            dns_port: config.proxy.dns_port,
+        }));
+    let ipc_control = ipc::SupervisorControl::new(
+        handle.clone(),
+        config_path.clone(),
+        std::sync::Arc::clone(&listeners),
+    );
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();
     let ipc_task = tokio::spawn(async move {
         if let Err(error) =
-            ipc::serve_daemon(server, ipc_control, ipc_state, ipc_cache, default_listeners).await
+            ipc::serve_daemon(server, ipc_control, ipc_state, ipc_cache, listeners).await
         {
             tracing::error!(%error, "IPC server failed");
         }

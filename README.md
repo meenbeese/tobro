@@ -2,20 +2,22 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0 complete; M1 in progress. Arti bootstrap/listeners, local IPC
+**Status:** M0 complete; M1 wrapped. Arti bootstrap/listeners, local IPC
 (Unix socket + Windows named pipe), and the Tauri 2 desktop shell are
-implemented. M1 now includes: `tobro-config` (TOML schema/load/save/validate),
+implemented. M1 includes: `tobro-config` (TOML schema/load/save/validate),
 `tobro-store` (embedded local libSQL/Turso-compatible DB + keychain abstraction),
 `tobrod` lifecycle/supervisor + `tobro-tor` adapter core, `tobrod run` (loads
 config/store, starts IPC, waits for connect), hardened IPC
 (`daemon.hello/status/connect/stop/reload_config` with allowlist, hello-preflight,
 no-params validation, Unix peer UID/euid check, idle timeout, event resync),
 `tobroctl` (`status/connect/stop/reload-config/watch`, JSON stdout, stable exit
-codes), and a React 19 + TypeScript + Vite Tauri shell (`apps/desktop/ui`) with
+codes), a React 19 + TypeScript + Vite/Bun Tauri shell (`apps/desktop/ui`) with
 connection/status/bootstrap UI, basic event log, connect/stop controls, tray
-icon, and quit-to-tray (the daemon keeps running). Remaining M1:
-logging/redaction + redaction test, reconfigure application, packaging smoke
-builds, and exit-gate verification.
+icon, and quit-to-tray (the daemon keeps running), and M1 hardening: log
+redaction utilities with tests, `daemon.reload_config` validation that applies
+listener config for the next connection (active listeners require restart), and
+unsigned packaging smoke-build config/CI. Soak/no-leak exit verification is not a
+required gate for M1 wrap-up.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -65,11 +67,16 @@ inside the checkout instead of the platform data directory.
 # install frontend dependencies once
 cd apps/desktop/ui && bun install
 
+# install the Rust Tauri CLI once (provides `cargo tauri`)
+cargo install tauri-cli --version "^2.0.0" --locked
+
 # run the daemon (terminal 1)
 cargo run -p tobrod -- run
 
 # run the Tauri shell (terminal 2, from repo root)
 cargo tauri dev --config apps/desktop/tauri.conf.json
+# alternative (uses @tauri-apps/cli from apps/desktop/ui):
+# cd apps/desktop/ui && bun run tauri dev --config ../tauri.conf.json
 # or, if you built the UI and want the Rust side only:
 # (cd apps/desktop/ui && bun run build) && cargo run -p tobro
 ```

@@ -206,19 +206,25 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
 }
 
-/// Supervisor handle paired with config path for IPC reload.
+/// Supervisor handle paired with config path and live listener settings for IPC.
 #[derive(Debug, Clone)]
 pub struct SupervisorControl {
     handle: SupervisorHandle,
     config_path: std::path::PathBuf,
+    listeners: Arc<RwLock<ListenerConfig>>,
 }
 
 impl SupervisorControl {
     /// Create a control wrapper.
-    pub fn new(handle: SupervisorHandle, config_path: std::path::PathBuf) -> Self {
+    pub fn new(
+        handle: SupervisorHandle,
+        config_path: std::path::PathBuf,
+        listeners: Arc<RwLock<ListenerConfig>>,
+    ) -> Self {
         Self {
             handle,
             config_path,
+            listeners,
         }
     }
 }
@@ -246,18 +252,37 @@ impl DaemonControl for SupervisorControl {
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
         let path = self.config_path.clone();
+        let listeners = Arc::clone(&self.listeners);
+        let snapshot = self.handle.snapshot();
+        let running = !matches!(
+            snapshot.state,
+            crate::lifecycle::State::Stopped | crate::lifecycle::State::Failed { .. }
+        );
         tokio::task::spawn_blocking(move || {
             let config = tobro_config::Config::load_or_default(&path)
                 .map_err(|e| format!("failed to load {}: {e}", path.display()))?;
             config
                 .validate()
                 .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+            let next = ListenerConfig {
+                socks_port: config.proxy.socks_port,
+                dns_port: config.proxy.dns_port,
+            };
+            match listeners.write() {
+                Ok(mut current) => *current = next.clone(),
+                Err(poisoned) => *poisoned.into_inner() = next.clone(),
+            }
+            let apply = if running {
+                "validated and saved for next connection; active listeners require stop/connect to apply"
+            } else {
+                "validated and applied for next connection"
+            };
             Ok(json!({
                 "ok": true,
                 "action": "reload_config",
                 "path": path.display().to_string(),
-                "apply": "validated; restart connection to apply listener/proxy changes",
-                "proxy": { "socks_port": config.proxy.socks_port, "dns_port": config.proxy.dns_port },
+                "apply": apply,
+                "proxy": { "socks_port": next.socks_port, "dns_port": next.dns_port },
             }))
         })
         .await
@@ -373,7 +398,7 @@ pub async fn serve_daemon<C: DaemonControl>(
     control: C,
     state_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
-    default_listeners: ListenerConfig,
+    listeners: Arc<RwLock<ListenerConfig>>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     tracing::info!(socket = %server.path().display(), "IPC listening (M1)");
@@ -382,15 +407,10 @@ pub async fn serve_daemon<C: DaemonControl>(
         let control = control.clone();
         let state_dir = state_dir.clone();
         let cache_dir = cache_dir.clone();
-        let default_listeners = default_listeners.clone();
+        let listeners = Arc::clone(&listeners);
         tokio::spawn(async move {
             if let Err(error) = handle_daemon(
-                connection,
-                control,
-                state_dir,
-                cache_dir,
-                default_listeners,
-                started,
+                connection, control, state_dir, cache_dir, listeners, started,
             )
             .await
             {
@@ -408,7 +428,7 @@ async fn handle_daemon<C: DaemonControl>(
     control: C,
     state_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
-    default_listeners: ListenerConfig,
+    listeners: Arc<RwLock<ListenerConfig>>,
     started: Instant,
 ) -> Result<(), IpcError> {
     check_peer_auth(&connection)?;
@@ -432,7 +452,7 @@ async fn handle_daemon<C: DaemonControl>(
                             &control,
                             &state_dir,
                             &cache_dir,
-                            &default_listeners,
+                            &listeners,
                             started,
                             &mut handshaken,
                             request,
@@ -468,6 +488,13 @@ async fn handle_daemon<C: DaemonControl>(
                 }
             }
         }
+    }
+}
+
+fn current_listeners(listeners: &Arc<RwLock<ListenerConfig>>) -> ListenerConfig {
+    match listeners.read() {
+        Ok(listeners) => listeners.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
@@ -515,7 +542,7 @@ pub async fn dispatch_daemon<C: DaemonControl>(
     control: &C,
     state_dir: &std::path::Path,
     cache_dir: &std::path::Path,
-    default_listeners: &ListenerConfig,
+    listeners: &Arc<RwLock<ListenerConfig>>,
     started: Instant,
     handshaken: &mut bool,
     request: RpcRequest,
@@ -547,12 +574,16 @@ pub async fn dispatch_daemon<C: DaemonControl>(
             encode(id, &snapshot_to_status(&snapshot, started))
         }
         methods::CONNECT => {
-            let listeners = control
+            let connect_listeners = control
                 .snapshot()
                 .listeners
-                .unwrap_or_else(|| default_listeners.clone());
+                .unwrap_or_else(|| current_listeners(listeners));
             match control
-                .connect(state_dir.to_path_buf(), cache_dir.to_path_buf(), listeners)
+                .connect(
+                    state_dir.to_path_buf(),
+                    cache_dir.to_path_buf(),
+                    connect_listeners,
+                )
                 .await
             {
                 Ok(()) => encode(id, &json!({ "ok": true, "action": "connect" })),
@@ -693,11 +724,11 @@ mod daemon_tests {
         RpcRequest::new(RequestId::Number(id), method).with_params(params)
     }
 
-    fn default_ctx() -> (PathBuf, PathBuf, ListenerConfig, Instant) {
+    fn default_ctx() -> (PathBuf, PathBuf, Arc<RwLock<ListenerConfig>>, Instant) {
         (
             PathBuf::from("/tmp/state"),
             PathBuf::from("/tmp/cache"),
-            ListenerConfig::default(),
+            Arc::new(RwLock::new(ListenerConfig::default())),
             Instant::now(),
         )
     }
@@ -795,7 +826,7 @@ mod daemon_tests {
                 control_srv,
                 PathBuf::from("/tmp/state"),
                 PathBuf::from("/tmp/cache"),
-                ListenerConfig::default(),
+                Arc::new(RwLock::new(ListenerConfig::default())),
                 Instant::now(),
             )
             .await

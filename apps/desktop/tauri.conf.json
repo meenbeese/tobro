@@ -31,6 +31,17 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "Desktop Tor client powered by Arti",
+    "longDescription": "tobro is a desktop Tor client with an embedded Arti core and a Tauri/React shell.",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
   }
 }
