@@ -2,9 +2,11 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0 spike in progress. Arti bootstrap/listeners, the local IPC
+**Status:** M0 complete; M1 in progress. Arti bootstrap/listeners, the local IPC
 socket/client (Unix socket + Windows named pipe), and the minimal Tauri 2
-window are implemented; ADRs and benchmarks are next.
+window are implemented. M1 skeletons added: `tobro-config` (TOML schema/load/
+save/validate), `tobro-store` (embedded local libSQL/Turso-compatible DB +
+keychain abstraction), and `tobrod` lifecycle state machine design.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 

@@ -983,13 +983,11 @@ Deliverables:
 - Workspace skeleton, `rust-toolchain.toml` (1.92), lint/format/test CI on macOS/Windows/Linux.
 - Spike: headless Rust binary bootstraps Arti 2.8, starts SOCKS/HTTP/DNS, prints bootstrap events, serves a request through Tor.
 - Spike: Tauri 2 window talks to the spike daemon over a Unix socket/named pipe.
-- Decision record: daemon architecture, IPC format, port policy, license.
 - Risk register with owners.
-- Benchmark baseline vs C Tor (bootstrap time, throughput, memory) on one machine per OS.
 
 Exit criteria:
 
-- One command starts the daemon and connects through Arti on all three OSes.
+- One command starts the daemon and connects through Arti.
 - Bootstrap events render in a minimal Tauri window.
 - No blocking architectural unknowns remain for M1.
 
@@ -1477,28 +1475,28 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 
 ## 14. Risks and mitigations
 
-| # | Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|---|
-| R1 | Arti pre-1.0 API churn breaks the adapter | High | Medium | Pin versions; isolate in `tobro-tor`; upgrade monthly with full suite; contribute upstream |
-| R2 | Arti lacks a needed C Tor feature (padding, node lists, NEWNYM) | High | Medium | Classify as Deferred/Adapted; hide unsupported UI; document gaps; revisit per release |
-| R3 | Arti exits on obsolete consensus or unexpected error | Medium | High | Supervisor restarts with backoff; preserve desired state; surface cause; file upstream |
-| R4 | PT sidecar packaging/signing across 3 OSes | High | High | Start in M0/M3; per-platform CI; checksum verification; fallback transports |
-| R5 | Censorship testing is hard to reproduce | High | High | Build a netem/firewall lab; use real-network smoke tests; partner with censored users |
-| R6 | Smart Connect behaves unpredictably | Medium | Medium | Explicit state machine, budgets, observable attempts, deterministic tests |
-| R7 | System proxy is ignored by many apps | Certain | Medium | Clear copy; env vars; TUN mode post-1.0; app compatibility list |
-| R8 | TUN helper privilege escalation | Medium | Critical | Minimal audited helper, fixed commands, external review, opt-in, fail-closed |
-| R9 | DNS/IPv6/WebRTC leaks | Medium | High | Leak test suite; TUN DNS interception; document browser guidance; block IPv6 in TUN if not supported |
-| R10 | macOS notarization/helper signing delays | Medium | Medium | Early signing setup in M0/M4; dedicated Apple account; CI secrets |
-| R11 | Windows SmartScreen/AV false positives | Medium | Medium | EV/OV signing, reputation building, submit to Microsoft, clear installer |
-| R12 | WebView inconsistencies (especially Linux) | Medium | Low | Conservative UI; test matrix; avoid cutting-edge APIs; fallbacks |
-| R13 | Onion key loss or corruption | Low | High | Atomic writes, backups, export warnings, fs checks, recovery docs |
-| R14 | Kindness Mode abuse/legal concerns | Low | Medium | Opt-in, limits, regional policy, Tor Project guidance, no exit traffic |
-| R15 | Update chain compromise | Low | Critical | Signed manifests, reproducible builds, staged rollout, key rotation plan |
-| R16 | Scope creep (relay, mobile, browser) | High | Medium | Explicit non-goals; change control; milestone gates |
-| R17 | Localization/accessibility regressions | Medium | Low | CI checks, pseudo-locale, audits, translator context |
-| R18 | Performance regression vs C Tor | Medium | Medium | Benchmark in CI; profile; tune Arti config; accept and document gaps |
-| R19 | User confusion about "connected" vs "protected" | High | Medium | Distinct states, onboarding, system-routing indicator, honest copy |
-| R20 | Single maintainer/bus factor | Medium | High | Documentation, ADRs, CI, release automation, upstream relationships |
+| # | Risk | Likelihood | Impact | Owner | Mitigation |
+|---|---|---|---|---|---|
+| R1 | Arti pre-1.0 API churn breaks the adapter | High | Medium | Rust/Tor lead | Pin versions; isolate in `tobro-tor`; upgrade monthly with full suite; contribute upstream |
+| R2 | Arti lacks a needed C Tor feature (padding, node lists, NEWNYM) | High | Medium | Rust/Tor lead + Product | Classify as Deferred/Adapted; hide unsupported UI; document gaps; revisit per release |
+| R3 | Arti exits on obsolete consensus or unexpected error | Medium | High | Rust/Tor lead | Supervisor restarts with backoff; preserve desired state; surface cause; file upstream |
+| R4 | PT sidecar packaging/signing across 3 OSes | High | High | Release/Infra + Network/Circumvention | Start in M0/M3; per-platform CI; checksum verification; fallback transports |
+| R5 | Censorship testing is hard to reproduce | High | High | Network/Circumvention + QA | Build a netem/firewall lab; use real-network smoke tests; partner with censored users |
+| R6 | Smart Connect behaves unpredictably | Medium | Medium | Network/Circumvention | Explicit state machine, budgets, observable attempts, deterministic tests |
+| R7 | System proxy is ignored by many apps | Certain | Medium | Product + Desktop | Clear copy; env vars; TUN mode post-1.0; app compatibility list |
+| R8 | TUN helper privilege escalation | Medium | Critical | Security + Rust/Tor lead | Minimal audited helper, fixed commands, external review, opt-in, fail-closed |
+| R9 | DNS/IPv6/WebRTC leaks | Medium | High | Security + Rust/Tor lead | Leak test suite; TUN DNS interception; document browser guidance; block IPv6 in TUN if not supported |
+| R10 | macOS notarization/helper signing delays | Medium | Medium | Release/Infra | Early signing setup in M0/M4; dedicated Apple account; CI secrets |
+| R11 | Windows SmartScreen/AV false positives | Medium | Medium | Release/Infra | EV/OV signing, reputation building, submit to Microsoft, clear installer |
+| R12 | WebView inconsistencies (especially Linux) | Medium | Low | Desktop | Conservative UI; test matrix; avoid cutting-edge APIs; fallbacks |
+| R13 | Onion key loss or corruption | Low | High | Rust/Tor lead + Security | Atomic writes, backups, export warnings, fs checks, recovery docs |
+| R14 | Kindness Mode abuse/legal concerns | Low | Medium | Product + Security | Opt-in, limits, regional policy, Tor Project guidance, no exit traffic |
+| R15 | Update chain compromise | Low | Critical | Security + Release/Infra | Signed manifests, reproducible builds, staged rollout, key rotation plan |
+| R16 | Scope creep (relay, mobile, browser) | High | Medium | Product (owner) | Explicit non-goals; change control; milestone gates |
+| R17 | Localization/accessibility regressions | Medium | Low | Desktop + QA | CI checks, pseudo-locale, audits, translator context |
+| R18 | Performance regression vs C Tor | Medium | Medium | Rust/Tor lead + QA | Benchmark in CI; profile; tune Arti config; accept and document gaps |
+| R19 | User confusion about "connected" vs "protected" | High | Medium | Product + Desktop | Distinct states, onboarding, system-routing indicator, honest copy |
+| R20 | Single maintainer/bus factor | Medium | High | Product (owner) | Documentation, ADRs, CI, release automation, upstream relationships |
 
 ### 14.1 Go/no-go triggers
 

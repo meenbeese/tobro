@@ -11,7 +11,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/tobro-config",
     "crates/tobro-ipc",
+    "crates/tobro-store",
     "crates/tobro-tor",
     "crates/tobrod",
     "crates/tobroctl",
@@ -68,7 +70,8 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # --- Storage / secrets ----------------------------------------------------
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+# Embedded/local libSQL (Turso-compatible) for tobro-store.
+libsql = "0.6"
 keyring = "4"
 zeroize = "1"
 

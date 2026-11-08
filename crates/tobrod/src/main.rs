@@ -4,10 +4,9 @@
 //! over Tor, and serves SOCKS/HTTP + DNS until shutdown. The JSON-RPC server,
 //! lifecycle state machine, and configuration layer arrive in M1.
 
-mod spike;
-
-#[cfg(unix)]
 mod ipc;
+mod lifecycle;
+mod spike;
 
 use std::path::{Path, PathBuf};
 

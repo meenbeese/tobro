@@ -10,14 +10,12 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Args;
 use serde::Serialize;
-#[cfg(unix)]
 use tobro_ipc::DaemonState;
 use tobro_tor::{Tor, parse_http_status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,8 +53,7 @@ pub struct SpikeArgs {
     #[arg(long, default_value_t = 180)]
     pub timeout_secs: u64,
 
-    /// IPC socket path (defaults to `<state-dir>/tobrod.sock`).
-    #[cfg(unix)]
+    /// IPC socket/endpoint path override.
     #[arg(long)]
     pub socket: Option<PathBuf>,
 }
@@ -128,7 +125,6 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
         .context("could not create the Arti client")?;
 
     let bootstrap = tor.bootstrap(|event| {
-        #[cfg(unix)]
         hub.report_bootstrap(
             event.percent,
             event.ready,
@@ -167,13 +163,9 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
     // observer first. The consensus stays cached on disk for a fast rebootstrap.
     drop(tor);
 
-    #[cfg(unix)]
     hub.set_state(DaemonState::Serving);
 
-    #[cfg(unix)]
     let ipc_socket = Some(socket_path.display().to_string());
-    #[cfg(not(unix))]
-    let ipc_socket = None;
 
     let socks_addr = SocketAddr::from(([127, 0, 0, 1], args.socks_port));
     emit(&Event::Serving {
