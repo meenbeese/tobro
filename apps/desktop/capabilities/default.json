@@ -1,6 +1,14 @@
 {
+  "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Permissions for the main tobro window: core APIs only (events and app commands).",
+  "description": "Permissions for the main tobro window.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:tray:default",
+    "core:menu:default"
+  ]
 }

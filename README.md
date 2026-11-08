@@ -3,16 +3,19 @@
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
 **Status:** M0 complete; M1 in progress. Arti bootstrap/listeners, local IPC
-(Unix socket + Windows named pipe), and the minimal Tauri 2 window are
+(Unix socket + Windows named pipe), and the Tauri 2 desktop shell are
 implemented. M1 now includes: `tobro-config` (TOML schema/load/save/validate),
 `tobro-store` (embedded local libSQL/Turso-compatible DB + keychain abstraction),
 `tobrod` lifecycle/supervisor + `tobro-tor` adapter core, `tobrod run` (loads
-config/store, starts IPC, waits for connect), and hardened IPC
+config/store, starts IPC, waits for connect), hardened IPC
 (`daemon.hello/status/connect/stop/reload_config` with allowlist, hello-preflight,
-no-params validation, Unix peer UID/euid check, idle timeout, event resync).
-`tobroctl` supports `status/connect/stop/reload-config/watch` with JSON stdout and
-stable exit codes. Remaining M1: React/Tauri shell, logging/redaction + redaction
-test, reconfigure application, packaging smoke builds, and exit-gate verification.
+no-params validation, Unix peer UID/euid check, idle timeout, event resync),
+`tobroctl` (`status/connect/stop/reload-config/watch`, JSON stdout, stable exit
+codes), and a React 19 + TypeScript + Vite Tauri shell (`apps/desktop/ui`) with
+connection/status/bootstrap UI, basic event log, connect/stop controls, tray
+icon, and quit-to-tray (the daemon keeps running). Remaining M1:
+logging/redaction + redaction test, reconfigure application, packaging smoke
+builds, and exit-gate verification.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -56,16 +59,25 @@ page through the local SOCKS listener. Drop `--exit-after-check` to keep
 serving until Ctrl-C. Use `--state-dir` and `--cache-dir` to keep Arti state
 inside the checkout instead of the platform data directory.
 
-## Try the window
+## Try the desktop app
 
 ```sh
-cargo run -p tobro -- --socket /path/to/tobrod.sock   # e.g. from the spike above
+# install frontend dependencies once
+cd apps/desktop/ui && bun install
+
+# run the daemon (terminal 1)
+cargo run -p tobrod -- run
+
+# run the Tauri shell (terminal 2, from repo root)
+cargo tauri dev --config apps/desktop/tauri.conf.json
+# or, if you built the UI and want the Rust side only:
+# (cd apps/desktop/ui && bun run build) && cargo run -p tobro
 ```
 
-A minimal Tauri window connects to the same socket (or the default platform
-path when run without `--socket`), streams `bootstrap.progress` and
-`daemon.state_changed` into the event list, and shows the latest daemon
-status. It retries once per second while no daemon is listening.
+The shell connects to `tobrod` over local IPC (default platform state path, or
+`--socket <path>`), shows status/bootstrap progress, provides Connect/Stop,
+keeps a basic event log, and lives in the tray when the window is closed. Quit
+from the tray menu to exit the GUI; the daemon is independent.
 
 ## License
 

@@ -1,118 +1,12 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>tobro</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 0; padding: 1.25rem; background: Background; color: WindowText;
-    }
-    h1 { font-size: 1.35rem; margin: 0 0 0.75rem; }
-    #connection { font-size: 0.8rem; opacity: 0.7; margin-bottom: 0.75rem; }
-    #status {
-      font-weight: bold;
-      padding: 0.6rem 0.8rem;
-      border-radius: 8px;
-      background: rgba(127,127,127,0.15);
-      margin-bottom: 1rem;
-    }
-    #status.connected { background: rgba(34,197,94,0.25); }
-    #status.error { background: rgba(239,68,68,0.25); }
-    section h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.6; margin: 0 0 0.4rem; }
-    #log {
-      list-style: none; margin: 0; padding: 0;
-      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-      white-space: pre-wrap; overflow-y: auto; max-height: 60vh;
-    }
-    #log li { padding: 2px 0; border-bottom: 1px solid rgba(127,127,127,0.15); }
-    .muted { opacity: 0.55; }
-  </style>
-</head>
-<body>
-  <h1>tobro</h1>
-  <p id="connection" class="muted">connecting to the tobro daemon…</p>
-  <p id="status">waiting for daemon status…</p>
-  <section>
-    <h2>Events</h2>
-    <ol id="log"></ol>
-  </section>
-  <script>
-    const tauri = window.__TAURI__;
-    if (!tauri) {
-      document.getElementById("connection").textContent =
-        "Tauri API unavailable — open through the app, not a browser";
-      throw new Error("no embedded Tauri API");
-    }
-    const { event, core } = tauri;
-    const statusEl = document.getElementById("status");
-    const connectionEl = document.getElementById("connection");
-    const logEl = document.getElementById("log");
-
-    function log(text) {
-      const li = document.createElement("li");
-      li.textContent = text;
-      logEl.append(li);
-      while (logEl.childElementCount > 200) { logEl.firstChild.remove(); }
-    }
-
-    function showStatus(status) {
-      if (status == null) {
-        statusEl.textContent = "daemon status unavailable";
-        statusEl.className = "error";
-        return;
-      }
-      const bootstrap = status.bootstrap || {};
-      const percent = bootstrap.percent != null ? `${bootstrap.percent}%` : "?";
-      statusEl.textContent =
-        `${status.state || "?"} — bootstrap ${percent}${bootstrap.detail ? " — " + bootstrap.detail : ""}`;
-      statusEl.className = status.state === "serving" || bootstrap.ready ? "connected" : "";
-    }
-
-    function waiting(message) {
-      statusEl.textContent = "daemon unavailable";
-      statusEl.className = "error";
-      connectionEl.textContent = message;
-    }
-
-    core.invoke("status").then(showStatus, (error) => {
-      statusEl.textContent = `status unavailable: ${error}`;
-      statusEl.className = "error";
-    });
-
-    event.listen("tobro-event", (e) => {
-      const { kind, payload } = e.payload;
-      if (kind === "status") {
-        showStatus(payload);
-        return;
-      }
-      if (kind === "hello") {
-        connectionEl.textContent =
-          `daemon ${payload.daemon_version} (rpc v${payload.rpc_version}, ${payload.platform}, arti ${payload.arti_version})`;
-        return;
-      }
-      if (kind === "reachable") {
-        connectionEl.textContent = `daemon socket: ${payload.socket}`;
-        return;
-      }
-      if (kind === "unreachable") {
-        waiting(`waiting for tobrod — ${payload.error}`);
-        return;
-      }
-      if (kind === "event") {
-        if (payload && payload.method === "bootstrap.progress") {
-          const bootstrap = payload.params || {};
-          log(`bootstrap ${bootstrap.percent == null ? "" : bootstrap.percent + "%"}${bootstrap.detail ? " — " + bootstrap.detail : ""}`);
-          return;
-        }
-        if (payload && payload.method === "daemon.state_changed") {
-          log(`state changed → ${payload.params && payload.params.state}`);
-          return;
-        }
-        log(JSON.stringify(payload));
-      }
-    });
-  </script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tobro</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

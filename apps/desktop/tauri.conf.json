@@ -4,20 +4,30 @@
   "version": "0.0.0",
   "identifier": "app.tobro",
   "build": {
-    "frontendDist": "ui"
+    "beforeDevCommand": {
+      "script": "bun run dev",
+      "cwd": "ui"
+    },
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": {
+      "script": "bun run build",
+      "cwd": "ui"
+    },
+    "frontendDist": "ui/dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",
         "title": "tobro",
-        "width": 700,
-        "height": 480
+        "width": 760,
+        "height": 560,
+        "resizable": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

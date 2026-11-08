@@ -83,7 +83,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 # --- Desktop shell --------------------------------------------------------
-tauri = "2"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-build = "2"
 
 # --- Dev / test -----------------------------------------------------------

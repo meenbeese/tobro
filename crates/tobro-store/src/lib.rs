@@ -221,28 +221,31 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn open_db_runs_migrations() {
-        let dir = TempDir::new().expect("tempdir");
+    async fn open_db_runs_migrations() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
         let path = dir.path().join("test.sqlite3");
-        let db = Db::open(&path).await.expect("open db");
+        let db = Db::open(&path).await?;
         let mut rows = db
             .conn()
             .query("SELECT COUNT(*) FROM meta", params![])
-            .await
-            .expect("query");
-        let row = rows.next().await.expect("next").expect("row");
-        let count: i64 = row.get(0).expect("count");
+            .await?;
+        let row = rows.next().await?.ok_or("expected a row from COUNT(*)")?;
+        let count: i64 = row.get(0)?;
         assert_eq!(count, 0);
+        Ok(())
     }
 
     #[test]
-    fn memory_secret_store_round_trips() {
+    fn memory_secret_store_round_trips() -> Result<(), StoreError> {
         let store = MemorySecretStore::default();
-        assert!(store.get("k").expect("get").is_none());
-        store.set("k", "v").expect("set");
-        let got = store.get("k").expect("get").expect("present");
+        assert!(store.get("k")?.is_none());
+        store.set("k", "v")?;
+        let got = store
+            .get("k")?
+            .ok_or_else(|| StoreError::Keychain("expected secret".to_owned()))?;
         assert_eq!(got.as_str(), "v");
-        store.delete("k").expect("delete");
-        assert!(store.get("k").expect("get").is_none());
+        store.delete("k")?;
+        assert!(store.get("k")?.is_none());
+        Ok(())
     }
 }
