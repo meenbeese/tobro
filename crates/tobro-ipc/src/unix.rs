@@ -175,10 +175,12 @@ fn check_path_len(path: &Path) -> Result<(), IpcError> {
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     if dir.exists() {
+        // Tighten existing directories: Arti/fs-mistrust rejects group/other access.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         return Ok(());
     }
-    use std::os::unix::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)

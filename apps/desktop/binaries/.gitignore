@@ -1,0 +1,6 @@
+# Prepared sidecar binaries (target-suffixed) for Tauri bundling.
+tobrod-*
+tobrod.exe-*
+*.exe
+!*.gitignore
+!README.md

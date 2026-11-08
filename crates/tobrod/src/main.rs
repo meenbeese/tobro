@@ -16,6 +16,29 @@ use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    if dir.exists() {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
+    } else {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create private directory {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create directory {}", dir.display()))?;
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "tobrod", version, about = "tobro Tor daemon")]
 struct Cli {
@@ -64,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (state_dir, cache_dir) = resolve_dirs(cli.state_dir, cli.cache_dir)?;
+    ensure_private_dir(&state_dir)?;
+    ensure_private_dir(&cache_dir)?;
+    if let Some(project) = ProjectDirs::from("", "", "tobro") {
+        let _ = ensure_private_dir(project.data_dir());
+    }
     match command {
         Command::Run(args) => run_daemon(args, state_dir, cache_dir).await,
         Command::Spike(args) => spike::run(args, state_dir, cache_dir).await,
@@ -79,8 +107,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     config.validate().context("invalid config")?;
 
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
+    ensure_private_dir(&state_dir)?;
     let db_path = state_dir.join(tobro_store::DB_FILE_NAME);
     let _db = tobro_store::Db::open(&db_path)
         .await

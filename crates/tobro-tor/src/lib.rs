@@ -262,6 +262,11 @@ pub async fn serve(
 }
 
 fn client_config(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<TorClientConfig> {
+    // Ensure private permissions before Arti/mistrust checks. This also repairs
+    // existing directories created with overly permissive modes (e.g. 0755).
+    ensure_private_dir(state_dir)?;
+    ensure_private_dir(cache_dir)?;
+
     let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir).build()?;
 
     // Arti refuses state/cache directories that are accessible to other users.
@@ -271,6 +276,29 @@ fn client_config(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<TorClient
     mistrust.make_directory(cache_dir)?;
 
     Ok(config)
+}
+
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    if dir.exists() {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
+    } else {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create private directory {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create directory {}", dir.display()))?;
+    Ok(())
 }
 
 /// Extract the status code from the first line of an HTTP response.

@@ -7,7 +7,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -401,13 +403,55 @@ async fn watch_daemon(
     daemon_socket: PathBuf,
     mut commands: mpsc::Receiver<IpcCommand>,
 ) {
+    let mut last_spawn_attempt: Option<Instant> = None;
     loop {
-        if let Err(error) = connect_once(&handle, &daemon_socket, &mut commands).await {
-            emit(
-                &handle,
-                "unreachable",
-                json!({ "error": format!("{} ({})", error, daemon_socket.display()) }),
-            );
+        match connect_once(&handle, &daemon_socket, &mut commands).await {
+            Ok(()) => {}
+            Err(error) if error == "desktop command channel closed" => return,
+            Err(error) => {
+                let should_spawn = last_spawn_attempt
+                    .map(|t| t.elapsed() >= Duration::from_secs(10))
+                    .unwrap_or(true);
+                if should_spawn {
+                    last_spawn_attempt = Some(Instant::now());
+                    match spawn_daemon(&daemon_socket) {
+                        Ok(path) => {
+                            emit(
+                                &handle,
+                                "event",
+                                json!({
+                                    "method": "ui.daemon_spawn",
+                                    "params": { "path": path, "socket": daemon_socket.display().to_string() }
+                                }),
+                            );
+                            emit(
+                                &handle,
+                                "unreachable",
+                                json!({ "error": format!("Starting tobrod ({}). {error}", daemon_socket.display()) }),
+                            );
+                        }
+                        Err(spawn_error) => {
+                            emit(
+                                &handle,
+                                "unreachable",
+                                json!({
+                                    "error": format!(
+                                        "tobrod is not reachable: {error}. Automatic start failed: {spawn_error}. \
+                                         You can set TOBROD_PATH or run `tobrod run --socket {}`.",
+                                        daemon_socket.display()
+                                    )
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    emit(
+                        &handle,
+                        "unreachable",
+                        json!({ "error": format!("{} ({})", error, daemon_socket.display()) }),
+                    );
+                }
+            }
         }
         // Drain commands while disconnected so callers don't hang forever.
         while let Ok(cmd) = commands.try_recv() {
@@ -415,6 +459,64 @@ async fn watch_daemon(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+fn spawn_daemon(socket: &Path) -> Result<String, String> {
+    let tobrod = find_tobrod_binary()?;
+    let mut cmd = Command::new(&tobrod);
+    cmd.arg("run").arg("--socket").arg(socket);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+        .map_err(|e| format!("failed to start {}: {e}", tobrod.display()))?;
+    Ok(tobrod.display().to_string())
+}
+
+fn find_tobrod_binary() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("TOBROD_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "TOBROD_PATH is set but not a file: {}",
+            path.display()
+        ));
+    }
+
+    let exe_name = if cfg!(windows) {
+        "tobrod.exe"
+    } else {
+        "tobrod"
+    };
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        let candidates = [
+            dir.join(exe_name),
+            dir.join("binaries").join(exe_name),
+            dir.join("../").join(exe_name),
+            dir.join("../Resources").join(exe_name),
+            dir.join("../Resources/binaries").join(exe_name),
+            dir.join("../resources").join(exe_name),
+            dir.join("../lib/tobro").join(exe_name),
+        ];
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    // Fallback: rely on PATH (useful in dev environments).
+    Ok(PathBuf::from(exe_name))
 }
 
 fn reject_command(cmd: IpcCommand, message: &str) {
@@ -448,7 +550,7 @@ async fn connect_once(
     loop {
         tokio::select! {
             cmd = commands.recv() => {
-                let Some(cmd) = cmd else { return Ok(()); };
+                let Some(cmd) = cmd else { return Err("desktop command channel closed".to_owned()); };
                 handle_command(handle, &mut client, cmd).await;
             }
             message = client.next_message() => {
@@ -465,7 +567,7 @@ async fn connect_once(
                         refresh_status(handle, &mut client).await;
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) => return Ok(()),
+                    Ok(None) => return Err("daemon connection closed".to_owned()),
                     Err(error) => return Err(error.to_string()),
                 }
             }

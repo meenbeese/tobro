@@ -271,3 +271,38 @@ button:disabled { opacity: 0.5; cursor: default; }
 .config-import p { margin: 0 0 10px; font-size: 0.9rem; }
 .config-messages { margin: 10px 0 0; padding-left: 18px; font-size: 0.9rem; }
 .config-messages li { margin: 2px 0; }
+
+.ports-hint { margin: 0 0 12px; font-size: 0.9rem; }
+.link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.power-user-gate {
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  padding: 14px;
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.power-user-gate h3 { margin: 0 0 8px; }
+.power-user-gate p { margin: 0 0 10px; }
+.power-user-gate ul { margin: 0 0 14px; padding-left: 18px; }
+.advanced-sections { display: flex; flex-direction: column; gap: 16px; }
+.settings-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.settings-section-head p { margin: 0; }
+.settings-section {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.settings-section h3 { margin: 0 0 8px; font-size: 1rem; }
+.settings-section p { margin: 0 0 10px; font-size: 0.9rem; }

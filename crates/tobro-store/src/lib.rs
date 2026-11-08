@@ -70,6 +70,11 @@ impl Db {
                     path: parent.to_path_buf(),
                     source,
                 })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
 
         let db = Builder::new_local(path).build().await?;
