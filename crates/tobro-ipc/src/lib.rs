@@ -12,11 +12,12 @@
 //! JSON-RPC framing; the pipe name is derived from the socket path, so both
 //! platforms share one endpoint convention.
 //!
-//! # M0 surface
+//! # M1 surface
 //!
-//! Methods: `daemon.hello`, `daemon.status`.
+//! Methods: `daemon.hello`, `daemon.status`, `daemon.connect`, `daemon.stop`.
 //! Notifications: `bootstrap.progress`, `daemon.state_changed`.
-//! The M1 surface grows to the full method list in the plan.
+//! Servers enforce a method allowlist and version handshake; peer identity checks
+//! are transport/platform-specific hardening.
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
@@ -44,14 +45,31 @@ pub mod codes {
     pub const INVALID_PARAMS: i32 = -32602;
     /// Unexpected daemon failure.
     pub const INTERNAL_ERROR: i32 = -32603;
+    /// Handshake/version/authorization failure.
+    pub const UNAUTHORIZED: i32 = -32001;
 }
 
-/// Method names used by the M0 IPC surface.
+/// Method names used by the IPC surface.
 pub mod methods {
     /// Handshake; returns [`Hello`].
     pub const HELLO: &str = "daemon.hello";
     /// Current daemon state; returns [`DaemonStatus`].
     pub const STATUS: &str = "daemon.status";
+    /// Request that the daemon connect/start Tor.
+    pub const CONNECT: &str = "daemon.connect";
+    /// Request that the daemon stop/disconnect Tor.
+    pub const STOP: &str = "daemon.stop";
+
+    /// Methods that may be called without a prior `daemon.hello` handshake.
+    pub const PREFLIGHT: &[&str] = &[HELLO];
+}
+
+/// Returns true if `method` is in the supported method allowlist.
+pub fn is_allowed_method(method: &str) -> bool {
+    matches!(
+        method,
+        methods::HELLO | methods::STATUS | methods::CONNECT | methods::STOP
+    )
 }
 
 /// Notification names used by the M0 IPC surface.
@@ -154,6 +172,11 @@ impl RpcError {
     /// `INTERNAL_ERROR`.
     pub fn internal(detail: impl Into<String>) -> Self {
         Self::new(codes::INTERNAL_ERROR, detail)
+    }
+
+    /// Authorization/handshake failure.
+    pub fn unauthorized(detail: impl Into<String>) -> Self {
+        Self::new(codes::UNAUTHORIZED, detail)
     }
 }
 
@@ -446,10 +469,12 @@ pub enum DaemonState {
     Starting,
     /// Arti is bootstrapping.
     Bootstrapping,
-    /// Arti is usable.
+    /// Arti is usable / listeners serving.
     Connected,
     /// Listeners are running.
     Serving,
+    /// Stopping/disconnecting.
+    Stopping,
     /// Cleanly stopped.
     Stopped,
     /// Failed; see the daemon logs.

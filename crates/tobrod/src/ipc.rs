@@ -1,7 +1,7 @@
-//! Minimal IPC endpoint for the M0 spike.
+//! IPC endpoint for `tobrod`.
 //!
-//! Serves `daemon.hello` and `daemon.status` over a Unix socket and pushes
-//! `bootstrap.progress` / `daemon.state_changed` notifications.
+//! Contains the M0 spike [`Hub`] and an M1 supervisor-backed server that
+//! enforces method allowlist, version handshake, and dispatches connect/stop.
 
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -174,5 +174,263 @@ fn hello() -> Hello {
         platform: std::env::consts::OS.to_owned(),
         arti_version: tobro_tor::ARTI_VERSION.to_owned(),
         pid: std::process::id(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M1 supervisor-backed IPC server
+// ---------------------------------------------------------------------------
+
+use crate::supervisor::{Snapshot, SupervisorEvent, SupervisorHandle};
+use tobro_tor::adapter::ListenerConfig;
+
+fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
+    let (state, bootstrap) = match &snapshot.state {
+        crate::lifecycle::State::Stopped => (
+            DaemonState::Stopped,
+            BootstrapProgress {
+                percent: 0,
+                ready: false,
+                blocked: None,
+                detail: "stopped".to_owned(),
+            },
+        ),
+        crate::lifecycle::State::Starting => (DaemonState::Starting, BootstrapProgress::default()),
+        crate::lifecycle::State::Bootstrapping { percent, detail } => (
+            DaemonState::Bootstrapping,
+            BootstrapProgress {
+                percent: percent.unwrap_or(0),
+                ready: false,
+                blocked: None,
+                detail: detail.clone(),
+            },
+        ),
+        crate::lifecycle::State::Ready => (
+            DaemonState::Serving,
+            BootstrapProgress {
+                percent: 100,
+                ready: true,
+                blocked: None,
+                detail: "ready".to_owned(),
+            },
+        ),
+        crate::lifecycle::State::Stopping => (
+            DaemonState::Stopping,
+            BootstrapProgress {
+                percent: 100,
+                ready: false,
+                blocked: None,
+                detail: "stopping".to_owned(),
+            },
+        ),
+        crate::lifecycle::State::Failed { message, .. } => (
+            DaemonState::Error,
+            BootstrapProgress {
+                percent: 0,
+                ready: false,
+                blocked: Some(message.clone()),
+                detail: message.clone(),
+            },
+        ),
+    };
+    let (socks_port, dns_port) = snapshot
+        .listeners
+        .as_ref()
+        .map(|l| (l.socks_port, l.dns_port))
+        .unwrap_or((9050, 9053));
+    DaemonStatus {
+        state,
+        bootstrap,
+        socks_port,
+        dns_port,
+        pid: std::process::id(),
+        uptime_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Accept connections and dispatch M1 methods to the supervisor.
+pub async fn serve_daemon(
+    mut server: Server,
+    handle: SupervisorHandle,
+    state_dir: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    default_listeners: ListenerConfig,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    tracing::info!(socket = %server.path().display(), "IPC listening (M1)");
+    loop {
+        let connection = server.accept().await?;
+        let handle = handle.clone();
+        let state_dir = state_dir.clone();
+        let cache_dir = cache_dir.clone();
+        let default_listeners = default_listeners.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_daemon(
+                connection,
+                handle,
+                state_dir,
+                cache_dir,
+                default_listeners,
+                started,
+            )
+            .await
+            {
+                tracing::debug!(%error, "IPC connection ended");
+            }
+        });
+    }
+}
+
+async fn handle_daemon(
+    mut connection: Connection,
+    handle: SupervisorHandle,
+    state_dir: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    default_listeners: ListenerConfig,
+    started: Instant,
+) -> Result<(), IpcError> {
+    #[cfg(unix)]
+    check_peer_auth(&connection)?;
+
+    let mut events = handle.subscribe_events();
+    let mut handshaken = false;
+
+    loop {
+        tokio::select! {
+            incoming = connection.next() => {
+                match incoming {
+                    Some(Ok(Message::Request(request))) => {
+                        let response = dispatch_daemon(
+                            &handle,
+                            &state_dir,
+                            &cache_dir,
+                            &default_listeners,
+                            started,
+                            &mut handshaken,
+                            request,
+                        )
+                        .await;
+                        connection.send(Message::Response(response)).await?;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(()),
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if let Some(notification) = supervisor_event_to_notification(event) {
+                            connection.send(Message::Notification(notification)).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn check_peer_auth(connection: &Connection) -> Result<(), IpcError> {
+    // Obtain peer credentials (ensures a same-host Unix socket peer and gives us
+    // its uid for logging/auditing). Socket is created in a 0700 directory with
+    // 0600 permissions, which restricts access to the owning user. A strict
+    // uid==euid comparison requires platform FFI unavailable under the workspace's
+    // `unsafe_code = "forbid"` lint; M1 hardening can add a safe wrapper dep.
+    let _cred = connection
+        .get_ref()
+        .peer_cred()
+        .map_err(|e| IpcError::Protocol(format!("could not determine peer credentials: {e}")))?;
+    Ok(())
+}
+
+async fn dispatch_daemon(
+    handle: &SupervisorHandle,
+    state_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    default_listeners: &ListenerConfig,
+    started: Instant,
+    handshaken: &mut bool,
+    request: RpcRequest,
+) -> RpcResponse {
+    let id = request.id;
+    let method = request.method.as_str();
+
+    if !tobro_ipc::is_allowed_method(method) {
+        return RpcResponse::error(id, RpcError::method_not_found(method));
+    }
+    if !*handshaken && !tobro_ipc::methods::PREFLIGHT.contains(&method) {
+        return RpcResponse::error(
+            id,
+            RpcError::unauthorized("call daemon.hello before other methods"),
+        );
+    }
+
+    match method {
+        methods::HELLO => {
+            *handshaken = true;
+            encode(id, &hello())
+        }
+        methods::STATUS => {
+            let snapshot = handle.snapshot();
+            encode(id, &snapshot_to_status(&snapshot, started))
+        }
+        methods::CONNECT => {
+            let listeners = handle
+                .snapshot()
+                .listeners
+                .unwrap_or_else(|| default_listeners.clone());
+            match handle
+                .connect(state_dir.to_path_buf(), cache_dir.to_path_buf(), listeners)
+                .await
+            {
+                Ok(()) => encode(id, &json!({ "ok": true, "action": "connect" })),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::internal(format!("connect failed: {e}")))
+                }
+            }
+        }
+        methods::STOP => match handle.disconnect().await {
+            Ok(()) => encode(id, &json!({ "ok": true, "action": "stop" })),
+            Err(e) => RpcResponse::error(id, RpcError::internal(format!("stop failed: {e}"))),
+        },
+        other => RpcResponse::error(id, RpcError::method_not_found(other)),
+    }
+}
+
+fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotification> {
+    match event {
+        SupervisorEvent::StateChanged(snapshot) => {
+            let state = match snapshot.state {
+                crate::lifecycle::State::Starting => DaemonState::Starting,
+                crate::lifecycle::State::Bootstrapping { .. } => DaemonState::Bootstrapping,
+                crate::lifecycle::State::Ready => DaemonState::Serving,
+                crate::lifecycle::State::Stopping => DaemonState::Stopping,
+                crate::lifecycle::State::Stopped => DaemonState::Stopped,
+                crate::lifecycle::State::Failed { .. } => DaemonState::Error,
+            };
+            Some(RpcNotification::new(
+                notifications::STATE_CHANGED,
+                Some(json!({ "state": state })),
+            ))
+        }
+        SupervisorEvent::BootstrapProgress { percent, detail } => {
+            let progress = BootstrapProgress {
+                percent: percent.unwrap_or(0),
+                ready: false,
+                blocked: None,
+                detail,
+            };
+            Some(RpcNotification::new(
+                notifications::BOOTSTRAP_PROGRESS,
+                Some(serde_json::to_value(progress).ok()?),
+            ))
+        }
+        SupervisorEvent::Failed { message } => Some(RpcNotification::new(
+            notifications::STATE_CHANGED,
+            Some(json!({ "state": "error", "message": message })),
+        )),
     }
 }

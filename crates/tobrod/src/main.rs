@@ -32,8 +32,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the supervised daemon (M1 control plane).
+    Run(RunArgs),
     /// Bootstrap Arti, check a request over Tor, and serve SOCKS/HTTP/DNS.
     Spike(spike::SpikeArgs),
+}
+
+/// Arguments for `tobrod run`.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Config file path (defaults to the platform config directory).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// IPC socket/endpoint path override (defaults to `<state-dir>/tobrod.sock`).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
         println!(
-            "tobrod {} (M0 scaffold: run `tobrod spike`)",
+            "tobrod {} (run `tobrod run` for the M1 daemon, or `tobrod spike` for the M0 spike)",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -51,8 +64,69 @@ async fn main() -> anyhow::Result<()> {
 
     let (state_dir, cache_dir) = resolve_dirs(cli.state_dir, cli.cache_dir)?;
     match command {
+        Command::Run(args) => run_daemon(args, state_dir, cache_dir).await,
         Command::Spike(args) => spike::run(args, state_dir, cache_dir).await,
     }
+}
+
+async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> anyhow::Result<()> {
+    let config_path = args
+        .config
+        .or_else(|| tobro_config::default_path().ok())
+        .context("could not determine config path")?;
+    let config = tobro_config::Config::load_or_default(&config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    config.validate().context("invalid config")?;
+
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
+    let db_path = state_dir.join(tobro_store::DB_FILE_NAME);
+    let _db = tobro_store::Db::open(&db_path)
+        .await
+        .with_context(|| format!("failed to open store at {}", db_path.display()))?;
+
+    let (handle, supervisor_task) = supervisor::spawn();
+
+    let socket_path = args
+        .socket
+        .unwrap_or_else(|| tobro_ipc::socket_path(&state_dir));
+    let server = tobro_ipc::Server::bind(&socket_path)
+        .await
+        .with_context(|| format!("failed to bind IPC at {}", socket_path.display()))?;
+
+    let default_listeners = tobro_tor::adapter::ListenerConfig {
+        socks_port: config.proxy.socks_port,
+        dns_port: config.proxy.dns_port,
+    };
+    let ipc_handle = handle.clone();
+    let ipc_state = state_dir.clone();
+    let ipc_cache = cache_dir.clone();
+    let ipc_task = tokio::spawn(async move {
+        if let Err(error) =
+            ipc::serve_daemon(server, ipc_handle, ipc_state, ipc_cache, default_listeners).await
+        {
+            tracing::error!(%error, "IPC server failed");
+        }
+    });
+
+    tracing::info!(
+        config = %config_path.display(),
+        db = %db_path.display(),
+        socket = %socket_path.display(),
+        socks_port = config.proxy.socks_port,
+        dns_port = config.proxy.dns_port,
+        "tobrod running (M1); waiting for daemon.connect"
+    );
+
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for ctrl-c")?;
+    tracing::info!("shutdown requested");
+    let _ = handle.disconnect().await;
+    let _ = handle.shutdown().await;
+    ipc_task.abort();
+    let _ = supervisor_task.await;
+    Ok(())
 }
 
 fn init_tracing() {
