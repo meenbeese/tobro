@@ -201,6 +201,8 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), String>> + Send;
     /// Request disconnect/stop.
     fn disconnect(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// Request a new identity (new circuits) while connected.
+    fn new_identity(&self) -> impl Future<Output = Result<(), String>> + Send;
     /// Reload and validate configuration. Returns a JSON summary.
     fn reload_config(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
@@ -249,6 +251,10 @@ impl DaemonControl for SupervisorControl {
 
     async fn disconnect(&self) -> Result<(), String> {
         self.handle.disconnect().await.map_err(|e| e.to_string())
+    }
+
+    async fn new_identity(&self) -> Result<(), String> {
+        self.handle.new_identity().await.map_err(|e| e.to_string())
     }
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
@@ -323,6 +329,12 @@ impl DaemonControl for SupervisorHandle {
 
     async fn disconnect(&self) -> Result<(), String> {
         SupervisorHandle::disconnect(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn new_identity(&self) -> Result<(), String> {
+        SupervisorHandle::new_identity(self)
             .await
             .map_err(|e| e.to_string())
     }
@@ -633,6 +645,37 @@ pub async fn dispatch_daemon<C: DaemonControl>(
             Ok(()) => encode(id, &json!({ "ok": true, "action": "stop" })),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("stop failed: {e}"))),
         },
+        methods::NEW_IDENTITY => {
+            let snapshot = control.snapshot();
+            let can_request = matches!(
+                snapshot.state,
+                crate::lifecycle::State::Starting
+                    | crate::lifecycle::State::Bootstrapping { .. }
+                    | crate::lifecycle::State::Ready
+            );
+            if !can_request {
+                return RpcResponse::error(
+                    id,
+                    RpcError::new(
+                        tobro_ipc::codes::INVALID_REQUEST,
+                        "cannot request new identity: Tor is not connected",
+                    ),
+                );
+            }
+            match control.new_identity().await {
+                Ok(()) => encode(
+                    id,
+                    &json!({
+                        "ok": true,
+                        "action": "new_identity",
+                        "note": "requested new circuits; guard state is preserved"
+                    }),
+                ),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::internal(format!("new identity failed: {e}")))
+                }
+            }
+        }
         methods::RELOAD_CONFIG => match control.reload_config().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(e)),
@@ -692,6 +735,7 @@ mod daemon_tests {
         snapshot: Arc<Mutex<Snapshot>>,
         connects: Arc<Mutex<u32>>,
         disconnects: Arc<Mutex<u32>>,
+        new_identities: Arc<Mutex<u32>>,
         _events_tx: broadcast::Sender<SupervisorEvent>,
         events_tx: broadcast::Sender<SupervisorEvent>,
     }
@@ -707,6 +751,7 @@ mod daemon_tests {
                 })),
                 connects: Arc::new(Mutex::new(0)),
                 disconnects: Arc::new(Mutex::new(0)),
+                new_identities: Arc::new(Mutex::new(0)),
                 _events_tx: events_tx.clone(),
                 events_tx,
             }
@@ -745,6 +790,14 @@ mod daemon_tests {
         async fn disconnect(&self) -> Result<(), String> {
             *self.disconnects.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             self.set_state(Desired::Stopped, State::Stopped, None);
+            Ok(())
+        }
+
+        async fn new_identity(&self) -> Result<(), String> {
+            *self
+                .new_identities
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) += 1;
             Ok(())
         }
 
@@ -899,5 +952,58 @@ mod daemon_tests {
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_identity_rejected_when_stopped() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::NEW_IDENTITY, None),
+        )
+        .await;
+        let err = resp.error.expect("should error");
+        assert_eq!(err.code, tobro_ipc::codes::INVALID_REQUEST);
+        assert!(err.message.contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn new_identity_succeeds_when_ready() {
+        let control = MockControl::new();
+        control.set_state(
+            Desired::Connected,
+            State::Ready,
+            Some(ListenerConfig::default()),
+        );
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::NEW_IDENTITY, None),
+        )
+        .await;
+        assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
+        let result = resp.result.expect("result");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "new_identity");
+        assert_eq!(
+            *control
+                .new_identities
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            1
+        );
     }
 }

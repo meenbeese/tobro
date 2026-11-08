@@ -31,6 +31,8 @@ enum Command {
     Connect,
     /// Ask the daemon to stop/disconnect Tor.
     Stop,
+    /// Request a new identity (new circuits; guard state preserved).
+    NewIdentity,
     /// Reload and validate daemon configuration from disk.
     ReloadConfig,
     /// Stream IPC notifications as JSON lines until Ctrl-C.
@@ -77,6 +79,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Stop => {
             let result = client.call(tobro_ipc::methods::STOP, None).await?;
+            print_json(&result)?;
+        }
+        Command::NewIdentity => {
+            let result = client.call(tobro_ipc::methods::NEW_IDENTITY, None).await?;
             print_json(&result)?;
         }
         Command::ReloadConfig => {

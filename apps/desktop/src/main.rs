@@ -21,6 +21,7 @@ use tobro_ipc::{Client, DaemonStatus, Message, methods, socket_path};
 enum IpcCommand {
     Connect(oneshot::Sender<Result<Value, String>>),
     Stop(oneshot::Sender<Result<Value, String>>),
+    NewIdentity(oneshot::Sender<Result<Value, String>>),
     ReloadConfig(oneshot::Sender<Result<Value, String>>),
 }
 
@@ -80,6 +81,18 @@ async fn daemon_stop(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|_| "daemon connection task dropped the response".to_owned())?
 }
 
+#[tauri::command]
+async fn daemon_new_identity(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::NewIdentity(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ProxyPorts {
     socks_port: u16,
@@ -116,7 +129,12 @@ async fn save_proxy_ports(
     config.save(&path).map_err(|e| e.to_string())?;
 
     let (tx, rx) = oneshot::channel();
-    let reload = if state.commands.send(IpcCommand::ReloadConfig(tx)).await.is_ok() {
+    let reload = if state
+        .commands
+        .send(IpcCommand::ReloadConfig(tx))
+        .await
+        .is_ok()
+    {
         rx.await.ok().and_then(Result::ok)
     } else {
         None
@@ -189,6 +207,7 @@ fn main() {
             status,
             daemon_connect,
             daemon_stop,
+            daemon_new_identity,
             get_proxy_ports,
             save_proxy_ports
         ])
@@ -301,7 +320,10 @@ async fn watch_daemon(
 fn reject_command(cmd: IpcCommand, message: &str) {
     let err = Err(message.to_owned());
     match cmd {
-        IpcCommand::Connect(tx) | IpcCommand::Stop(tx) | IpcCommand::ReloadConfig(tx) => {
+        IpcCommand::Connect(tx)
+        | IpcCommand::Stop(tx)
+        | IpcCommand::NewIdentity(tx)
+        | IpcCommand::ReloadConfig(tx) => {
             let _ = tx.send(err);
         }
     }
@@ -360,6 +382,14 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
         IpcCommand::Stop(tx) => {
             let result = client
                 .call(methods::STOP, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            refresh_status(handle, client).await;
+        }
+        IpcCommand::NewIdentity(tx) => {
+            let result = client
+                .call(methods::NEW_IDENTITY, None)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);

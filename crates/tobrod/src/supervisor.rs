@@ -35,6 +35,8 @@ pub enum Command {
     },
     /// Request that Tor stop serving.
     Disconnect,
+    /// Request a new identity (restart client/listeners for new circuits).
+    NewIdentity,
     /// Shut down the supervisor.
     Shutdown,
 }
@@ -98,6 +100,11 @@ impl SupervisorHandle {
     /// Request disconnect/stop.
     pub async fn disconnect(&self) -> Result<(), mpsc::error::SendError<Command>> {
         self.cmd_tx.send(Command::Disconnect).await
+    }
+
+    /// Request a new identity (new circuits). Only meaningful while connected.
+    pub async fn new_identity(&self) -> Result<(), mpsc::error::SendError<Command>> {
+        self.cmd_tx.send(Command::NewIdentity).await
     }
 
     /// Request supervisor shutdown.
@@ -180,6 +187,7 @@ async fn run(
     let mut last_start: Option<(PathBuf, PathBuf, ListenerConfig)> = None;
     let mut backoff = BACKOFF_INITIAL;
     let mut restart_deadline: Option<tokio::time::Instant> = None;
+    let mut intentional_restart = false;
 
     publish(&lifecycle, listeners.clone(), &status_tx, &events_tx);
 
@@ -191,7 +199,8 @@ async fn run(
                 cmd = cmd_rx.recv() => {
                     if handle_command(
                         cmd, &mut lifecycle, &mut worker, &mut listeners, &mut last_start,
-                        &mut backoff, &mut restart_deadline, &status_tx, &events_tx,
+                        &mut backoff, &mut restart_deadline, &mut intentional_restart,
+                        &status_tx, &events_tx,
                     ) {
                         return;
                     }
@@ -199,7 +208,8 @@ async fn run(
                 msg = w.msg_rx.recv() => {
                     handle_worker_msg(
                         msg, &mut lifecycle, &mut worker, &mut listeners, &mut last_start,
-                        &mut backoff, &mut restart_deadline, &status_tx, &events_tx,
+                        &mut backoff, &mut restart_deadline, &mut intentional_restart,
+                        &status_tx, &events_tx,
                     );
                 }
                 _ = sleep_until_opt(deadline), if deadline.is_some() => {
@@ -215,7 +225,8 @@ async fn run(
                 cmd = cmd_rx.recv() => {
                     if handle_command(
                         cmd, &mut lifecycle, &mut worker, &mut listeners, &mut last_start,
-                        &mut backoff, &mut restart_deadline, &status_tx, &events_tx,
+                        &mut backoff, &mut restart_deadline, &mut intentional_restart,
+                        &status_tx, &events_tx,
                     ) {
                         return;
                     }
@@ -248,6 +259,7 @@ fn handle_command(
     last_start: &mut Option<(PathBuf, PathBuf, ListenerConfig)>,
     backoff: &mut Duration,
     restart_deadline: &mut Option<tokio::time::Instant>,
+    intentional_restart: &mut bool,
     status_tx: &watch::Sender<Snapshot>,
     events_tx: &broadcast::Sender<SupervisorEvent>,
 ) -> bool {
@@ -257,6 +269,7 @@ fn handle_command(
             cache_dir,
             listeners: ls,
         }) => {
+            *intentional_restart = false;
             *restart_deadline = None;
             *backoff = BACKOFF_INITIAL;
             *listeners = Some(ls.clone());
@@ -286,6 +299,7 @@ fn handle_command(
             false
         }
         Some(Command::Disconnect) => {
+            *intentional_restart = false;
             *restart_deadline = None;
             apply(
                 lifecycle,
@@ -303,7 +317,42 @@ fn handle_command(
             publish(lifecycle, listeners.clone(), status_tx, events_tx);
             false
         }
+        Some(Command::NewIdentity) => {
+            if lifecycle.desired() != Desired::Connected || last_start.is_none() {
+                let message = "cannot request new identity: Tor is not connected".to_owned();
+                warn!(%message, "new identity rejected");
+                let _ = events_tx.send(SupervisorEvent::Failed { message });
+                publish(lifecycle, listeners.clone(), status_tx, events_tx);
+                return false;
+            }
+            info!("requesting new identity (restarting Tor client/listeners for new circuits)");
+            *intentional_restart = true;
+            *restart_deadline = None;
+            *backoff = BACKOFF_INITIAL;
+            let _ = events_tx.send(SupervisorEvent::BootstrapProgress {
+                percent: None,
+                detail: "requesting new identity (new circuits)…".to_owned(),
+            });
+            if let Some(w) = worker.as_mut() {
+                apply(lifecycle, Event::StopBegun, listeners, status_tx, events_tx);
+                w.stop();
+            } else if let Some((state_dir, cache_dir, ls)) = last_start.clone() {
+                *listeners = Some(ls.clone());
+                apply(
+                    lifecycle,
+                    Event::StartBegun,
+                    listeners,
+                    status_tx,
+                    events_tx,
+                );
+                *worker = Some(start_worker(state_dir, cache_dir, ls));
+                *intentional_restart = false;
+            }
+            publish(lifecycle, listeners.clone(), status_tx, events_tx);
+            false
+        }
         Some(Command::Shutdown) | None => {
+            *intentional_restart = false;
             apply(lifecycle, Event::Shutdown, listeners, status_tx, events_tx);
             if let Some(w) = worker.as_mut() {
                 apply(lifecycle, Event::StopBegun, listeners, status_tx, events_tx);
@@ -353,9 +402,10 @@ fn handle_worker_msg(
     lifecycle: &mut Lifecycle,
     worker: &mut Option<RunningWorker>,
     listeners: &mut Option<ListenerConfig>,
-    _last_start: &mut Option<(PathBuf, PathBuf, ListenerConfig)>,
+    last_start: &mut Option<(PathBuf, PathBuf, ListenerConfig)>,
     backoff: &mut Duration,
     restart_deadline: &mut Option<tokio::time::Instant>,
+    intentional_restart: &mut bool,
     status_tx: &watch::Sender<Snapshot>,
     events_tx: &broadcast::Sender<SupervisorEvent>,
 ) {
@@ -368,7 +418,38 @@ fn handle_worker_msg(
             match result {
                 Ok(()) => {
                     apply(lifecycle, Event::Stopped, listeners, status_tx, events_tx);
-                    if lifecycle.desired() == Desired::Connected {
+                    if *intentional_restart && lifecycle.desired() == Desired::Connected {
+                        *intentional_restart = false;
+                        *restart_deadline = None;
+                        *backoff = BACKOFF_INITIAL;
+                        if let Some((state_dir, cache_dir, ls)) = last_start.clone() {
+                            info!("restarting Tor for new identity");
+                            *listeners = Some(ls.clone());
+                            apply(
+                                lifecycle,
+                                Event::StartBegun,
+                                listeners,
+                                status_tx,
+                                events_tx,
+                            );
+                            *worker = Some(start_worker(state_dir, cache_dir, ls));
+                        } else {
+                            let message =
+                                "new identity restart failed: missing previous configuration"
+                                    .to_owned();
+                            apply(
+                                lifecycle,
+                                Event::Failed {
+                                    message: message.clone(),
+                                    retryable: false,
+                                },
+                                listeners,
+                                status_tx,
+                                events_tx,
+                            );
+                            let _ = events_tx.send(SupervisorEvent::Failed { message });
+                        }
+                    } else if lifecycle.desired() == Desired::Connected {
                         let message = "proxy service exited unexpectedly".to_owned();
                         apply(
                             lifecycle,
@@ -386,6 +467,7 @@ fn handle_worker_msg(
                     }
                 }
                 Err(message) => {
+                    *intentional_restart = false;
                     let retryable = lifecycle.desired() == Desired::Connected;
                     apply(
                         lifecycle,

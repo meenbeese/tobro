@@ -12,10 +12,10 @@
 //! JSON-RPC framing; the pipe name is derived from the socket path, so both
 //! platforms share one endpoint convention.
 //!
-//! # M1 surface
+//! # M1/M2 surface
 //!
 //! Methods: `daemon.hello`, `daemon.status`, `daemon.connect`, `daemon.stop`,
-//! `daemon.reload_config`.
+//! `daemon.reload_config`, `daemon.new_identity`.
 //! Notifications: `bootstrap.progress`, `daemon.state_changed`.
 //! Servers enforce a method allowlist, version/hello preflight, explicit no-params
 //! validation, peer-identity checks (platform-specific), and idle-connection timeouts.
@@ -62,6 +62,8 @@ pub mod methods {
     pub const STOP: &str = "daemon.stop";
     /// Reload and validate configuration from disk (apply semantics are method-specific).
     pub const RELOAD_CONFIG: &str = "daemon.reload_config";
+    /// Request a new identity (restart Tor client/listeners for new circuits).
+    pub const NEW_IDENTITY: &str = "daemon.new_identity";
 
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
@@ -76,17 +78,19 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::CONNECT
             | methods::STOP
             | methods::RELOAD_CONFIG
+            | methods::NEW_IDENTITY
     )
 }
 
-/// Validate that an M1 method's params are absent/null/empty (no-params contract).
+/// Validate that an M1/M2 method's params are absent/null/empty (no-params contract).
 pub fn validate_no_params(method: &str, params: &Option<Value>) -> Result<(), RpcError> {
     match method {
         methods::HELLO
         | methods::STATUS
         | methods::CONNECT
         | methods::STOP
-        | methods::RELOAD_CONFIG => {
+        | methods::RELOAD_CONFIG
+        | methods::NEW_IDENTITY => {
             if let Some(p) = params
                 && !p.is_null()
                 && !(p.is_object() && p.as_object().is_some_and(|o| o.is_empty()))

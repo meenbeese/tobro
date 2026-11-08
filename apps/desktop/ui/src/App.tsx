@@ -201,6 +201,19 @@ export default function App() {
     }
   }
 
+  async function onNewIdentity() {
+    setBusy(true);
+    appendLog("requesting new identity (new circuits)…");
+    try {
+      const result = await invoke<{ note?: string }>("daemon_new_identity");
+      if (result?.note) appendLog(result.note);
+    } catch (e) {
+      appendLog(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function updatePort(field: PortField, value: string) {
     setPortsDirty(true);
     setPortsError("");
@@ -361,9 +374,19 @@ export default function App() {
               Connect
             </button>
           ) : (
-            <button className="danger" onClick={onStop} disabled={!canAct}>
-              Stop
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={onNewIdentity}
+                disabled={!canAct || status?.state !== "connected" && status?.state !== "serving"}
+                title="Request new circuits. Guard state is preserved; this is not identical to Tor's NEWNYM."
+              >
+                New identity
+              </button>
+              <button className="danger" onClick={onStop} disabled={!canAct}>
+                Stop
+              </button>
+            </>
           )}
         </div>
       </section>
