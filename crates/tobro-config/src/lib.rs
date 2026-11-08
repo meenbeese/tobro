@@ -515,6 +515,39 @@ level = "info"
     }
 
     #[test]
+    fn udp_port_availability_reflects_bind() -> Result<(), Box<dyn std::error::Error>> {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = socket.local_addr()?.port();
+        assert!(!udp_port_available(port));
+        drop(socket);
+        // After release the port should usually become available; this is a
+        // best-effort check and not asserted to avoid flakiness on all OSes.
+        let _ = udp_port_available(port);
+        Ok(())
+    }
+
+    #[test]
+    fn port_conflicts_reports_dns_udp_in_use() -> Result<(), Box<dyn std::error::Error>> {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let dns_port = socket.local_addr()?.port();
+        // Keep socks/http on ports that are very likely free by probing.
+        let socks_port = next_available_port(40000, tcp_port_available).unwrap_or(19050);
+        let proxy = ProxyConfig {
+            socks_port,
+            http_port: 0,
+            dns_port,
+        };
+        let conflicts = port_conflicts(&proxy);
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.contains("proxy.dns_port") && c.contains("DNS UDP")),
+            "expected DNS conflict, got: {conflicts:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
         let path = dir.path().join("config.toml");

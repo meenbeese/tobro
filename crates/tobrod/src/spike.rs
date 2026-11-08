@@ -19,7 +19,7 @@ use serde::Serialize;
 use tobro_ipc::DaemonState;
 use tobro_tor::{Tor, parse_http_status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
 /// Arguments for `tobrod spike`.
@@ -45,7 +45,15 @@ pub struct SpikeArgs {
     #[arg(long)]
     pub no_check: bool,
 
-    /// Exit once the SOCKS listener check finishes (useful for CI).
+    /// Resolve this hostname through the local DNS proxy (UDP) after serving
+    /// starts. Use a `.onion` name for the M2 `.onion` resolution test. The
+    /// check is opt-in because it needs Tor to be bootstrapped and a reachable
+    /// target; the first DNS query can take several seconds while a circuit is
+    /// built.
+    #[arg(long)]
+    pub dns_check_host: Option<String>,
+
+    /// Exit once the listener checks finish (useful for CI/manual verification).
     #[arg(long)]
     pub exit_after_check: bool,
 
@@ -85,6 +93,11 @@ enum Event {
     SocksCheck {
         target: String,
         status: u16,
+        elapsed_ms: u64,
+    },
+    DnsCheck {
+        target: String,
+        answers: u16,
         elapsed_ms: u64,
     },
     Error {
@@ -174,53 +187,53 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
         ipc_socket,
     });
 
-    let check = if args.no_check {
+    let limit = Duration::from_secs(args.timeout_secs);
+    let socks_check = if args.no_check {
         None
     } else {
         let host = args.check_host.clone();
         let port = args.check_port;
-        let limit = Duration::from_secs(args.timeout_secs);
         Some(tokio::spawn(async move {
             socks_check_with_retry(socks_addr, &host, port, limit).await
         }))
     };
+    let dns_addr = SocketAddr::from(([127, 0, 0, 1], args.dns_port));
+    let dns_check = args.dns_check_host.as_ref().map(|host| {
+        let host = host.clone();
+        tokio::spawn(async move { dns_check_with_retry(dns_addr, &host, limit).await })
+    });
 
     let serve = tobro_tor::serve(&state_dir, &cache_dir, args.socks_port, args.dns_port);
     tokio::pin!(serve);
 
-    match check {
-        Some(handle) => {
-            tokio::select! {
-                result = &mut serve => result.context("the Arti listener failed")?,
-                joined = handle => {
-                    match joined {
-                        Ok(Ok((status, elapsed_ms))) => emit(&Event::SocksCheck {
-                            target: format!("{}:{}", args.check_host, args.check_port),
-                            status,
-                            elapsed_ms,
-                        }),
-                        Ok(Err(error)) => emit(&Event::Error {
-                            context: "SOCKS check".to_owned(),
-                            message: format!("{error:#}"),
-                        }),
-                        Err(error) => emit(&Event::Error {
-                            context: "SOCKS check task".to_owned(),
-                            message: error.to_string(),
-                        }),
-                    }
-
-                    if args.exit_after_check {
-                        return Ok(());
-                    }
-                    (&mut serve).await.context("the Arti listener failed")?;
-                }
+    if args.exit_after_check && (socks_check.is_some() || dns_check.is_some()) {
+        let checks = async {
+            if let Some(handle) = socks_check {
+                report_socks_check(handle, &args.check_host, args.check_port).await;
             }
+            if let Some(handle) = dns_check {
+                report_dns_check(handle, args.dns_check_host.as_deref().unwrap_or_default()).await;
+            }
+        };
+        tokio::select! {
+            result = &mut serve => result.context("the Arti listener failed")?,
+            _ = checks => return Ok(()),
         }
-        None => {
-            (&mut serve).await.context("the Arti listener failed")?;
-        }
+        return Ok(());
     }
 
+    // Long-running mode: report checks in the background while serving.
+    if let Some(handle) = socks_check {
+        let host = args.check_host.clone();
+        let port = args.check_port;
+        tokio::spawn(async move { report_socks_check(handle, &host, port).await });
+    }
+    if let Some(handle) = dns_check {
+        let host = args.dns_check_host.clone().unwrap_or_default();
+        tokio::spawn(async move { report_dns_check(handle, &host).await });
+    }
+
+    (&mut serve).await.context("the Arti listener failed")?;
     Ok(())
 }
 
@@ -364,4 +377,180 @@ async fn check_via_socks(
         )
     })?;
     Ok((status, started.elapsed().as_millis() as u64))
+}
+
+async fn report_socks_check(
+    handle: tokio::task::JoinHandle<anyhow::Result<(u16, u64)>>,
+    host: &str,
+    port: u16,
+) {
+    match handle.await {
+        Ok(Ok((status, elapsed_ms))) => emit(&Event::SocksCheck {
+            target: format!("{host}:{port}"),
+            status,
+            elapsed_ms,
+        }),
+        Ok(Err(error)) => emit(&Event::Error {
+            context: "SOCKS check".to_owned(),
+            message: format!("{error:#}"),
+        }),
+        Err(error) => emit(&Event::Error {
+            context: "SOCKS check task".to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Retry DNS resolution a few times.
+///
+/// Arti's DNS proxy is UDP-only and the first query after startup can take
+/// several seconds while a circuit is built, so transient failures/timeouts are
+/// expected early in a serving session.
+async fn dns_check_with_retry(
+    resolver: SocketAddr,
+    host: &str,
+    limit: Duration,
+) -> anyhow::Result<(u16, u64)> {
+    const ATTEMPTS: usize = 6;
+    let per_attempt = (limit / ATTEMPTS as u32).max(Duration::from_secs(10));
+    let mut last_error = None;
+    for attempt in 1..=ATTEMPTS {
+        match check_via_dns(resolver, host, per_attempt).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if attempt < ATTEMPTS {
+                    eprintln!("tobrod: DNS check attempt {attempt} failed: {error:#}; retrying");
+                    sleep(Duration::from_secs(2)).await;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("the DNS check failed")))
+}
+
+async fn report_dns_check(handle: tokio::task::JoinHandle<anyhow::Result<(u16, u64)>>, host: &str) {
+    match handle.await {
+        Ok(Ok((answers, elapsed_ms))) => emit(&Event::DnsCheck {
+            target: host.to_owned(),
+            answers,
+            elapsed_ms,
+        }),
+        Ok(Err(error)) => emit(&Event::Error {
+            context: "DNS check".to_owned(),
+            message: format!("{error:#}"),
+        }),
+        Err(error) => emit(&Event::Error {
+            context: "DNS check task".to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Resolve `host` through a local DNS proxy (UDP) and return answer count.
+///
+/// Sends a minimal A (IN) query and accepts any NOERROR response with at least
+/// one answer record. This proves DNS wiring; for `.onion` names it verifies
+/// client-side `.onion` resolution through the configured Tor DNS listener.
+async fn check_via_dns(
+    resolver: SocketAddr,
+    host: &str,
+    limit: Duration,
+) -> anyhow::Result<(u16, u64)> {
+    let started = Instant::now();
+    let id = 0xB007u16;
+    let query = build_dns_a_query(id, host)?;
+    let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .context("could not bind UDP socket for DNS check")?;
+    socket
+        .connect(resolver)
+        .await
+        .context("could not target the DNS listener")?;
+
+    let mut buf = [0u8; 1500];
+    let answers = timeout(limit, async {
+        socket.send(&query).await?;
+        let n = socket.recv(&mut buf).await?;
+        parse_dns_response(id, &buf[..n])
+    })
+    .await
+    .context("timed out waiting for a DNS response")??;
+
+    Ok((answers, started.elapsed().as_millis() as u64))
+}
+
+fn build_dns_a_query(id: u16, host: &str) -> anyhow::Result<Vec<u8>> {
+    let host = host.trim_end_matches('.');
+    anyhow::ensure!(!host.is_empty(), "DNS check host must not be empty");
+    let mut out = Vec::with_capacity(host.len() + 18);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&[0x01, 0x00]); // RD
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in host.split('.') {
+        anyhow::ensure!(
+            !label.is_empty() && label.len() <= 63,
+            "invalid DNS label in {host:?}"
+        );
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out.extend_from_slice(&1u16.to_be_bytes()); // QTYPE=A
+    out.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+    Ok(out)
+}
+
+fn parse_dns_response(expected_id: u16, packet: &[u8]) -> anyhow::Result<u16> {
+    anyhow::ensure!(
+        packet.len() >= 12,
+        "short DNS response ({} bytes)",
+        packet.len()
+    );
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    anyhow::ensure!(
+        id == expected_id,
+        "DNS response id {id:#06x} did not match query"
+    );
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    anyhow::ensure!(flags & 0x8000 != 0, "DNS packet was not a response");
+    let rcode = flags & 0x000F;
+    anyhow::ensure!(rcode == 0, "DNS response returned error rcode {rcode}");
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]);
+    anyhow::ensure!(ancount > 0, "DNS response contained no answer records");
+    Ok(ancount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_dns_a_query, parse_dns_response};
+
+    #[test]
+    fn builds_dns_a_query_for_onion() -> Result<(), Box<dyn std::error::Error>> {
+        let packet = build_dns_a_query(
+            0x1234,
+            "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
+        )?;
+        assert_eq!(&packet[0..2], &0x1234u16.to_be_bytes());
+        assert!(packet.windows("onion".len()).any(|w| w == b"onion"));
+        assert_eq!(&packet[packet.len() - 4..], &[0, 1, 0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_noerror_dns_response() -> Result<(), Box<dyn std::error::Error>> {
+        // Minimal header: id, QR+RD+RA+NOERROR, qd=1, an=2
+        let packet = [0xB0, 0x07, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0, 0, 0, 0];
+        assert_eq!(parse_dns_response(0xB007, &packet)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dns_error_response() {
+        let packet = [0xB0, 0x07, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0]; // NXDOMAIN
+        assert!(parse_dns_response(0xB007, &packet).is_err());
+    }
 }
