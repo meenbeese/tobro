@@ -36,7 +36,37 @@ body {
   gap: 16px;
   min-height: 100vh;
 }
+.hero {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.app-icon {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+}
 .hero h1 { margin: 0; font-size: 1.5rem; }
+.hero p { margin: 2px 0 0; font-size: 0.9rem; }
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.toolbar button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  font-size: 0.9rem;
+}
+.toolbar button:hover:not(:disabled) { border-color: var(--muted); }
 .muted { color: var(--muted); }
 .card {
   background: var(--card);
@@ -143,7 +173,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .log-line {
   display: grid;
-  grid-template-columns: auto auto 1fr;
+  grid-template-columns: auto auto auto 1fr;
   gap: 8px;
   padding: 4px 0;
   border-bottom: 1px solid var(--border);
@@ -152,7 +182,18 @@ button:disabled { opacity: 0.5; cursor: default; }
 .log-line.error { color: var(--bad); }
 .log-ts { color: var(--muted); white-space: nowrap; }
 .log-level { color: var(--muted); text-transform: uppercase; font-size: 0.9em; }
-.log-text { word-break: break-word; white-space: pre-wrap; }
+.log-source {
+  color: var(--muted);
+  font-size: 0.85em;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.log-source.empty { display: none; }
+.log-empty { padding: 8px 0; }
+.log-list.nowrap .log-text { white-space: pre; overflow-x: auto; word-break: normal; }
+.log-list.wrap .log-text { white-space: pre-wrap; word-break: break-word; }
 .sr-only {
   position: absolute;
   width: 1px;
@@ -189,3 +230,44 @@ button:disabled { opacity: 0.5; cursor: default; }
   padding: 8px 10px;
 }
 .error { color: var(--bad); }
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.panel-header h2, .config-import h3 { margin: 0 0 4px; font-size: 1rem; }
+.panel-header p { margin: 0; font-size: 0.9rem; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.config-actions button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  font-size: 0.9rem;
+}
+.config-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.config-preview { margin: 12px 0; }
+.config-preview summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+.config-preview pre, .config-textarea {
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: auto;
+  max-height: 260px;
+}
+.config-textarea {
+  width: 100%;
+  min-height: 180px;
+  max-height: 360px;
+  resize: vertical;
+}
+.config-import p { margin: 0 0 10px; font-size: 0.9rem; }
+.config-messages { margin: 10px 0 0; padding-left: 18px; font-size: 0.9rem; }
+.config-messages li { margin: 2px 0; }

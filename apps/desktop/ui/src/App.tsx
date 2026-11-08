@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
+import appIconUrl from "./assets/icon.svg";
+import { ConfigPanel } from "./ConfigPanel";
 import { LogViewer, type LogEntry } from "./LogViewer";
 
 type DaemonState =
@@ -80,6 +82,7 @@ export default function App() {
   const [portsBusy, setPortsBusy] = useState(false);
   const [portsMessage, setPortsMessage] = useState<string>("");
   const [portsError, setPortsError] = useState<string>("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const nextLogId = useRef(1);
 
   function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
@@ -144,7 +147,7 @@ export default function App() {
         if (kind === "unreachable") {
           setReachable(false);
           const p = payload as { error?: string };
-          if (p?.error) appendLog(p.error, "error");
+          if (p?.error) appendLog(p.error, "error", "daemon");
           return;
         }
         if (kind === "event") {
@@ -153,10 +156,15 @@ export default function App() {
             const b = (e.params ?? {}) as BootstrapProgress;
             appendLog(
               `bootstrap ${typeof b.percent === "number" ? `${b.percent}%` : ""}${b.detail ? ` — ${b.detail}` : ""}`.trim(),
+              "info",
+              "daemon",
             );
           } else if (e.method === "daemon.state_changed") {
-            const s = (e.params ?? {}) as { state?: string };
-            appendLog(`state → ${s.state ?? "?"}`);
+            const s = (e.params ?? {}) as { state?: string; message?: string };
+            const detail = s.message ? ` — ${s.message}` : "";
+            appendLog(`state → ${s.state ?? "?"}${detail}`, s.state === "error" ? "error" : "info", "daemon");
+          } else if (e.method) {
+            appendLog(`${e.method}`, "info", "daemon");
           }
         }
       });
@@ -176,14 +184,19 @@ export default function App() {
   const headline = useMemo(() => formatStatus(status, reachable), [status, reachable]);
   const isActive = status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving";
   const canAct = reachable && !busy && status?.state !== "starting" && status?.state !== "stopping";
+  const canNewIdentity = canAct && (status?.state === "connected" || status?.state === "serving");
+
+  function onPlaceholder(feature: string) {
+    appendLog(`${feature}: coming soon.`, "info", "ui");
+  }
 
   async function onConnect() {
     setBusy(true);
-    appendLog("requesting connect…");
+    appendLog("requesting connect…", "info", "ui");
     try {
       await invoke("daemon_connect");
     } catch (e) {
-      appendLog(String(e), "error");
+      appendLog(String(e), "error", "ui");
     } finally {
       setBusy(false);
     }
@@ -191,11 +204,11 @@ export default function App() {
 
   async function onStop() {
     setBusy(true);
-    appendLog("requesting stop…");
+    appendLog("requesting stop…", "info", "ui");
     try {
       await invoke("daemon_stop");
     } catch (e) {
-      appendLog(String(e), "error");
+      appendLog(String(e), "error", "ui");
     } finally {
       setBusy(false);
     }
@@ -203,12 +216,12 @@ export default function App() {
 
   async function onNewIdentity() {
     setBusy(true);
-    appendLog("requesting new identity (new circuits)…");
+    appendLog("requesting new identity (new circuits)…", "info", "ui");
     try {
       const result = await invoke<{ note?: string }>("daemon_new_identity");
-      if (result?.note) appendLog(result.note);
+      if (result?.note) appendLog(result.note, "info", "daemon");
     } catch (e) {
-      appendLog(String(e), "error");
+      appendLog(String(e), "error", "ui");
     } finally {
       setBusy(false);
     }
@@ -274,12 +287,12 @@ export default function App() {
       const warnings = result.reload?.warnings ?? [];
       const msg = apply ? `Saved. ${apply}` : "Saved to config.";
       setPortsMessage(warnings.length ? `${msg} Warnings: ${warnings.join(" | ")}` : msg);
-      appendLog(`ports saved (SOCKS ${socksPort}, HTTP ${httpPort || socksPort}, DNS ${dnsPort})`);
-      if (warnings.length) appendLog(warnings.join(" | "), "error");
+      appendLog(`ports saved (SOCKS ${socksPort}, HTTP ${httpPort || socksPort}, DNS ${dnsPort})`, "info", "ui");
+      if (warnings.length) appendLog(warnings.join(" | "), "error", "ui");
     } catch (e) {
       const message = String(e);
       setPortsError(message);
-      appendLog(message, "error");
+      appendLog(message, "error", "ui");
     } finally {
       setPortsBusy(false);
     }
@@ -291,10 +304,27 @@ export default function App() {
   return (
     <main className="app">
       <header className="hero">
-        <div>
-          <h1>tobro</h1>
-          <p className="muted">{daemonInfo || "Connecting to local daemon…"}</p>
+        <div className="brand">
+          <img src={appIconUrl} alt="" className="app-icon" width={44} height={44} />
+          <div>
+            <h1>Tobro</h1>
+            <p className="muted">{daemonInfo || "Connecting to local daemon…"}</p>
+          </div>
         </div>
+        <nav className="toolbar" aria-label="App actions">
+          <button type="button" onClick={onNewIdentity} disabled={!canNewIdentity} title="Request new circuits (implemented). Guard state preserved.">
+            New identity
+          </button>
+          <button type="button" disabled title="Change exit country (coming soon)">
+            Change exit
+          </button>
+          <button type="button" onClick={() => setSettingsOpen((v) => !v)} aria-expanded={settingsOpen} title="Config import/export and settings">
+            Settings
+          </button>
+          <button type="button" onClick={() => onPlaceholder("About")} title="About (coming soon)">
+            About
+          </button>
+        </nav>
       </header>
 
       <section className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"}`}>
@@ -391,7 +421,15 @@ export default function App() {
         </div>
       </section>
 
-      <LogViewer entries={logs} onClear={() => setLogs([])} />
+      {settingsOpen ? (
+        <ConfigPanel
+          onClose={() => setSettingsOpen(false)}
+          onApplied={() => void loadPorts()}
+          appendLog={appendLog}
+        />
+      ) : null}
+
+      <LogViewer entries={logs} onClear={() => setLogs([])} defaultOpen={false} />
     </main>
   );
 }

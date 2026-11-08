@@ -173,7 +173,8 @@ fn read_patch(input: &str) -> anyhow::Result<Value> {
             .context("failed to read patch from stdin")?;
         buf
     } else if let Some(path) = input.strip_prefix('@') {
-        std::fs::read_to_string(path).with_context(|| format!("failed to read patch from {path}"))?
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read patch from {path}"))?
     } else {
         input.to_owned()
     };

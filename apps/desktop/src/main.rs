@@ -23,6 +23,10 @@ enum IpcCommand {
     Stop(oneshot::Sender<Result<Value, String>>),
     NewIdentity(oneshot::Sender<Result<Value, String>>),
     ConfigGet(oneshot::Sender<Result<Value, String>>),
+    ConfigValidate {
+        patch: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ConfigApply {
         patch: Value,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -111,6 +115,18 @@ async fn daemon_get_config(state: State<'_, AppState>) -> Result<Value, String> 
 }
 
 #[tauri::command]
+async fn daemon_validate_config(state: State<'_, AppState>, patch: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ConfigValidate { patch, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
 async fn daemon_apply_config(state: State<'_, AppState>, patch: Value) -> Result<Value, String> {
     let (tx, rx) = oneshot::channel();
     state
@@ -188,7 +204,10 @@ async fn save_proxy_ports(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let apply = if effects.get("runtime_active").and_then(Value::as_bool).unwrap_or(false)
+        let apply = if effects
+            .get("runtime_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
             && effects
                 .get("restart_required")
                 .and_then(Value::as_bool)
@@ -287,6 +306,7 @@ fn main() {
             daemon_stop,
             daemon_new_identity,
             daemon_get_config,
+            daemon_validate_config,
             daemon_apply_config,
             get_proxy_ports,
             save_proxy_ports
@@ -407,7 +427,7 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::ReloadConfig(tx) => {
             let _ = tx.send(err);
         }
-        IpcCommand::ConfigApply { reply, .. } => {
+        IpcCommand::ConfigValidate { reply, .. } | IpcCommand::ConfigApply { reply, .. } => {
             let _ = reply.send(err);
         }
     }
@@ -485,6 +505,13 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
+        }
+        IpcCommand::ConfigValidate { patch, reply } => {
+            let result = client
+                .call(methods::CONFIG_VALIDATE, Some(json!({ "patch": patch })))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
         }
         IpcCommand::ConfigApply { patch, reply } => {
             let result = client

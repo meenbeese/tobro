@@ -1,5 +1,19 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { redactLogText } from "./logRedaction";
+
+const PREF_REDACT = "tobro.logViewer.redact";
+const PREF_WRAP = "tobro.logViewer.wrap";
+
+function readBoolPref(key: string, fallback: boolean): boolean {
+  try {
+    const value = localStorage.getItem(key);
+    if (value === "true") return true;
+    if (value === "false") return false;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
 
 export type LogLevel = "info" | "error";
 
@@ -16,6 +30,7 @@ type LevelFilter = "all" | LogLevel;
 export interface LogViewerProps {
   entries: LogEntry[];
   onClear?: () => void;
+  defaultOpen?: boolean;
   className?: string;
 }
 
@@ -54,13 +69,30 @@ function serializeEntries(entries: LogEntry[], redacted: boolean): string {
   return `${header.join("\n")}${lines.join("\n")}\n`;
 }
 
-export function LogViewer({ entries, onClear, className }: LogViewerProps) {
-  const [open, setOpen] = useState(true);
+export function LogViewer({ entries, onClear, defaultOpen = false, className }: LogViewerProps) {
+  const [open, setOpen] = useState(defaultOpen);
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState<LevelFilter>("all");
-  const [applyRedaction, setApplyRedaction] = useState(true);
+  const [applyRedaction, setApplyRedaction] = useState(() => readBoolPref(PREF_REDACT, true));
+  const [wrapLines, setWrapLines] = useState(() => readBoolPref(PREF_WRAP, true));
   const [message, setMessage] = useState<string>("");
   const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PREF_REDACT, String(applyRedaction));
+    } catch {
+      // ignore
+    }
+  }, [applyRedaction]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PREF_WRAP, String(wrapLines));
+    } catch {
+      // ignore
+    }
+  }, [wrapLines]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -159,7 +191,15 @@ export function LogViewer({ entries, onClear, className }: LogViewerProps) {
                 checked={applyRedaction}
                 onChange={(e) => setApplyRedaction(e.target.checked)}
               />
-              Redact on copy/save/display
+              Redact
+            </label>
+            <label className="log-control log-check">
+              <input
+                type="checkbox"
+                checked={wrapLines}
+                onChange={(e) => setWrapLines(e.target.checked)}
+              />
+              Wrap
             </label>
             <div className="log-actions">
               <button type="button" onClick={() => void onCopy()} disabled={filtered.length === 0}>
@@ -179,14 +219,19 @@ export function LogViewer({ entries, onClear, className }: LogViewerProps) {
           {message ? <p className="muted log-message">{message}</p> : null}
           {error ? <p className="error log-message">{error}</p> : null}
 
-          <ol className="log-list" aria-label="Event log">
+          <ol className={`log-list ${wrapLines ? "wrap" : "nowrap"}`} aria-label="Event log">
             {displayEntries.length === 0 ? (
-              <li className="muted">{entries.length === 0 ? "No events yet." : "No matching events."}</li>
+              <li className="muted log-empty">
+                {entries.length === 0
+                  ? "No events yet. Connect to the daemon or perform an action to see status events here."
+                  : "No events match the current filters."}
+              </li>
             ) : null}
             {displayEntries.map((entry) => (
               <li key={entry.id} className={`log-line ${entry.level === "error" ? "error" : ""}`}>
                 <span className="log-ts">{formatStamp(entry.ts)}</span>
                 <span className="log-level">[{entry.level}]</span>
+                <span className={`log-source ${entry.source ? "" : "empty"}`}>{entry.source ?? ""}</span>
                 <span className="log-text">{entry.displayText}</span>
               </li>
             ))}

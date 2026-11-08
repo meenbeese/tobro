@@ -237,7 +237,9 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
                 if patch_value.is_null() {
                     base_map.remove(key);
                 } else {
-                    let entry = base_map.entry(key.clone()).or_insert(serde_json::Value::Null);
+                    let entry = base_map
+                        .entry(key.clone())
+                        .or_insert(serde_json::Value::Null);
                     merge_json(entry, patch_value);
                 }
             }
@@ -266,8 +268,8 @@ fn merged_config(
     let mut merged = serde_json::to_value(&current)
         .map_err(|e| format!("could not serialize current config: {e}"))?;
     merge_json(&mut merged, patch);
-    let next: tobro_config::Config = serde_json::from_value(merged)
-        .map_err(|e| format!("invalid config patch: {e}"))?;
+    let next: tobro_config::Config =
+        serde_json::from_value(merged).map_err(|e| format!("invalid config patch: {e}"))?;
     next.validate()
         .map_err(|e| format!("invalid config: {e}"))?;
     Ok((current, next))
@@ -531,10 +533,7 @@ impl DaemonControl for SupervisorHandle {
         Err("config operations require daemon config path context".to_owned())
     }
 
-    async fn config_apply(
-        &self,
-        _patch: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    async fn config_apply(&self, _patch: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("config operations require daemon config path context".to_owned())
     }
 
@@ -891,7 +890,9 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 .unwrap_or_else(|| json!({}));
             match control.config_validate(patch).await {
                 Ok(value) => RpcResponse::success(id, value),
-                Err(e) => RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e)),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
             }
         }
         methods::CONFIG_APPLY => {
@@ -903,7 +904,9 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 .unwrap_or_else(|| json!({}));
             match control.config_apply(patch).await {
                 Ok(value) => RpcResponse::success(id, value),
-                Err(e) => RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e)),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
             }
         }
         methods::RELOAD_CONFIG => match control.reload_config().await {
