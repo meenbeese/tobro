@@ -719,12 +719,15 @@ system.proxy_changed
 
 The Tauri layer exposes thin commands that call the same IPC client; the React app uses TanStack Query for request/response and a typed event subscription for pushes. No business logic in the UI beyond presentation and validation.
 
-> **M0 implementation (verified 2026-11-07):** length-prefixed JSON frames
-> (4-byte big-endian, 1 MiB cap) over a Unix socket at
-> `<state-dir>/tobrod.sock`. `daemon.hello`, `daemon.status`,
-> `bootstrap.progress`, and `daemon.state_changed` are implemented in
-> `tobro-ipc`/`tobrod`; `tobroctl status|watch` are the reference clients.
-> Windows named pipes, peer-credential auth, and the full method list remain.
+> **M0 implementation (2026-11-07, updated 2026-11-08):** length-prefixed
+> JSON frames (4-byte big-endian, 1 MiB cap) over a Unix socket at
+> `<state-dir>/tobrod.sock`, and Windows named pipes named
+> `\\.\pipe\tobro-<hash-of-state-path>` on the same framing.
+> `daemon.hello`, `daemon.status`, `bootstrap.progress`, and
+> `daemon.state_changed` are implemented in `tobro-ipc`/`tobrod`;
+> `tobroctl status|watch` are the reference clients, and the minimal Tauri
+> window (`apps/desktop`) is the GUI client. Peer-credential auth and the
+> full method list remain.
 
 ### 5.7 Configuration and reconfiguration flow
 
@@ -1595,7 +1598,7 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 - **Isolation:** `StreamPrefs::isolate_every_stream`, `new_isolation_group`, `set_isolation`; `isolated_client()` for unlinkable handles.
 - **New identity:** no `NEWNYM`; dispose/recreate the client. Document that guard state may persist.
 - **Onion services:** `create_onion_service`, `launch_onion_service`, `launch_onion_service_with_hsid`; restricted discovery via `generate_service_discovery_key`/`insert_service_discovery_key`/`rotate_service_discovery_key`; `KeyMgr` for client keys. APIs are evolving; wrap them.
-- **Bridges/PTs:** `BridgesConfig` (bridges, enabled, transports) and `pt-client`; `TransportConfig` describes the sidecar command/args. Verify the exact PT manager API on 0.48 during M0.
+- **Bridges/PTs:** `BridgesConfig` (bridges, enabled, transports) and `pt-client`; `TransportConfig` describes the sidecar command/args. Verify the exact PT manager API on 0.48 during M0. *(Verified in M0 — see the `pt_api_probe` example in `tobro-tor`.)*
 - **Outbound proxy:** `ChannelConfig::outbound_proxy` exposes `ProxyProtocol`; confirm supported schemes (HTTP CONNECT/SOCKS) and auth in M3. Shadowsocks via a local SOCKS5 sidecar.
 - **DNS (verified 2026-11-07):** Arti's DNS proxy is UDP-only — `bind_dns_resolver` binds UDP sockets and no TCP listener, despite the docs. Use it for `.onion` and optional DNS routing; the first query after startup can take several seconds while a circuit is built. Do not claim system-wide DNS protection in proxy mode.
 - **Failure mode:** Arti may call `exit(1)` on an obsolete consensus; the daemon must supervise and restart, not assume a clean error.

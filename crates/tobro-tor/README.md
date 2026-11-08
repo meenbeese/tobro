@@ -28,3 +28,30 @@ TCP listener, and the first query after startup can take several seconds while
 a circuit is built.
 
 See the module docs in `src/lib.rs` for details.
+
+## Pluggable transport API (M0 verification)
+
+`cargo run -p tobro-tor --features pt-client --example pt_api_probe` exercises
+the bridge/PT surface of `arti-client` 0.48 without networking. All checks
+pass; findings for M3 (plan §5.8, milestone M3):
+
+- `BridgeConfigBuilder` parses C Tor-style `Bridge <transport> <addr:port>
+  <id> k=v ...` lines with `FromStr` — Orbot-style bridge lines import
+  directly, no custom parser needed at first cut.
+- Hand-built bridges work: `.transport(name)`, `.push_setting(k, v)`,
+  `.set_addrs(vec![SocketAddr])`, `.set_ids(vec![...])`.
+- Transports live in a plain `Vec<TransportConfig>` under
+  `bridges.transports` (not an ordered map), each naming its transport name
+  protocols, the client binary `path`, and `run_on_startup`.
+- Validation happens at `TorClientConfig` build time: a bridge whose
+  transport has no matching `TransportConfig` fails with *"all bridges
+  unusable due to lack of corresponding pluggable transport"* — only when
+  **every** bridge is unusable, so partial bridge sets are tolerated.
+- `enabled` is `BoolOrAuto`: auto means "use bridges iff any are
+  configured".
+- **Process ownership:** `tor-ptmgr` *spawns and supervises the PT client
+  binary itself* (that is what `path` means). M3's "PT supervisor"
+  therefore is not a process manager for the client PTs arti launches;
+  it is (a) locating/verifying binaries and (b) building the
+  `TransportConfig`s. Anything arti cannot launch (DNS-based transports
+  like dnstt) remains a real sidecar in our supervisor.

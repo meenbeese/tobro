@@ -20,5 +20,11 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Enables the pluggable-transport API surface
+# (`config::pt::TransportConfig`, `BridgesConfig::transports`). Off by
+# default; the `pt_api_probe` example exercises it.
+pt-client = ["arti-client/pt-client"]
+
 [lints]
 workspace = true

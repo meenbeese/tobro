@@ -12,6 +12,7 @@ dist/
 # Tauri
 **/src-tauri/target/
 **/src-tauri/gen/
+apps/desktop/gen/
 
 # Environment and secrets
 .env

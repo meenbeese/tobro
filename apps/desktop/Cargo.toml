@@ -10,5 +10,16 @@ publish.workspace = true
 name = "tobro"
 path = "src/main.rs"
 
+[dependencies]
+tauri = { workspace = true }
+tokio = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tobro-ipc = { path = "../../crates/tobro-ipc" }
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
 [lints]
 workspace = true

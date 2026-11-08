@@ -1,0 +1,6 @@
+{
+  "identifier": "main-capability",
+  "description": "Permissions for the main tobro window: core APIs only (events and app commands).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

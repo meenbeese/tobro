@@ -2,9 +2,9 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0 spike in progress. Arti bootstrap/listeners and the local IPC
-socket/client (Unix socket + Windows named pipe) are implemented; the Tauri
-window, ADRs, and benchmarks are next.
+**Status:** M0 spike in progress. Arti bootstrap/listeners, the local IPC
+socket/client (Unix socket + Windows named pipe), and the minimal Tauri 2
+window are implemented; ADRs and benchmarks are next.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -41,6 +41,17 @@ cargo run -p tobroctl -- watch    # stream bootstrap.progress / state changes
 
 The socket defaults to `<platform data dir>/tobro/state/tobrod.sock`. Pass
 `--socket <path>` to both commands when using a custom `--state-dir`.
+
+## Try the window
+
+```sh
+cargo run -p tobro -- --socket /path/to/tobrod.sock   # e.g. from the spike above
+```
+
+A minimal Tauri window connects to the same socket (or the default platform
+path when run without `--socket`), streams `bootstrap.progress` and
+`daemon.state_changed` into the event list, and shows the latest daemon
+status. It retries once per second while no daemon is listening.
 
 ## License
 
