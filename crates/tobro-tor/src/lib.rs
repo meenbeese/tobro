@@ -15,9 +15,12 @@
 //! That is why [`Tor`] (bootstrap events, connectivity checks) and [`serve`]
 //! (long-running listeners) are separate phases: a `TorClient` holds an
 //! exclusive lock on its state directory, so the observation client must be
-//! dropped before the serving client is created.
+//! dropped before the serving client is created. The [`adapter`] module provides
+//! the M1 supervised start/stop/status wrapper around this pattern.
 
 #![forbid(unsafe_code)]
+
+pub mod adapter;
 
 use std::path::Path;
 use std::sync::Arc;

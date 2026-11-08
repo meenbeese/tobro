@@ -52,10 +52,7 @@ impl State {
 
     /// Whether a start/connect operation can be accepted.
     pub fn can_start(&self) -> bool {
-        matches!(
-            self,
-            Self::Stopped | Self::Failed { .. }
-        )
+        matches!(self, Self::Stopped | Self::Failed { .. })
     }
 
     /// Whether a stop/disconnect operation can be accepted.

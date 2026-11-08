@@ -75,8 +75,10 @@ impl Db {
         let db = Builder::new_local(path).build().await?;
         let conn = db.connect()?;
 
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
-            .await?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+        )
+        .await?;
         Self::migrate(&conn).await?;
 
         Ok(Self { _db: db, conn })

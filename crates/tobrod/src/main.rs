@@ -7,6 +7,7 @@
 mod ipc;
 mod lifecycle;
 mod spike;
+mod supervisor;
 
 use std::path::{Path, PathBuf};
 

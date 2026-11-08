@@ -154,11 +154,10 @@ impl Config {
     pub fn load_or_default(path: &Path) -> Result<Self, ConfigError> {
         match fs::read_to_string(path) {
             Ok(text) => {
-                let config: Self =
-                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
+                let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
                 config.validate()?;
                 Ok(config)
             }
@@ -204,10 +203,9 @@ impl Config {
     /// Save config to `path` atomically (write temp file, then rename).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
-        let parent = path.parent().ok_or_else(|| ConfigError::Invalid(format!(
-            "config path has no parent: {}",
-            path.display()
-        )))?;
+        let parent = path.parent().ok_or_else(|| {
+            ConfigError::Invalid(format!("config path has no parent: {}", path.display()))
+        })?;
         fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
             path: parent.to_path_buf(),
             source,
