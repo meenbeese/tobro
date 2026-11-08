@@ -417,14 +417,16 @@ async fn watch_daemon(
     mut commands: mpsc::Receiver<IpcCommand>,
 ) {
     let mut last_spawn_attempt: Option<Instant> = None;
+    let mut connect_pending = false;
     loop {
-        match connect_once(&handle, &daemon_socket, &mut commands).await {
+        match connect_once(&handle, &daemon_socket, &mut commands, &mut connect_pending).await {
             Ok(()) => {}
             Err(error) if error == "desktop command channel closed" => return,
             Err(error) => {
-                let should_spawn = last_spawn_attempt
-                    .map(|t| t.elapsed() >= Duration::from_secs(10))
-                    .unwrap_or(true);
+                let should_spawn = connect_pending
+                    || last_spawn_attempt
+                        .map(|t| t.elapsed() >= Duration::from_secs(10))
+                        .unwrap_or(true);
                 if should_spawn {
                     last_spawn_attempt = Some(Instant::now());
                     match spawn_daemon(&daemon_socket) {
@@ -444,6 +446,7 @@ async fn watch_daemon(
                             );
                         }
                         Err(spawn_error) => {
+                            connect_pending = false;
                             emit(
                                 &handle,
                                 "unreachable",
@@ -466,11 +469,42 @@ async fn watch_daemon(
                 }
             }
         }
-        // Drain commands while disconnected so callers don't hang forever.
-        while let Ok(cmd) = commands.try_recv() {
-            reject_command(cmd, "tobrod is not reachable");
+        // Handle commands while disconnected. "Connect" starts the daemon and
+        // requests Tor connect once IPC is available (Orbot-style single button).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, commands.recv()).await {
+                Ok(Some(IpcCommand::Connect(tx))) => {
+                    connect_pending = true;
+                    let should_spawn = last_spawn_attempt
+                        .map(|t| t.elapsed() >= Duration::from_secs(2))
+                        .unwrap_or(true);
+                    let mut note = "connecting (starting local daemon if needed)...".to_owned();
+                    if should_spawn {
+                        last_spawn_attempt = Some(Instant::now());
+                        if let Err(spawn_error) = spawn_daemon(&daemon_socket) {
+                            connect_pending = false;
+                            let _ = tx.send(Err(format!(
+                                "could not start tobrod: {spawn_error}. Set TOBROD_PATH or run `tobrod run --socket {}`.",
+                                daemon_socket.display()
+                            )));
+                            continue;
+                        }
+                        note = "starting tobrod and connecting...".to_owned();
+                    }
+                    let _ = tx.send(Ok(
+                        json!({ "ok": true, "action": "connect", "status": note }),
+                    ));
+                }
+                Ok(Some(cmd)) => reject_command(cmd, "tobrod is not reachable"),
+                Ok(None) => return,
+                Err(_) => break,
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -552,6 +586,7 @@ async fn connect_once(
     handle: &AppHandle,
     daemon_socket: &Path,
     commands: &mut mpsc::Receiver<IpcCommand>,
+    connect_pending: &mut bool,
 ) -> Result<(), String> {
     let mut client = Client::connect(daemon_socket)
         .await
@@ -559,6 +594,23 @@ async fn connect_once(
     emit(handle, "reachable", json!({ "socket": daemon_socket }));
     client.handshake().await.map_err(|e| e.to_string())?;
     refresh_status(handle, &mut client).await;
+
+    if *connect_pending {
+        *connect_pending = false;
+        match client.call(methods::CONNECT, None).await {
+            Ok(result) => emit(
+                handle,
+                "event",
+                json!({ "method": "ui.auto_connect", "params": result }),
+            ),
+            Err(error) => emit(
+                handle,
+                "event",
+                json!({ "method": "ui.auto_connect_error", "params": { "error": error.to_string() } }),
+            ),
+        }
+        refresh_status(handle, &mut client).await;
+    }
 
     loop {
         tokio::select! {

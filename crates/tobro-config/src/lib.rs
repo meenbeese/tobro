@@ -448,6 +448,91 @@ pub fn proxy_warnings(proxy: &ProxyConfig) -> Vec<String> {
     warnings
 }
 
+/// Explain a config knob path that is known but unsupported in this build.
+///
+/// Used to reject unsupported knobs explicitly (never silently ignored). Unknown
+/// fields are still rejected by `deny_unknown_fields` during deserialization.
+pub fn unsupported_knob_error(path: &str) -> Option<String> {
+    let (knob, explanation) = match path {
+        "network" | "network.exit_country" | "network.ipv6" | "network.geoip" => (
+            path,
+            "exit country/IPv6/StreamPrefs defaults are not wired yet (M2 open). Arti 0.48 supports StreamPrefs/geoip-gated exit country APIs, but tobro does not expose or apply this setting in the current build.",
+        ),
+        "tor" | "tor.entry_nodes" | "tor.exit_nodes" | "tor.exclude_nodes" | "tor.strict_nodes" => {
+            (
+                path,
+                "C Tor-style node restriction lists (entry/exit/exclude/strict nodes) are not exposed by the pinned Arti 2.8/arti-client 0.48 APIs used by tobro. The supported subset is currently none for these knobs; unsupported options remain hidden.",
+            )
+        }
+        "stream"
+        | "stream.isolation"
+        | "stream.destination_isolation"
+        | "stream.port_isolation"
+        | "stream.protocol_isolation" => (
+            path,
+            "stream isolation controls are not exposed yet (M2 open). Arti supports StreamPrefs isolation primitives, but tobro has not wired this setting.",
+        ),
+        "bridges" | "bridges.enabled" | "bridges.lines" | "transports" => (
+            path,
+            "bridge/pluggable-transport configuration is not exposed yet (M3 planned).",
+        ),
+        "onion_services" | "onion_services.client_auth" => (
+            path,
+            "onion service hosting/client authorization is not exposed yet (M5 planned).",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "unsupported config knob `{knob}`: {explanation} Unsupported knobs are rejected and never silently ignored; remove this field from the config/patch."
+    ))
+}
+
+/// Reject known unsupported knobs in a JSON config patch with explicit errors.
+pub fn check_unsupported_knobs(patch: &serde_json::Value) -> Result<(), String> {
+    fn walk(prefix: &str, value: &serde_json::Value, matches: &mut Vec<(String, String)>) {
+        if let Some(err) = unsupported_knob_error(prefix) {
+            matches.push((prefix.to_owned(), err));
+        }
+        if let serde_json::Value::Object(map) = value {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                walk(&path, child, matches);
+            }
+        }
+    }
+
+    let mut matches = Vec::new();
+    if let serde_json::Value::Object(map) = patch {
+        for (key, child) in map {
+            walk(key, child, &mut matches);
+        }
+    }
+    // Keep the most specific match when one path is an ancestor of another.
+    let errors = matches
+        .iter()
+        .filter(|(path, _)| {
+            !matches
+                .iter()
+                .any(|(other, _)| other != path && other.starts_with(&format!("{path}.")))
+        })
+        .map(|(_, err)| err.clone())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Human-readable summary of node restriction support (for UI/diagnostics).
+pub fn node_restrictions_support_summary() -> &'static str {
+    "Supported node restrictions (current build): none of C Tor's entry/exit/exclude/strict node lists are exposed by Arti 2.8/arti-client 0.48 APIs used by tobro. Exit country and IPv6/StreamPrefs defaults are planned (M2 open) and are not yet wired/applied. Unsupported knobs are hidden in the UI and rejected by config validation/import (never silently ignored)."
+}
+
 impl Config {
     /// Save config to `path` atomically (write temp file, then rename).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
@@ -620,6 +705,27 @@ level = "info"
         fs::write(&path, "version = 1\nnope = true\n")?;
         let err = Config::load(&path);
         assert!(matches!(err, Err(ConfigError::Parse { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_known_unsupported_node_restriction_knobs() {
+        let patch = serde_json::json!({ "tor": { "exit_nodes": "{us}" } });
+        let err = check_unsupported_knobs(&patch).expect_err("must reject unsupported knob");
+        assert!(err.contains("unsupported config knob"));
+        assert!(err.contains("tor"));
+        assert!(err.contains("never silently ignored"));
+
+        let patch = serde_json::json!({ "network": { "exit_country": "US" } });
+        let err = check_unsupported_knobs(&patch).expect_err("must reject unsupported knob");
+        assert!(err.contains("network.exit_country"));
+    }
+
+    #[test]
+    fn allows_supported_patch_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let patch =
+            serde_json::json!({ "proxy": { "socks_port": 9050, "bind_all_interfaces": false } });
+        check_unsupported_knobs(&patch).map_err(|e| format!("supported patch rejected: {e}"))?;
         Ok(())
     }
 }

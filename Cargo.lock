@@ -7043,6 +7043,7 @@ dependencies = [
  "anyhow",
  "directories",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",

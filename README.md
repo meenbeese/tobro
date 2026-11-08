@@ -22,15 +22,17 @@ DNS/`.onion` wiring verification (CI unit/config tests) plus an opt-in runtime
 supervised restart while preserving guard/state dirs) with tests/CLI/UI, daemon
 config API (`config.get`/`config.validate`/`config.apply`, redacted/no secrets,
 patch-based, deny-unknown-fields preserved), `tobroctl config get|validate|apply`,
+supported node-restrictions/unsupported-knob UX (supported subset documented in
+UI; known unsupported config knobs rejected explicitly, never silently ignored),
 desktop Advanced Settings behind a power-user gate with listener/bind-all
 editing and config import/export (no secrets), and a standalone log viewer
 (filters, copy/save, wrap, persisted redaction preference) plus daemon/UI
 redaction hardening.
 
-M2 still open: exit country/IPv6/`StreamPrefs`, stream isolation, supported
-node restrictions/unsupported-knob UX, and runtime/cross-OS verification for M2
-exit criteria (new identity, port conflicts, bind-all exposure, opt-in `.onion`
-resolution on a live Tor network).
+M2 still open: exit country/IPv6/`StreamPrefs`, stream isolation, and
+runtime/cross-OS verification for M2 exit criteria (new identity, port
+conflicts, bind-all exposure, opt-in `.onion` resolution on a live Tor network,
+and feature tests for every exposed knob).
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -76,13 +78,13 @@ resolution on a live Tor network).
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Try the daemon
+## CLI
 
 ```sh
 # terminal 1: start the control plane (loads config/store, idle until connect)
 cargo run -p tobrod -- run
 
-# terminal 2
+# terminal 2: control the daemon
 cargo run -p tobroctl -- status         # JSON status (stopped until connected)
 cargo run -p tobroctl -- connect        # start Tor/bootstrap + local listeners
 cargo run -p tobroctl -- status         # should become serving/connected when ready
@@ -90,9 +92,14 @@ cargo run -p tobroctl -- new-identity   # request new circuits (preserves guards
 cargo run -p tobroctl -- reload-config  # reload/validate config from disk
 cargo run -p tobroctl -- config get     # redacted config (no secrets)
 cargo run -p tobroctl -- config validate '{"proxy":{"socks_port":9050}}'
-cargo run -p tobroctl -- config apply '{"proxy":{"socks_port":9050}}'
+cargo run -p tobroctl -- config apply '{"proxy":{"socks_port":9050,"bind_all_interfaces":false}}'
 cargo run -p tobroctl -- stop           # disconnect Tor
 cargo run -p tobroctl -- watch          # stream state/bootstrap notifications
+
+# M0 spike / runtime checks (boots Tor, serves listeners)
+cargo run -p tobrod -- spike --exit-after-check
+# opt-in .onion resolution check through the local DNS proxy (UDP; needs live Tor + a reachable target)
+cargo run -p tobrod -- spike --exit-after-check --timeout-secs 300 --dns-check-host <v3-onion-hostname>.onion
 ```
 
 `tobrod run` starts stopped; use `connect` to start Tor. `tobroctl` prints JSON to
@@ -100,19 +107,13 @@ stdout and diagnostics to stderr (exit `0` on success, `1` on error). The IPC
 endpoint defaults to `<platform data dir>/tobro/state/tobrod.sock`; pass
 `--socket <path>` to both commands when using custom dirs.
 
-## Try the M0 spike
+The spike bootstraps Arti, prints JSON-line bootstrap events to stdout, fetches
+a page through Tor, starts SOCKS/HTTP on `9050` and DNS on `9053`, then fetches
+a page through the local SOCKS listener. Drop `--exit-after-check` to keep
+serving until Ctrl-C. Use `--state-dir`/`--cache-dir` for checkout-local Arti
+state, and `--dns-check-host` for an explicit DNS/`.onion` resolution check.
 
-```sh
-cargo run -p tobrod -- spike --exit-after-check
-```
-
-This bootstraps Arti, prints JSON-line bootstrap events to stdout, fetches a
-page through Tor, starts SOCKS/HTTP on `9050` and DNS on `9053`, then fetches a
-page through the local SOCKS listener. Drop `--exit-after-check` to keep
-serving until Ctrl-C. Use `--state-dir` and `--cache-dir` to keep Arti state
-inside the checkout instead of the platform data directory.
-
-## Try the desktop app
+## Desktop app
 
 ```sh
 # install frontend dependencies once

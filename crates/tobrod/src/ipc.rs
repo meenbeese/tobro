@@ -265,6 +265,7 @@ fn merged_config(
     path: &std::path::Path,
     patch: &serde_json::Value,
 ) -> Result<(tobro_config::Config, tobro_config::Config), String> {
+    tobro_config::check_unsupported_knobs(patch)?;
     let current = load_current_config(path)?;
     let mut merged = serde_json::to_value(&current)
         .map_err(|e| format!("could not serialize current config: {e}"))?;

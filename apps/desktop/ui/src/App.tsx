@@ -140,9 +140,11 @@ export default function App() {
   }, []);
 
   const headline = useMemo(() => formatStatus(status, reachable), [status, reachable]);
-  const isActive = status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving";
-  const canAct = reachable && !busy && status?.state !== "starting" && status?.state !== "stopping";
-  const canNewIdentity = canAct && (status?.state === "connected" || status?.state === "serving");
+  const isActive = status?.state === "starting" || status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving";
+  // Allow Connect even when the local daemon is unavailable so the desktop can
+  // start tobrod and connect with a single button (Orbot parity).
+  const canConnect = !busy && !isActive && status?.state !== "stopping";
+  const canNewIdentity = reachable && !busy && (status?.state === "connected" || status?.state === "serving");
 
   function onPlaceholder(feature: string) {
     appendLog(`${feature}: coming soon.`, "info", "ui");
@@ -152,7 +154,8 @@ export default function App() {
     setBusy(true);
     appendLog("requesting connect…", "info", "ui");
     try {
-      await invoke("daemon_connect");
+      const result = await invoke<{ status?: string }>("daemon_connect");
+      if (result?.status) appendLog(String(result.status), "info", "ui");
     } catch (e) {
       appendLog(String(e), "error", "ui");
     } finally {
@@ -246,7 +249,7 @@ export default function App() {
         </p>
         <div className="actions">
           {!isActive ? (
-            <button className="primary" onClick={onConnect} disabled={!canAct}>
+            <button className="primary" onClick={onConnect} disabled={!canConnect}>
               Connect
             </button>
           ) : (
@@ -254,12 +257,12 @@ export default function App() {
               <button
                 type="button"
                 onClick={onNewIdentity}
-                disabled={!canAct || status?.state !== "connected" && status?.state !== "serving"}
+                disabled={!canNewIdentity}
                 title="Request new circuits. Guard state is preserved; this is not identical to Tor's NEWNYM."
               >
                 New identity
               </button>
-              <button className="danger" onClick={onStop} disabled={!canAct}>
+              <button className="danger" onClick={onStop} disabled={!reachable || busy || status?.state === "stopping"}>
                 Stop
               </button>
             </>

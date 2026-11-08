@@ -435,6 +435,20 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
             </div>
           </form>
 
+          <div className="settings-section node-restrictions">
+            <h3>Node restrictions / exit selection (supported subset)</h3>
+            <p className="muted">
+              <strong>Supported now:</strong> none of C Tor’s node restriction lists are exposed by the pinned Arti backend
+              (entry/exit/exclude/strict nodes are unavailable). Unsupported knobs remain hidden in the UI and are rejected
+              if supplied in config import/patches (never silently ignored).
+            </p>
+            <ul className="muted">
+              <li><strong>Exit country / IPv6 / StreamPrefs defaults:</strong> planned (M2 open) — not yet wired or applied.</li>
+              <li><strong>Stream isolation controls:</strong> planned (M2 open).</li>
+              <li><strong>Entry/exit/exclude/strict node lists:</strong> not supported by current Arti APIs used here; hidden.</li>
+            </ul>
+          </div>
+
           <div className="settings-section config-import">
             <h3>Config import/export (no secrets)</h3>
             <p className="muted">
