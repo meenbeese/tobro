@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">tobro sliced onion icon</title>
+  <defs>
+    <radialGradient id="bg" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#F3C7A6"/>
+      <stop offset="100%" stop-color="#8F3B1F"/>
+    </radialGradient>
+    <linearGradient id="ringLight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F6D2B8"/>
+      <stop offset="100%" stop-color="#D97A43"/>
+    </linearGradient>
+    <linearGradient id="ringMid" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E09A63"/>
+      <stop offset="100%" stop-color="#B7410E"/>
+    </linearGradient>
+    <linearGradient id="ringDark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#CE5A2C"/>
+      <stop offset="100%" stop-color="#7A2E12"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFD9B8"/>
+      <stop offset="100%" stop-color="#CE412B"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#3A1408" flood-opacity="0.28"/>
+    </filter>
+    <clipPath id="sliceClip">
+      <circle cx="256" cy="256" r="188"/>
+    </clipPath>
+  </defs>
+
+  <!-- Rounded background for app-icon presence -->
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="url(#bg)"/>
+
+  <!-- Sliced onion cross-section -->
+  <g filter="url(#softShadow)" clip-path="url(#sliceClip)">
+    <!-- outer flesh -->
+    <circle cx="256" cy="256" r="188" fill="url(#ringLight)"/>
+    <!-- concentric layers with subtle separation like onion rings -->
+    <circle cx="256" cy="256" r="188" fill="none" stroke="#7A2E12" stroke-opacity="0.22" stroke-width="10"/>
+    <circle cx="256" cy="256" r="156" fill="url(#ringMid)"/>
+    <circle cx="256" cy="256" r="156" fill="none" stroke="#F7D7C2" stroke-opacity="0.45" stroke-width="6"/>
+    <circle cx="256" cy="256" r="124" fill="url(#ringLight)"/>
+    <circle cx="256" cy="256" r="124" fill="none" stroke="#7A2E12" stroke-opacity="0.18" stroke-width="6"/>
+    <circle cx="256" cy="256" r="92" fill="url(#ringDark)"/>
+    <circle cx="256" cy="256" r="92" fill="none" stroke="#F7D7C2" stroke-opacity="0.35" stroke-width="5"/>
+    <circle cx="256" cy="256" r="60" fill="url(#ringMid)"/>
+    <circle cx="256" cy="256" r="60" fill="none" stroke="#7A2E12" stroke-opacity="0.16" stroke-width="5"/>
+    <!-- core -->
+    <circle cx="256" cy="256" r="28" fill="url(#core)"/>
+    <circle cx="256" cy="256" r="28" fill="none" stroke="#FFF0E4" stroke-opacity="0.55" stroke-width="3"/>
+
+    <!-- slice highlight/cut facet to read as "sliced" -->
+    <path d="M256 68 L430 182 L430 330 L256 444 L82 330 L82 182 Z" fill="none" stroke="#FFF3EA" stroke-opacity="0.16" stroke-width="8" stroke-linejoin="round"/>
+    <path d="M256 256 L256 68" stroke="#FFF3EA" stroke-opacity="0.18" stroke-width="6" stroke-linecap="round"/>
+    <path d="M256 256 L418 162" stroke="#7A2E12" stroke-opacity="0.10" stroke-width="6" stroke-linecap="round"/>
+    <path d="M256 256 L418 350" stroke="#FFF3EA" stroke-opacity="0.10" stroke-width="6" stroke-linecap="round"/>
+  </g>
+
+  <!-- subtle rim -->
+  <circle cx="256" cy="256" r="188" fill="none" stroke="#4A1A0C" stroke-opacity="0.18" stroke-width="4"/>
+</svg>
