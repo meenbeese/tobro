@@ -22,8 +22,10 @@ use crate::{BootstrapEvent, Tor};
 /// Listener configuration for the local proxies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerConfig {
-    /// Combined SOCKS5 + HTTP CONNECT port.
+    /// SOCKS5 port (also carries HTTP CONNECT while listeners are combined).
     pub socks_port: u16,
+    /// HTTP CONNECT port (reported; served on `socks_port` while combined).
+    pub http_port: u16,
     /// UDP DNS proxy port.
     pub dns_port: u16,
 }
@@ -32,7 +34,19 @@ impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
             socks_port: crate::DEFAULT_SOCKS_PORT,
+            http_port: crate::DEFAULT_HTTP_PORT,
             dns_port: crate::DEFAULT_DNS_PORT,
+        }
+    }
+}
+
+impl ListenerConfig {
+    /// Effective HTTP port (follows SOCKS when unset/combined).
+    pub fn effective_http_port(&self) -> u16 {
+        if self.http_port == 0 {
+            self.socks_port
+        } else {
+            self.http_port
         }
     }
 }

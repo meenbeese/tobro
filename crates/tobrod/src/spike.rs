@@ -96,7 +96,7 @@ enum Event {
 /// Run the spike until the listener is shut down with Ctrl-C.
 pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> anyhow::Result<()> {
     // Start IPC first so clients can watch bootstrap progress.
-    let hub = crate::ipc::Hub::new(args.socks_port, args.dns_port);
+    let hub = crate::ipc::Hub::new(args.socks_port, args.socks_port, args.dns_port);
 
     let socket_path = args
         .socket

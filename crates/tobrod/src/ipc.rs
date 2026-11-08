@@ -27,13 +27,14 @@ pub struct Hub {
 
 impl Hub {
     /// Create the hub for a daemon about to start.
-    pub fn new(socks_port: u16, dns_port: u16) -> Arc<Self> {
+    pub fn new(socks_port: u16, http_port: u16, dns_port: u16) -> Arc<Self> {
         let (events, _receiver) = broadcast::channel(64);
         Arc::new(Self {
             status: RwLock::new(DaemonStatus {
                 state: DaemonState::Starting,
                 bootstrap: BootstrapProgress::default(),
                 socks_port,
+                http_port,
                 dns_port,
                 pid: std::process::id(),
                 uptime_ms: 0,
@@ -264,8 +265,10 @@ impl DaemonControl for SupervisorControl {
             config
                 .validate()
                 .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+            let conflicts = tobro_config::port_conflicts(&config.proxy);
             let next = ListenerConfig {
                 socks_port: config.proxy.socks_port,
+                http_port: config.proxy.effective_http_port(),
                 dns_port: config.proxy.dns_port,
             };
             match listeners.write() {
@@ -277,13 +280,21 @@ impl DaemonControl for SupervisorControl {
             } else {
                 "validated and applied for next connection"
             };
-            Ok(json!({
+            let mut result = json!({
                 "ok": true,
                 "action": "reload_config",
                 "path": path.display().to_string(),
                 "apply": apply,
-                "proxy": { "socks_port": next.socks_port, "dns_port": next.dns_port },
-            }))
+                "proxy": {
+                    "socks_port": next.socks_port,
+                    "http_port": next.effective_http_port(),
+                    "dns_port": next.dns_port
+                },
+            });
+            if !conflicts.is_empty() {
+                result["warnings"] = json!(conflicts);
+            }
+            Ok(result)
         })
         .await
         .map_err(|e| format!("reload task failed: {e}"))?
@@ -377,15 +388,16 @@ pub fn snapshot_to_status(
             },
         ),
     };
-    let (socks_port, dns_port) = snapshot
+    let (socks_port, http_port, dns_port) = snapshot
         .listeners
         .as_ref()
-        .map(|l| (l.socks_port, l.dns_port))
-        .unwrap_or((9050, 9053));
+        .map(|l| (l.socks_port, l.effective_http_port(), l.dns_port))
+        .unwrap_or((9050, 9050, 9053));
     DaemonStatus {
         state,
         bootstrap,
         socks_port,
+        http_port,
         dns_port,
         pid: std::process::id(),
         uptime_ms: started.elapsed().as_millis() as u64,
@@ -574,10 +586,35 @@ pub async fn dispatch_daemon<C: DaemonControl>(
             encode(id, &snapshot_to_status(&snapshot, started))
         }
         methods::CONNECT => {
-            let connect_listeners = control
-                .snapshot()
+            let snapshot = control.snapshot();
+            let connect_listeners = snapshot
                 .listeners
+                .clone()
                 .unwrap_or_else(|| current_listeners(listeners));
+            let can_preflight = matches!(
+                snapshot.state,
+                crate::lifecycle::State::Stopped | crate::lifecycle::State::Failed { .. }
+            );
+            if can_preflight {
+                let probe = tobro_config::ProxyConfig {
+                    socks_port: connect_listeners.socks_port,
+                    http_port: connect_listeners.effective_http_port(),
+                    dns_port: connect_listeners.dns_port,
+                };
+                let conflicts = tobro_config::port_conflicts(&probe);
+                if !conflicts.is_empty() {
+                    return RpcResponse::error(
+                        id,
+                        RpcError::new(
+                            tobro_ipc::codes::INVALID_PARAMS,
+                            format!(
+                                "cannot connect: configured listener ports are unavailable: {}",
+                                conflicts.join(" | ")
+                            ),
+                        ),
+                    );
+                }
+            }
             match control
                 .connect(
                     state_dir.to_path_buf(),

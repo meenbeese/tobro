@@ -22,6 +22,7 @@ interface DaemonStatus {
   state?: DaemonState | string;
   bootstrap?: BootstrapProgress;
   socks_port?: number;
+  http_port?: number;
   dns_port?: number;
 }
 
@@ -178,8 +179,12 @@ export default function App() {
         {status?.bootstrap?.blocked ? <p className="blocked">Blocked: {status.bootstrap.blocked}</p> : null}
         <div className="ports muted">
           <span>SOCKS {status?.socks_port ?? "—"}</span>
+          <span>HTTP {status?.http_port ?? status?.socks_port ?? "—"}</span>
           <span>DNS {status?.dns_port ?? "—"}</span>
         </div>
+        <p className="muted config-hint">
+          Listener ports are configured in <code>config.toml</code> (<code>proxy.socks_port</code>, <code>proxy.http_port</code>, <code>proxy.dns_port</code>). Edit the file, then run <code>tobroctl reload-config</code> or restart the connection.
+        </p>
         <div className="actions">
           {!isActive ? (
             <button className="primary" onClick={onConnect} disabled={!canAct}>

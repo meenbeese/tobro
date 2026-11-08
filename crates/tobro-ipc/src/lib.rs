@@ -543,8 +543,10 @@ pub struct DaemonStatus {
     pub state: DaemonState,
     /// Latest bootstrap progress.
     pub bootstrap: BootstrapProgress,
-    /// Local SOCKS/HTTP CONNECT port.
+    /// Local SOCKS port (combined SOCKS/HTTP listener in current builds).
     pub socks_port: u16,
+    /// Local HTTP CONNECT port (same as `socks_port` while listeners are combined).
+    pub http_port: u16,
     /// Local DNS port.
     pub dns_port: u16,
     /// Daemon process id.

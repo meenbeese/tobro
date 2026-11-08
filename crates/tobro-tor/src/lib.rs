@@ -42,8 +42,13 @@ use tracing::debug;
 /// Arti release this crate is built against; keep in sync with the workspace pin.
 pub const ARTI_VERSION: &str = "2.8.0";
 
-/// Default local SOCKS/HTTP CONNECT port (Orbot-compatible).
+/// Default local SOCKS port (Orbot-compatible). Also carries HTTP CONNECT
+/// while Arti serves both protocols on one listener.
 pub const DEFAULT_SOCKS_PORT: u16 = 9050;
+
+/// Default local HTTP CONNECT port (Orbot-compatible config value). With Arti
+/// 2.8 this is served on the same listener as SOCKS.
+pub const DEFAULT_HTTP_PORT: u16 = 9050;
 
 /// Default local DNS proxy port (Orbot-compatible).
 pub const DEFAULT_DNS_PORT: u16 = 9053;

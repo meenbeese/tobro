@@ -98,6 +98,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
+            http_port: config.proxy.effective_http_port(),
             dns_port: config.proxy.dns_port,
         }));
     let ipc_control = ipc::SupervisorControl::new(
@@ -120,6 +121,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         db = %db_path.display(),
         socket = %socket_path.display(),
         socks_port = config.proxy.socks_port,
+        http_port = config.proxy.effective_http_port(),
         dns_port = config.proxy.dns_port,
         "tobrod running (M1); waiting for daemon.connect"
     );

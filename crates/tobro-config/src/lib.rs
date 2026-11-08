@@ -81,15 +81,25 @@ pub struct GeneralConfig {
     pub start_on_login: bool,
 }
 
+fn default_http_port_follow() -> u16 {
+    0
+}
+
 /// Local proxy listener settings.
 ///
-/// M0 uses a combined SOCKS + HTTP CONNECT listener and a UDP DNS listener.
-/// Port policy is finalized before user-configurable ports are exposed.
+/// Arti 2.8 serves SOCKS5 and HTTP CONNECT on the same local TCP listener
+/// (`ListenProtocols::SocksAndHttpConnect`). Until separate listeners are
+/// supported, `http_port` must match `socks_port`; `0` means "use `socks_port`".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Combined SOCKS5 + HTTP CONNECT port.
+    /// SOCKS5 port (also carries HTTP CONNECT while listeners are combined).
     pub socks_port: u16,
+    /// HTTP CONNECT port. Set to `0` or the same value as `socks_port` while
+    /// Arti serves both protocols on one listener. When omitted from config, it
+    /// follows `socks_port`.
+    #[serde(default = "default_http_port_follow")]
+    pub http_port: u16,
     /// UDP DNS proxy port.
     pub dns_port: u16,
 }
@@ -98,7 +108,20 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             socks_port: 9050,
+            // Combined with SOCKS under Arti 2.8; keep explicit for config parity.
+            http_port: 9050,
             dns_port: 9053,
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// Effective HTTP CONNECT port (follows `socks_port` when unset/combined).
+    pub fn effective_http_port(&self) -> u16 {
+        if self.http_port == 0 {
+            self.socks_port
+        } else {
+            self.http_port
         }
     }
 }
@@ -168,20 +191,26 @@ impl Config {
                 "version must be greater than zero".to_owned(),
             ));
         }
-        if self.proxy.socks_port == 0 {
-            return Err(ConfigError::Invalid(
-                "proxy.socks_port must not be zero".to_owned(),
-            ));
-        }
-        if self.proxy.dns_port == 0 {
-            return Err(ConfigError::Invalid(
-                "proxy.dns_port must not be zero".to_owned(),
-            ));
+        validate_port("proxy.socks_port", self.proxy.socks_port)?;
+        validate_port("proxy.dns_port", self.proxy.dns_port)?;
+        let http_port = self.proxy.effective_http_port();
+        validate_port("proxy.http_port", http_port)?;
+        if self.proxy.http_port != 0 && self.proxy.http_port != self.proxy.socks_port {
+            return Err(ConfigError::Invalid(format!(
+                "proxy.http_port ({}) must match proxy.socks_port ({}) or be 0: Arti 2.8 serves SOCKS and HTTP CONNECT on the same local listener",
+                self.proxy.http_port, self.proxy.socks_port
+            )));
         }
         if self.proxy.socks_port == self.proxy.dns_port {
             return Err(ConfigError::Invalid(format!(
                 "proxy.socks_port and proxy.dns_port must differ (both {})",
                 self.proxy.socks_port
+            )));
+        }
+        if http_port == self.proxy.dns_port {
+            return Err(ConfigError::Invalid(format!(
+                "proxy.http_port and proxy.dns_port must differ (both {})",
+                http_port
             )));
         }
         if self.logging.level.trim().is_empty() {
@@ -191,7 +220,170 @@ impl Config {
         }
         Ok(())
     }
+}
 
+/// Validate a configured TCP/UDP port number.
+pub fn validate_port(name: &str, port: u16) -> Result<(), ConfigError> {
+    if port == 0 {
+        return Err(ConfigError::Invalid(format!("{name} must not be zero")));
+    }
+    Ok(())
+}
+
+/// Check whether a local TCP port appears available on loopback.
+///
+/// This performs a best-effort bind probe. It cannot guarantee availability
+/// (TOCTOU), but it provides actionable feedback before Tor starts.
+pub fn tcp_port_available(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+/// Check whether a local UDP port appears available on loopback.
+pub fn udp_port_available(port: u16) -> bool {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+/// Best-effort description of the process occupying a local port.
+///
+/// Returns `None` when ownership cannot be determined. Never fails startup.
+pub fn port_owner_hint(port: u16, protocol: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let proto = if protocol.eq_ignore_ascii_case("udp") {
+            "UDP"
+        } else {
+            "TCP"
+        };
+        let output = std::process::Command::new("lsof")
+            .args(["-nP", &format!("-i{proto}:{port}"), "-sTCP:LISTEN"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            // UDP listeners may not match -sTCP:LISTEN; retry without it.
+            let output = std::process::Command::new("lsof")
+                .args(["-nP", &format!("-i{proto}:{port}")])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            return summarize_lsof(&output.stdout);
+        }
+        summarize_lsof(&output.stdout)
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("netstat")
+            .args(["-aonp", protocol])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        summarize_netstat(&output.stdout, port)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (port, protocol);
+        None
+    }
+}
+
+#[cfg(unix)]
+fn summarize_lsof(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines();
+    let _header = lines.next()?;
+    let line = lines.find(|l| !l.trim().is_empty())?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() >= 2 {
+        Some(format!("owner: {} (pid {})", cols[0], cols[1]))
+    } else {
+        Some(line.trim().to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn summarize_netstat(stdout: &[u8], port: u16) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let needle = format!(":{port} ");
+    let line = text.lines().find(|l| l.contains(&needle))?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let pid = cols.last()?;
+    Some(format!("owner pid: {pid}"))
+}
+
+/// Find the next available local port starting at `start` (wrapping within the
+/// valid unprivileged range), using `is_available` to probe.
+///
+/// Returns `None` if no port is found after a bounded search.
+pub fn next_available_port(start: u16, is_available: impl Fn(u16) -> bool) -> Option<u16> {
+    const MAX_PROBE: u16 = 1024;
+    let start = if start == 0 { 1024 } else { start };
+    for offset in 0..MAX_PROBE {
+        let port = start.saturating_add(offset);
+        if port == 0 {
+            continue;
+        }
+        if is_available(port) {
+            return Some(port);
+        }
+    }
+    // Wrap to unprivileged range if we started high.
+    if start > 1024 {
+        for port in 1024..start.min(1024 + MAX_PROBE) {
+            if is_available(port) {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// Report listener port conflicts with actionable suggestions.
+pub fn port_conflicts(proxy: &ProxyConfig) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    let http_port = proxy.effective_http_port();
+    if !tcp_port_available(proxy.socks_port) {
+        let owner = port_owner_hint(proxy.socks_port, "tcp")
+            .map(|o| format!("; {o}"))
+            .unwrap_or_default();
+        let suggestion =
+            next_available_port(proxy.socks_port.saturating_add(1), tcp_port_available)
+                .map(|p| format!("; next free TCP port: {p}"))
+                .unwrap_or_default();
+        conflicts.push(format!(
+            "proxy.socks_port {} (SOCKS/HTTP TCP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
+            proxy.socks_port
+        ));
+    }
+    if http_port != proxy.socks_port && !tcp_port_available(http_port) {
+        let owner = port_owner_hint(http_port, "tcp")
+            .map(|o| format!("; {o}"))
+            .unwrap_or_default();
+        let suggestion = next_available_port(http_port.saturating_add(1), tcp_port_available)
+            .map(|p| format!("; next free TCP port: {p}"))
+            .unwrap_or_default();
+        conflicts.push(format!(
+            "proxy.http_port {http_port} (HTTP TCP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process."
+        ));
+    }
+    if !udp_port_available(proxy.dns_port) {
+        let owner = port_owner_hint(proxy.dns_port, "udp")
+            .map(|o| format!("; {o}"))
+            .unwrap_or_default();
+        let suggestion = next_available_port(proxy.dns_port.saturating_add(1), udp_port_available)
+            .map(|p| format!("; next free UDP port: {p}"))
+            .unwrap_or_default();
+        conflicts.push(format!(
+            "proxy.dns_port {} (DNS UDP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
+            proxy.dns_port
+        ));
+    }
+    conflicts
+}
+
+impl Config {
     /// Save config to `path` atomically (write temp file, then rename).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
@@ -262,6 +454,60 @@ mod tests {
         if let Err(ConfigError::Invalid(message)) = err {
             assert!(message.contains("must differ"));
         }
+    }
+
+    #[test]
+    fn http_port_zero_follows_socks_port() {
+        let mut config = Config::default();
+        config.proxy.socks_port = 19050;
+        config.proxy.http_port = 0;
+        config.validate().expect("valid when http follows socks");
+        assert_eq!(config.proxy.effective_http_port(), 19050);
+    }
+
+    #[test]
+    fn rejects_split_http_port_until_supported() {
+        let mut config = Config::default();
+        config.proxy.http_port = 8118;
+        let err = config.validate();
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
+        if let Err(ConfigError::Invalid(message)) = err {
+            assert!(message.contains("http_port"));
+            assert!(message.contains("same local listener"));
+        }
+    }
+
+    #[test]
+    fn loads_config_without_http_port() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[general]
+start_on_login = false
+
+[proxy]
+socks_port = 19050
+dns_port = 19053
+
+[logging]
+level = "info"
+"#,
+        )?;
+        let loaded = Config::load(&path)?;
+        assert_eq!(loaded.proxy.socks_port, 19050);
+        assert_eq!(loaded.proxy.dns_port, 19053);
+        assert_eq!(loaded.proxy.effective_http_port(), 19050);
+        Ok(())
+    }
+
+    #[test]
+    fn next_available_port_finds_candidate() {
+        let port = next_available_port(65530, |p| p == 65531).expect("candidate");
+        assert_eq!(port, 65531);
     }
 
     #[test]
