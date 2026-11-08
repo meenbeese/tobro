@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,8 +35,29 @@ enum Command {
     NewIdentity,
     /// Reload and validate daemon configuration from disk.
     ReloadConfig,
+    /// Read or modify daemon configuration via the daemon config API.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Stream IPC notifications as JSON lines until Ctrl-C.
     Watch,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Get the current daemon configuration (redacted; no secrets).
+    Get,
+    /// Validate a JSON patch without persisting it.
+    Validate {
+        /// JSON patch object, `@path` to read a file, or `-` to read stdin.
+        patch: String,
+    },
+    /// Validate, persist, and stage/apply a JSON patch.
+    Apply {
+        /// JSON patch object, `@path` to read a file, or `-` to read stdin.
+        patch: String,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +110,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let result = client.call(tobro_ipc::methods::RELOAD_CONFIG, None).await?;
             print_json(&result)?;
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Get => {
+                let result = client.call(tobro_ipc::methods::CONFIG_GET, None).await?;
+                print_json(&result)?;
+            }
+            ConfigCommand::Validate { patch } => {
+                let patch = read_patch(&patch)?;
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CONFIG_VALIDATE,
+                        Some(json!({ "patch": patch })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            ConfigCommand::Apply { patch } => {
+                let patch = read_patch(&patch)?;
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CONFIG_APPLY,
+                        Some(json!({ "patch": patch })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+        },
         Command::Watch => watch(&mut client).await?,
     }
 
@@ -115,6 +162,26 @@ async fn watch(client: &mut tobro_ipc::Client) -> anyhow::Result<()> {
 fn print_json(value: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn read_patch(input: &str) -> anyhow::Result<Value> {
+    let raw = if input == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read patch from stdin")?;
+        buf
+    } else if let Some(path) = input.strip_prefix('@') {
+        std::fs::read_to_string(path).with_context(|| format!("failed to read patch from {path}"))?
+    } else {
+        input.to_owned()
+    };
+    let value: Value = serde_json::from_str(&raw).context("patch must be valid JSON")?;
+    if !value.is_object() {
+        anyhow::bail!("patch must be a JSON object");
+    }
+    Ok(value)
 }
 
 fn default_socket() -> anyhow::Result<PathBuf> {

@@ -64,6 +64,12 @@ pub mod methods {
     pub const RELOAD_CONFIG: &str = "daemon.reload_config";
     /// Request a new identity (restart Tor client/listeners for new circuits).
     pub const NEW_IDENTITY: &str = "daemon.new_identity";
+    /// Get the current daemon configuration (redacted; no secrets).
+    pub const CONFIG_GET: &str = "config.get";
+    /// Validate a configuration patch without applying it.
+    pub const CONFIG_VALIDATE: &str = "config.validate";
+    /// Validate, persist, and apply a configuration patch.
+    pub const CONFIG_APPLY: &str = "config.apply";
 
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
@@ -79,31 +85,60 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::STOP
             | methods::RELOAD_CONFIG
             | methods::NEW_IDENTITY
+            | methods::CONFIG_GET
+            | methods::CONFIG_VALIDATE
+            | methods::CONFIG_APPLY
     )
 }
 
-/// Validate that an M1/M2 method's params are absent/null/empty (no-params contract).
-pub fn validate_no_params(method: &str, params: &Option<Value>) -> Result<(), RpcError> {
+/// Validate JSON-RPC params for a method.
+pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcError> {
     match method {
         methods::HELLO
         | methods::STATUS
         | methods::CONNECT
         | methods::STOP
         | methods::RELOAD_CONFIG
-        | methods::NEW_IDENTITY => {
-            if let Some(p) = params
-                && !p.is_null()
-                && !(p.is_object() && p.as_object().is_some_and(|o| o.is_empty()))
-            {
+        | methods::NEW_IDENTITY
+        | methods::CONFIG_GET => validate_no_params(method, params),
+        methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
+            let Some(Value::Object(map)) = params else {
                 return Err(RpcError::invalid_params(
                     method,
-                    "this method takes no parameters",
+                    "expected params object: {\"patch\": { ... }}",
                 ));
+            };
+            match map.get("patch") {
+                Some(Value::Object(_)) => Ok(()),
+                Some(_) => Err(RpcError::invalid_params(
+                    method,
+                    "\"patch\" must be an object",
+                )),
+                None => Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"patch\" object",
+                )),
             }
-            Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Validate that an M1/M2 method's params are absent/null/empty (no-params contract).
+pub fn validate_no_params(method: &str, params: &Option<Value>) -> Result<(), RpcError> {
+    let has_params = match params {
+        None => false,
+        Some(Value::Null) => false,
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    };
+    if has_params {
+        return Err(RpcError::invalid_params(
+            method,
+            "this method takes no parameters",
+        ));
+    }
+    Ok(())
 }
 
 /// Notification names used by the M0 IPC surface.

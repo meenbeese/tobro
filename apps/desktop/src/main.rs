@@ -22,6 +22,11 @@ enum IpcCommand {
     Connect(oneshot::Sender<Result<Value, String>>),
     Stop(oneshot::Sender<Result<Value, String>>),
     NewIdentity(oneshot::Sender<Result<Value, String>>),
+    ConfigGet(oneshot::Sender<Result<Value, String>>),
+    ConfigApply {
+        patch: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ReloadConfig(oneshot::Sender<Result<Value, String>>),
 }
 
@@ -93,6 +98,30 @@ async fn daemon_new_identity(state: State<'_, AppState>) -> Result<Value, String
         .map_err(|_| "daemon connection task dropped the response".to_owned())?
 }
 
+#[tauri::command]
+async fn daemon_get_config(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ConfigGet(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_apply_config(state: State<'_, AppState>, patch: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ConfigApply { patch, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ProxyPorts {
     socks_port: u16,
@@ -102,7 +131,31 @@ struct ProxyPorts {
 }
 
 #[tauri::command]
-fn get_proxy_ports() -> Result<ProxyPorts, String> {
+async fn get_proxy_ports(state: State<'_, AppState>) -> Result<ProxyPorts, String> {
+    if let Ok(result) = daemon_get_config(state).await
+        && let Some(config) = result.get("config")
+        && let Some(proxy) = config.get("proxy")
+    {
+        return Ok(ProxyPorts {
+            socks_port: proxy
+                .get("socks_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(9050) as u16,
+            http_port: proxy
+                .get("http_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(9050) as u16,
+            dns_port: proxy
+                .get("dns_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(9053) as u16,
+            config_path: result
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
     let path = tobro_config::default_path().map_err(|e| e.to_string())?;
     let config = tobro_config::Config::load_or_default(&path).map_err(|e| e.to_string())?;
     Ok(ProxyPorts {
@@ -120,6 +173,44 @@ async fn save_proxy_ports(
     http_port: u16,
     dns_port: u16,
 ) -> Result<Value, String> {
+    let patch = json!({
+        "proxy": {
+            "socks_port": socks_port,
+            "http_port": http_port,
+            "dns_port": dns_port
+        }
+    });
+
+    if let Ok(result) = daemon_apply_config(state, patch.clone()).await {
+        let effects = result.get("effects").cloned().unwrap_or_else(|| json!({}));
+        let warnings = effects
+            .get("warnings")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let apply = if effects.get("runtime_active").and_then(Value::as_bool).unwrap_or(false)
+            && effects
+                .get("restart_required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            "validated and saved; active listeners require stop/connect for listener changes to take effect"
+        } else {
+            "validated and applied for next connection"
+        };
+        return Ok(json!({
+            "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(true),
+            "config_path": result.get("path").cloned().unwrap_or(Value::Null),
+            "proxy": result.get("proxy").cloned().unwrap_or_else(|| json!({
+                "socks_port": socks_port,
+                "http_port": http_port,
+                "dns_port": dns_port
+            })),
+            "reload": { "apply": apply, "warnings": warnings },
+            "config": result.get("config").cloned(),
+        }));
+    }
+
     let path = tobro_config::default_path().map_err(|e| e.to_string())?;
     let mut config = tobro_config::Config::load_or_default(&path).map_err(|e| e.to_string())?;
     config.proxy.socks_port = socks_port;
@@ -127,19 +218,6 @@ async fn save_proxy_ports(
     config.proxy.dns_port = dns_port;
     config.validate().map_err(|e| e.to_string())?;
     config.save(&path).map_err(|e| e.to_string())?;
-
-    let (tx, rx) = oneshot::channel();
-    let reload = if state
-        .commands
-        .send(IpcCommand::ReloadConfig(tx))
-        .await
-        .is_ok()
-    {
-        rx.await.ok().and_then(Result::ok)
-    } else {
-        None
-    };
-
     Ok(json!({
         "ok": true,
         "config_path": path.display().to_string(),
@@ -148,7 +226,7 @@ async fn save_proxy_ports(
             "http_port": config.proxy.effective_http_port(),
             "dns_port": config.proxy.dns_port,
         },
-        "reload": reload,
+        "reload": { "apply": "saved to config; daemon was unreachable, so it was not reloaded", "warnings": [] },
     }))
 }
 
@@ -208,6 +286,8 @@ fn main() {
             daemon_connect,
             daemon_stop,
             daemon_new_identity,
+            daemon_get_config,
+            daemon_apply_config,
             get_proxy_ports,
             save_proxy_ports
         ])
@@ -323,8 +403,12 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         IpcCommand::Connect(tx)
         | IpcCommand::Stop(tx)
         | IpcCommand::NewIdentity(tx)
+        | IpcCommand::ConfigGet(tx)
         | IpcCommand::ReloadConfig(tx) => {
             let _ = tx.send(err);
+        }
+        IpcCommand::ConfigApply { reply, .. } => {
+            let _ = reply.send(err);
         }
     }
 }
@@ -393,6 +477,21 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
+            refresh_status(handle, client).await;
+        }
+        IpcCommand::ConfigGet(tx) => {
+            let result = client
+                .call(methods::CONFIG_GET, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::ConfigApply { patch, reply } => {
+            let result = client
+                .call(methods::CONFIG_APPLY, Some(json!({ "patch": patch })))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
             refresh_status(handle, client).await;
         }
         IpcCommand::ReloadConfig(tx) => {

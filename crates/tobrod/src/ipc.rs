@@ -203,10 +203,163 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     fn disconnect(&self) -> impl Future<Output = Result<(), String>> + Send;
     /// Request a new identity (new circuits) while connected.
     fn new_identity(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// Get current configuration (redacted).
+    fn config_get(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Validate a configuration patch without persisting it.
+    fn config_validate(
+        &self,
+        patch: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Validate, persist, and stage/apply a configuration patch.
+    fn config_apply(
+        &self,
+        patch: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Reload and validate configuration. Returns a JSON summary.
     fn reload_config(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
+}
+
+fn is_runtime_active(state: &crate::lifecycle::State) -> bool {
+    !matches!(
+        state,
+        crate::lifecycle::State::Stopped | crate::lifecycle::State::Failed { .. }
+    )
+}
+
+fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                if patch_value.is_null() {
+                    base_map.remove(key);
+                } else {
+                    let entry = base_map.entry(key.clone()).or_insert(serde_json::Value::Null);
+                    merge_json(entry, patch_value);
+                }
+            }
+        }
+        (base_slot, patch_value) => {
+            *base_slot = patch_value.clone();
+        }
+    }
+}
+
+fn redacted_config_value(config: &tobro_config::Config) -> Result<serde_json::Value, String> {
+    // Config currently contains no secrets; secrets belong in the keychain/store.
+    serde_json::to_value(config).map_err(|e| format!("could not serialize config: {e}"))
+}
+
+fn load_current_config(path: &std::path::Path) -> Result<tobro_config::Config, String> {
+    tobro_config::Config::load_or_default(path)
+        .map_err(|e| format!("failed to load {}: {e}", path.display()))
+}
+
+fn merged_config(
+    path: &std::path::Path,
+    patch: &serde_json::Value,
+) -> Result<(tobro_config::Config, tobro_config::Config), String> {
+    let current = load_current_config(path)?;
+    let mut merged = serde_json::to_value(&current)
+        .map_err(|e| format!("could not serialize current config: {e}"))?;
+    merge_json(&mut merged, patch);
+    let next: tobro_config::Config = serde_json::from_value(merged)
+        .map_err(|e| format!("invalid config patch: {e}"))?;
+    next.validate()
+        .map_err(|e| format!("invalid config: {e}"))?;
+    Ok((current, next))
+}
+
+fn config_effects(
+    current: &tobro_config::Config,
+    next: &tobro_config::Config,
+    running: bool,
+) -> serde_json::Value {
+    let listeners_changed = current.proxy.socks_port != next.proxy.socks_port
+        || current.proxy.effective_http_port() != next.proxy.effective_http_port()
+        || current.proxy.dns_port != next.proxy.dns_port;
+    let restart_required = listeners_changed;
+    let mut warnings = Vec::new();
+    let conflicts = tobro_config::port_conflicts(&next.proxy);
+    if !conflicts.is_empty() {
+        warnings.extend(conflicts);
+    }
+    if running && restart_required {
+        warnings.push(
+            "active listeners require stop/connect (or restart) for network listener changes to take effect"
+                .to_owned(),
+        );
+    }
+    json!({
+        "restart_required": restart_required,
+        "listeners_changed": listeners_changed,
+        "runtime_active": running,
+        "warnings": warnings,
+    })
+}
+
+fn config_get_at(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let config = load_current_config(path)?;
+    let conflicts = tobro_config::port_conflicts(&config.proxy);
+    Ok(json!({
+        "ok": true,
+        "action": "config.get",
+        "path": path.display().to_string(),
+        "config": redacted_config_value(&config)?,
+        "warnings": conflicts,
+    }))
+}
+
+fn config_validate_patch(
+    path: &std::path::Path,
+    patch: &serde_json::Value,
+    running: bool,
+) -> Result<serde_json::Value, String> {
+    let (current, next) = merged_config(path, patch)?;
+    let effects = config_effects(&current, &next, running);
+    Ok(json!({
+        "ok": true,
+        "action": "config.validate",
+        "path": path.display().to_string(),
+        "valid": true,
+        "config": redacted_config_value(&next)?,
+        "effects": effects,
+    }))
+}
+
+fn config_apply_patch(
+    path: &std::path::Path,
+    patch: &serde_json::Value,
+    running: bool,
+    listeners: &Arc<RwLock<ListenerConfig>>,
+) -> Result<serde_json::Value, String> {
+    let (current, next) = merged_config(path, patch)?;
+    let effects = config_effects(&current, &next, running);
+    next.save(path)
+        .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
+    let next_listeners = ListenerConfig {
+        socks_port: next.proxy.socks_port,
+        http_port: next.proxy.effective_http_port(),
+        dns_port: next.proxy.dns_port,
+    };
+    match listeners.write() {
+        Ok(mut current) => *current = next_listeners.clone(),
+        Err(poisoned) => *poisoned.into_inner() = next_listeners.clone(),
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "config.apply",
+        "path": path.display().to_string(),
+        "saved": true,
+        "config": redacted_config_value(&next)?,
+        "proxy": {
+            "socks_port": next_listeners.socks_port,
+            "http_port": next_listeners.effective_http_port(),
+            "dns_port": next_listeners.dns_port,
+        },
+        "effects": effects,
+    }))
 }
 
 /// Supervisor handle paired with config path and live listener settings for IPC.
@@ -255,6 +408,32 @@ impl DaemonControl for SupervisorControl {
 
     async fn new_identity(&self) -> Result<(), String> {
         self.handle.new_identity().await.map_err(|e| e.to_string())
+    }
+
+    async fn config_get(&self) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        tokio::task::spawn_blocking(move || config_get_at(&path))
+            .await
+            .map_err(|e| format!("config task failed: {e}"))?
+    }
+
+    async fn config_validate(&self, patch: serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let snapshot = self.handle.snapshot();
+        let running = is_runtime_active(&snapshot.state);
+        tokio::task::spawn_blocking(move || config_validate_patch(&path, &patch, running))
+            .await
+            .map_err(|e| format!("config task failed: {e}"))?
+    }
+
+    async fn config_apply(&self, patch: serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let listeners = Arc::clone(&self.listeners);
+        let snapshot = self.handle.snapshot();
+        let running = is_runtime_active(&snapshot.state);
+        tokio::task::spawn_blocking(move || config_apply_patch(&path, &patch, running, &listeners))
+            .await
+            .map_err(|e| format!("config task failed: {e}"))?
     }
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
@@ -337,6 +516,24 @@ impl DaemonControl for SupervisorHandle {
         SupervisorHandle::new_identity(self)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn config_get(&self) -> Result<serde_json::Value, String> {
+        Err("config operations require daemon config path context".to_owned())
+    }
+
+    async fn config_validate(
+        &self,
+        _patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("config operations require daemon config path context".to_owned())
+    }
+
+    async fn config_apply(
+        &self,
+        _patch: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("config operations require daemon config path context".to_owned())
     }
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
@@ -557,9 +754,9 @@ fn check_peer_auth(connection: &Connection) -> Result<(), IpcError> {
     Ok(())
 }
 
-/// Validate method params (per-method schema baseline; M1 is explicit no-params).
+/// Validate method params.
 fn validate_params(method: &str, params: &Option<serde_json::Value>) -> Result<(), RpcError> {
-    tobro_ipc::validate_no_params(method, params)
+    tobro_ipc::validate_params(method, params)
 }
 
 pub async fn dispatch_daemon<C: DaemonControl>(
@@ -674,6 +871,34 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 Err(e) => {
                     RpcResponse::error(id, RpcError::internal(format!("new identity failed: {e}")))
                 }
+            }
+        }
+        methods::CONFIG_GET => match control.config_get().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(e)),
+        },
+        methods::CONFIG_VALIDATE => {
+            let patch = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("patch"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match control.config_validate(patch).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e)),
+            }
+        }
+        methods::CONFIG_APPLY => {
+            let patch = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("patch"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match control.config_apply(patch).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e)),
             }
         }
         methods::RELOAD_CONFIG => match control.reload_config().await {
@@ -799,6 +1024,24 @@ mod daemon_tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) += 1;
             Ok(())
+        }
+
+        async fn config_get(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "config.get", "mock": true, "config": {} }))
+        }
+
+        async fn config_validate(
+            &self,
+            _patch: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "config.validate", "valid": true, "effects": {} }))
+        }
+
+        async fn config_apply(
+            &self,
+            _patch: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "config.apply", "saved": true, "effects": {} }))
         }
 
         async fn reload_config(&self) -> Result<serde_json::Value, String> {
@@ -1005,5 +1248,45 @@ mod daemon_tests {
                 .unwrap_or_else(|e| e.into_inner()),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn config_apply_merges_proxy_ports() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        tobro_config::Config::default().save(&path)?;
+        let listeners = Arc::new(RwLock::new(ListenerConfig::default()));
+        let result = config_apply_patch(
+            &path,
+            &json!({ "proxy": { "socks_port": 19050, "http_port": 0, "dns_port": 19053 } }),
+            false,
+            &listeners,
+        )
+        .map_err(|e| format!("{e}"))?;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["config"]["proxy"]["socks_port"], 19050);
+        assert_eq!(result["config"]["proxy"]["dns_port"], 19053);
+        assert_eq!(result["effects"]["listeners_changed"], true);
+        let loaded = tobro_config::Config::load(&path)?;
+        assert_eq!(loaded.proxy.socks_port, 19050);
+        assert_eq!(listeners.read().unwrap().socks_port, 19050);
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_rejects_unknown_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        tobro_config::Config::default().save(&path)?;
+        let err = config_validate_patch(&path, &json!({ "proxy": { "nope": 1 } }), false)
+            .expect_err("should reject unknown field");
+        assert!(err.contains("invalid config patch") || err.contains("unknown field"));
+        Ok(())
     }
 }

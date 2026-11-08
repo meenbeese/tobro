@@ -457,12 +457,15 @@ mod tests {
     }
 
     #[test]
-    fn http_port_zero_follows_socks_port() {
+    fn http_port_zero_follows_socks_port() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = Config::default();
         config.proxy.socks_port = 19050;
         config.proxy.http_port = 0;
-        config.validate().expect("valid when http follows socks");
+        config
+            .validate()
+            .map_err(|e| format!("valid when http follows socks: {e}"))?;
         assert_eq!(config.proxy.effective_http_port(), 19050);
+        Ok(())
     }
 
     #[test]
@@ -505,9 +508,10 @@ level = "info"
     }
 
     #[test]
-    fn next_available_port_finds_candidate() {
-        let port = next_available_port(65530, |p| p == 65531).expect("candidate");
+    fn next_available_port_finds_candidate() -> Result<(), Box<dyn std::error::Error>> {
+        let port = next_available_port(65530, |p| p == 65531).ok_or("expected a candidate port")?;
         assert_eq!(port, 65531);
+        Ok(())
     }
 
     #[test]
