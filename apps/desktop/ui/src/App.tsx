@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useMemo, useRef, useState } from "react";
 import appIconUrl from "./assets/icon.svg";
-import { AdvancedSettings } from "./AdvancedSettings";
 import { LogViewer, type LogEntry } from "./LogViewer";
 
 type DaemonState =
@@ -57,7 +57,6 @@ export default function App() {
   const [daemonInfo, setDaemonInfo] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const nextLogId = useRef(1);
 
   function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
@@ -150,6 +149,32 @@ export default function App() {
     appendLog(`${feature}: coming soon.`, "info", "ui");
   }
 
+  async function openSettings() {
+    try {
+      const existing = await WebviewWindow.getByLabel("settings");
+      if (existing) {
+        await existing.show();
+        await existing.setFocus();
+        return;
+      }
+      const settings = new WebviewWindow("settings", {
+        url: "index.html?window=settings",
+        title: "Settings — Tobro",
+        width: 820,
+        height: 720,
+        minWidth: 560,
+        minHeight: 480,
+        resizable: true,
+        center: true,
+      });
+      settings.once("tauri://error", (e) => {
+        appendLog(`settings window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+      });
+    } catch (e) {
+      appendLog(`failed to open settings: ${String(e)}`, "error", "ui");
+    }
+  }
+
   async function onConnect() {
     setBusy(true);
     appendLog("requesting connect…", "info", "ui");
@@ -217,7 +242,7 @@ export default function App() {
           <button type="button" disabled title="Change exit country (coming soon)">
             Change exit
           </button>
-          <button type="button" onClick={() => setSettingsOpen((v) => !v)} aria-expanded={settingsOpen} title="Config import/export and settings">
+          <button type="button" onClick={() => void openSettings()} aria-haspopup="dialog" title="Settings">
             Settings
           </button>
           <button type="button" onClick={() => onPlaceholder("About")} title="About (coming soon)">
@@ -245,7 +270,7 @@ export default function App() {
           <span>active DNS {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.dns_port ?? "—"}</span>
         </div>
         <p className="muted ports-hint">
-          Listener settings and config import/export are in <button type="button" className="link-button" onClick={() => setSettingsOpen(true)}>Advanced settings</button> (power-user gated).
+          Proxy, node, and advanced Tor settings are in <button type="button" className="link-button" onClick={() => void openSettings()}>Settings</button>.
         </p>
         <div className="actions">
           {!isActive ? (
@@ -269,14 +294,6 @@ export default function App() {
           )}
         </div>
       </section>
-
-      {settingsOpen ? (
-        <AdvancedSettings
-          onClose={() => setSettingsOpen(false)}
-          onApplied={() => void refreshStatus()}
-          appendLog={appendLog}
-        />
-      ) : null}
 
       <LogViewer entries={logs} onClear={() => setLogs([])} defaultOpen={false} />
     </main>

@@ -311,3 +311,31 @@ button:disabled { opacity: 0.5; cursor: default; }
 .checkbox-label input[type="checkbox"] { margin-top: 2px; }
 .bind-all-warning, .bind-all-guidance { margin: 8px 0 0; font-size: 0.9rem; }
 .bind-all-warning { padding: 10px 12px; border: 1px solid var(--warn, #b45309); border-radius: 8px; }
+
+.settings-shell { display: flex; flex-direction: column; gap: 14px; }
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+.settings-tabs button {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 0.9rem;
+}
+.settings-tabs button:hover { color: var(--fg); border-color: var(--muted); }
+.settings-tabs button.active,
+.settings-tabs button[aria-selected="true"] {
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.settings-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

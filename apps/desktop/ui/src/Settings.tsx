@@ -114,15 +114,20 @@ function summarizeEffects(effects?: ConfigEffects): string[] {
   return lines;
 }
 
-export interface AdvancedSettingsProps {
+export interface SettingsProps {
   onClose: () => void;
   onApplied?: () => void;
   appendLog?: (text: string, level?: "info" | "error", source?: string) => void;
 }
 
-export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSettingsProps) {
+export type AdvancedSettingsProps = SettingsProps;
+
+type SettingsTab = "general" | "node" | "advanced";
+
+export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [powerUser, setPowerUser] = useState(readPowerUser);
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState<SettingsTab>("general");
 
   // Listener settings
   const [portInputs, setPortInputs] = useState<Record<PortField, string>>({
@@ -212,7 +217,7 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
   function enablePowerUser() {
     writePowerUser(true);
     setPowerUser(true);
-    log("advanced settings enabled (power-user gate acknowledged)");
+    log("settings enabled (power-user gate acknowledged)");
   }
 
   function disablePowerUser() {
@@ -437,11 +442,11 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
   }
 
   return (
-    <section className="card advanced-settings" aria-label="Advanced settings">
+    <section className="card advanced-settings settings-screen" aria-label="Settings">
       <div className="panel-header">
         <div>
-          <h2>Advanced settings</h2>
-          <p className="muted">Power-user controls. Unsupported options are hidden rather than silently ignored.</p>
+          <h2>Settings</h2>
+          <p className="muted">Configure tobro. Sensitive controls are power-user gated and never silently ignore unsupported options.</p>
         </div>
         <button type="button" className="logs-toggle" onClick={onClose}>Close</button>
       </div>
@@ -450,164 +455,187 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
         <div className="power-user-gate" role="alert">
           <h3>Power-user gate</h3>
           <p>
-            Advanced settings can affect connectivity, leak local services if misconfigured, or require a restart of Tor listeners.
+            Some settings can affect connectivity, expose local services if misconfigured, or require a restart of Tor listeners.
             Only change them if you understand the impact.
           </p>
           <ul className="muted">
-            <li>Listener port changes may conflict with other apps and can require Stop → Connect.</li>
+            <li>Listener, bind-all, and stream isolation changes can require Stop → Connect.</li>
             <li>Config import/export is validated, but applying the wrong config can break startup/connect behavior.</li>
             <li>Config exports are redacted and contain no secrets; secrets remain in the OS keychain/store.</li>
           </ul>
           <div className="actions">
-            <button type="button" className="primary" onClick={enablePowerUser}>I understand, enable advanced settings</button>
+            <button type="button" className="primary" onClick={enablePowerUser}>I understand, enable settings</button>
             <button type="button" onClick={onClose}>Cancel</button>
           </div>
         </div>
       ) : (
-        <div className="advanced-sections">
-          <div className="settings-section-head">
-            <p className="muted">Power-user mode is enabled for this UI profile.</p>
-            <button type="button" className="logs-toggle" onClick={disablePowerUser}>Lock advanced settings</button>
+        <div className="settings-shell">
+          <div className="settings-tabs" role="tablist" aria-label="Settings tabs">
+            <button type="button" role="tab" aria-selected={tab === "general"} className={tab === "general" ? "active" : ""} onClick={() => setTab("general")}>General</button>
+            <button type="button" role="tab" aria-selected={tab === "node"} className={tab === "node" ? "active" : ""} onClick={() => setTab("node")}>Node Configuration</button>
+            <button type="button" role="tab" aria-selected={tab === "advanced"} className={tab === "advanced" ? "active" : ""} onClick={() => setTab("advanced")}>Advanced Tor Configuration</button>
           </div>
 
-          <form className="settings-section port-editor" onSubmit={onSavePorts}>
-            <h3>Listener settings</h3>
-            <p className="muted">
-              Configure local SOCKS/HTTP and DNS ports. With the current Arti backend, SOCKS and HTTP share one listener, so HTTP should match SOCKS (use <code>0</code> to follow SOCKS). By default listeners bind to loopback only. Active listener changes require stop/connect.
-            </p>
-            <div className="port-grid">
-              <label>
-                SOCKS
-                <input type="number" min={1} max={65535} inputMode="numeric" value={portInputs.socks_port} onChange={(e) => updatePort("socks_port", e.target.value)} />
-              </label>
-              <label>
-                HTTP
-                <input type="number" min={0} max={65535} inputMode="numeric" value={portInputs.http_port} onChange={(e) => updatePort("http_port", e.target.value)} />
-              </label>
-              <label>
-                DNS
-                <input type="number" min={1} max={65535} inputMode="numeric" value={portInputs.dns_port} onChange={(e) => updatePort("dns_port", e.target.value)} />
-              </label>
-            </div>
-            <div className="bind-all-setting">
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={bindAllInterfaces}
-                  onChange={(e) => onBindAllChange(e.target.checked)}
-                  disabled={portsBusy}
-                />
-                Bind listeners to all interfaces (opt-in, dangerous)
-              </label>
-              {bindAllInterfaces ? (
-                <div className="error bind-all-warning" role="alert">
-                  <strong>Security warning / firewall guidance:</strong> {BIND_ALL_WARNING}
-                </div>
-              ) : (
-                <p className="muted bind-all-guidance">
-                  Off by default. Enable only if you need other devices on a trusted network to use this Tor proxy, and restrict access with firewall rules.
+          {tab === "general" ? (
+            <div className="advanced-sections" role="tabpanel">
+              <div className="settings-section-head">
+                <p className="muted">General settings, proxy listeners, and configuration management.</p>
+                <button type="button" className="logs-toggle" onClick={disablePowerUser}>Lock settings</button>
+              </div>
+
+              <form className="settings-section port-editor" onSubmit={onSavePorts}>
+                <h3>Proxy / listener settings</h3>
+                <p className="muted">
+                  Configure local SOCKS/HTTP and DNS ports. With the current Arti backend, SOCKS and HTTP share one listener, so HTTP should match SOCKS (use <code>0</code> to follow SOCKS). By default listeners bind to loopback only. Active listener changes require stop/connect.
                 </p>
-              )}
-            </div>
-            {configPath ? <p className="muted config-hint">Config: <code>{configPath}</code></p> : null}
-            {portsError ? <p className="error">{portsError}</p> : null}
-            {portsMessage ? <p className="muted">{portsMessage}</p> : null}
-            <div className="actions">
-              <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save listener settings"}</button>
-              <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reset</button>
-            </div>
-          </form>
+                <div className="port-grid">
+                  <label>
+                    SOCKS
+                    <input type="number" min={1} max={65535} inputMode="numeric" value={portInputs.socks_port} onChange={(e) => updatePort("socks_port", e.target.value)} />
+                  </label>
+                  <label>
+                    HTTP
+                    <input type="number" min={0} max={65535} inputMode="numeric" value={portInputs.http_port} onChange={(e) => updatePort("http_port", e.target.value)} />
+                  </label>
+                  <label>
+                    DNS
+                    <input type="number" min={1} max={65535} inputMode="numeric" value={portInputs.dns_port} onChange={(e) => updatePort("dns_port", e.target.value)} />
+                  </label>
+                </div>
+                <div className="bind-all-setting">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={bindAllInterfaces}
+                      onChange={(e) => onBindAllChange(e.target.checked)}
+                      disabled={portsBusy}
+                    />
+                    Bind listeners to all interfaces (opt-in, dangerous)
+                  </label>
+                  {bindAllInterfaces ? (
+                    <div className="error bind-all-warning" role="alert">
+                      <strong>Security warning / firewall guidance:</strong> {BIND_ALL_WARNING}
+                    </div>
+                  ) : (
+                    <p className="muted bind-all-guidance">
+                      Off by default. Enable only if you need other devices on a trusted network to use this Tor proxy, and restrict access with firewall rules.
+                    </p>
+                  )}
+                </div>
+                {configPath ? <p className="muted config-hint">Config: <code>{configPath}</code></p> : null}
+                {portsError ? <p className="error">{portsError}</p> : null}
+                {portsMessage ? <p className="muted">{portsMessage}</p> : null}
+                <div className="actions">
+                  <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save proxy settings"}</button>
+                  <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reset</button>
+                </div>
+              </form>
 
-          <div className="settings-section stream-isolation">
-            <h3>Stream isolation (F-42/F-43)</h3>
-            <p className="muted">
-              Controls how proxy streams are isolated onto Tor circuits. Defaults are off. SOCKS auth isolation is
-              native to Arti when credentials are provided; destination/port isolation is applied by tobro’s isolation
-              front-end when enabled. Changes require Stop/Connect while Tor is running.
-            </p>
-            <label className="checkbox-label">
-              <input type="checkbox" checked={stream.isolate_destination} disabled={streamBusy}
-                onChange={(e) => onStreamToggle("isolate_destination", e.target.checked)} />
-              <span><strong>Isolate by destination</strong> — streams to different destinations do not share circuits.</span>
-            </label>
-            <label className="checkbox-label">
-              <input type="checkbox" checked={stream.isolate_port} disabled={streamBusy}
-                onChange={(e) => onStreamToggle("isolate_port", e.target.checked)} />
-              <span><strong>Isolate by port</strong> — streams to different destination ports do not share circuits.</span>
-            </label>
-            <label className="checkbox-label">
-              <input type="checkbox" checked={stream.isolate_protocol} disabled={streamBusy}
-                onChange={(e) => onStreamToggle("isolate_protocol", e.target.checked)} />
-              <span><strong>Isolate by protocol</strong> — separate isolation by client protocol context (explicit policy; Arti already separates HTTP/SOCKS contexts).</span>
-            </label>
-            <label className="checkbox-label">
-              <input type="checkbox" checked={stream.keep_alive_isolation} disabled={streamBusy}
-                onChange={(e) => onStreamToggle("keep_alive_isolation", e.target.checked)} />
-              <span><strong>SOCKS auth keep-alive isolation</strong> (F-43) — keep SOCKS username/password isolation explicit for stream lifetime/circuit association.</span>
-            </label>
-            {streamError ? <p className="error">{streamError}</p> : null}
-            {streamMessage ? <p className="muted">{streamMessage}</p> : null}
-            <div className="actions">
-              <button className="primary" type="button" disabled={streamBusy || !streamDirty} onClick={() => void onSaveStream()}>
-                {streamBusy ? "Saving…" : "Save stream isolation"}
-              </button>
-              <button type="button" disabled={streamBusy} onClick={() => void loadConfigState()}>Reset</button>
+              <div className="settings-section config-import">
+                <h3>Config import/export (no secrets)</h3>
+                <p className="muted">
+                  Uses the daemon config API. Exports are <strong>redacted</strong> and contain <strong>no secrets</strong>. Import accepts a JSON object/patch; it is merged, validated (<code>deny_unknown_fields</code>), and only saved/applied if valid.
+                </p>
+                <div className="config-actions">
+                  <button type="button" onClick={() => void onRefreshConfig()} disabled={busy}>Load current</button>
+                  <button type="button" onClick={onExport} disabled={busy || !currentConfig}>Export JSON</button>
+                  <button type="button" onClick={() => void onCopyCurrent()} disabled={busy || !currentConfig}>Copy current</button>
+                </div>
+                <details className="config-preview" open={Boolean(currentConfig)}>
+                  <summary>Current config (redacted)</summary>
+                  <pre>{currentConfig ? JSON.stringify(currentConfig, null, 2) : "Load the current config to preview it."}</pre>
+                </details>
+                <div className="config-actions">
+                  <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}>Load file…</button>
+                  <input ref={fileRef} type="file" accept=".json,application/json" className="sr-only" onChange={(e) => void onPickFile(e)} />
+                  <button type="button" onClick={() => void onValidate()} disabled={busy || !importText.trim()}>Validate</button>
+                  <button type="button" className="primary" onClick={() => void onApplyConfig()} disabled={busy || !importText.trim()}>Apply</button>
+                </div>
+                <label className="sr-only" htmlFor="settings-config-import-text">Config JSON patch</label>
+                <textarea
+                  id="settings-config-import-text"
+                  className="config-textarea"
+                  value={importText}
+                  onChange={(e) => setImportText(e.target.value)}
+                  placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053, "bind_all_interfaces": false },\n  "stream": { "isolate_destination": false, "isolate_port": false }\n}'}
+                  spellCheck={false}
+                  rows={10}
+                />
+                {configMessages.length ? (
+                  <ul className="config-messages muted">
+                    {configMessages.map((m, i) => <li key={i}>{m}</li>)}
+                  </ul>
+                ) : null}
+                {configError ? <p className="error">{configError}</p> : null}
+              </div>
             </div>
-          </div>
+          ) : null}
 
-          <div className="settings-section node-restrictions">
-            <h3>Node restrictions / exit selection (supported subset)</h3>
-            <p className="muted">
-              <strong>Supported now:</strong> stream isolation (F-42/F-43) is configurable above. C Tor’s node restriction
-              lists (entry/exit/exclude/strict nodes) are not exposed by the pinned Arti backend. Unsupported knobs remain
-              hidden and are rejected if supplied in config import/patches (never silently ignored).
-            </p>
-            <ul className="muted">
-              <li><strong>Exit country / IPv6 / StreamPrefs defaults:</strong> planned (M2 open) — not yet wired or applied.</li>
-              <li><strong>Entry/exit/exclude/strict node lists:</strong> not supported by current Arti APIs used here; hidden.</li>
-            </ul>
-          </div>
+          {tab === "node" ? (
+            <div className="advanced-sections" role="tabpanel">
+              <div className="settings-section node-restrictions">
+                <h3>Node configuration (supported subset)</h3>
+                <p className="muted">
+                  Node restrictions and exit selection are exposed only when supported by the pinned Arti backend.
+                  Unsupported knobs remain hidden in the UI and are rejected if supplied in config import/patches (never silently ignored).
+                </p>
+                <ul className="muted">
+                  <li><strong>Exit country / IPv6 / StreamPrefs defaults:</strong> planned (M2 open) — not yet wired or applied.</li>
+                  <li><strong>Entry/exit/exclude/strict node lists:</strong> not supported by current Arti APIs used here; hidden.</li>
+                  <li><strong>Stream isolation (F-42/F-43):</strong> supported and configurable in Advanced Tor Configuration.</li>
+                </ul>
+              </div>
+            </div>
+          ) : null}
 
-          <div className="settings-section config-import">
-            <h3>Config import/export (no secrets)</h3>
-            <p className="muted">
-              Uses the daemon config API. Exports are <strong>redacted</strong> and contain <strong>no secrets</strong>. Import accepts a JSON object/patch; it is merged, validated (<code>deny_unknown_fields</code>), and only saved/applied if valid.
-            </p>
-            <div className="config-actions">
-              <button type="button" onClick={() => void onRefreshConfig()} disabled={busy}>Load current</button>
-              <button type="button" onClick={onExport} disabled={busy || !currentConfig}>Export JSON</button>
-              <button type="button" onClick={() => void onCopyCurrent()} disabled={busy || !currentConfig}>Copy current</button>
+          {tab === "advanced" ? (
+            <div className="advanced-sections" role="tabpanel">
+              <div className="settings-section-head">
+                <p className="muted">Advanced Tor behavior. Proxy/listener settings are in General.</p>
+              </div>
+
+              <div className="settings-section stream-isolation">
+                <h3>Stream isolation (F-42/F-43)</h3>
+                <p className="muted">
+                  Controls how proxy streams are isolated onto Tor circuits. Defaults are off. SOCKS auth isolation is
+                  native to Arti when credentials are provided; destination/port isolation is applied by tobro’s isolation
+                  front-end when enabled. Changes require Stop/Connect while Tor is running.
+                </p>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={stream.isolate_destination} disabled={streamBusy}
+                    onChange={(e) => onStreamToggle("isolate_destination", e.target.checked)} />
+                  <span><strong>Isolate by destination</strong> — streams to different destinations do not share circuits.</span>
+                </label>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={stream.isolate_port} disabled={streamBusy}
+                    onChange={(e) => onStreamToggle("isolate_port", e.target.checked)} />
+                  <span><strong>Isolate by port</strong> — streams to different destination ports do not share circuits.</span>
+                </label>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={stream.isolate_protocol} disabled={streamBusy}
+                    onChange={(e) => onStreamToggle("isolate_protocol", e.target.checked)} />
+                  <span><strong>Isolate by protocol</strong> — separate isolation by client protocol context (explicit policy; Arti already separates HTTP/SOCKS contexts).</span>
+                </label>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={stream.keep_alive_isolation} disabled={streamBusy}
+                    onChange={(e) => onStreamToggle("keep_alive_isolation", e.target.checked)} />
+                  <span><strong>SOCKS auth keep-alive isolation</strong> (F-43) — keep SOCKS username/password isolation explicit for stream lifetime/circuit association.</span>
+                </label>
+                {streamError ? <p className="error">{streamError}</p> : null}
+                {streamMessage ? <p className="muted">{streamMessage}</p> : null}
+                <div className="actions">
+                  <button className="primary" type="button" disabled={streamBusy || !streamDirty} onClick={() => void onSaveStream()}>
+                    {streamBusy ? "Saving…" : "Save stream isolation"}
+                  </button>
+                  <button type="button" disabled={streamBusy} onClick={() => void loadConfigState()}>Reset</button>
+                </div>
+              </div>
             </div>
-            {configPath ? <p className="muted config-hint">Config path: <code>{configPath}</code></p> : null}
-            <details className="config-preview" open={Boolean(currentConfig)}>
-              <summary>Current config (redacted)</summary>
-              <pre>{currentConfig ? JSON.stringify(currentConfig, null, 2) : "Load the current config to preview it."}</pre>
-            </details>
-            <div className="config-actions">
-              <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}>Load file…</button>
-              <input ref={fileRef} type="file" accept=".json,application/json" className="sr-only" onChange={(e) => void onPickFile(e)} />
-              <button type="button" onClick={() => void onValidate()} disabled={busy || !importText.trim()}>Validate</button>
-              <button type="button" className="primary" onClick={() => void onApplyConfig()} disabled={busy || !importText.trim()}>Apply</button>
-            </div>
-            <label className="sr-only" htmlFor="advanced-config-import-text">Config JSON patch</label>
-            <textarea
-              id="advanced-config-import-text"
-              className="config-textarea"
-              value={importText}
-              onChange={(e) => setImportText(e.target.value)}
-              placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053, "bind_all_interfaces": false }\n}'}
-              spellCheck={false}
-              rows={10}
-            />
-            {configMessages.length ? (
-              <ul className="config-messages muted">
-                {configMessages.map((m, i) => <li key={i}>{m}</li>)}
-              </ul>
-            ) : null}
-            {configError ? <p className="error">{configError}</p> : null}
-          </div>
+          ) : null}
         </div>
       )}
     </section>
   );
 }
+
+export const AdvancedSettings = Settings;
