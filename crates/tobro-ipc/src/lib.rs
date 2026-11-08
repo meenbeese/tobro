@@ -8,9 +8,9 @@
 //! # Transport
 //!
 //! Unix domain socket on macOS/Linux, created with a `0600` socket in a
-//! `0700` directory. Windows named pipes are part of the M1 IPC work; on
-//! non-Unix targets this crate exposes the protocol types but not
-//! [`Client`]/[`Server`].
+//! `0700` directory. Windows named pipes carry the same length-prefixed
+//! JSON-RPC framing; the pipe name is derived from the socket path, so both
+//! platforms share one endpoint convention.
 //!
 //! # M0 surface
 //!
@@ -517,6 +517,11 @@ pub struct Hello {
 mod unix;
 #[cfg(unix)]
 pub use unix::{Client, Connection, Server};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{Client, Connection, Server};
 
 #[cfg(test)]
 mod tests {

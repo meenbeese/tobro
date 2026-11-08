@@ -105,7 +105,7 @@ impl Hub {
 }
 
 /// Accept connections forever, serving each on its own task.
-pub async fn serve(server: Server, hub: Arc<Hub>) -> anyhow::Result<()> {
+pub async fn serve(mut server: Server, hub: Arc<Hub>) -> anyhow::Result<()> {
     tracing::info!(socket = %server.path().display(), "IPC listening");
     loop {
         let connection = server.accept().await?;

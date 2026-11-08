@@ -99,16 +99,13 @@ enum Event {
 /// Run the spike until the listener is shut down with Ctrl-C.
 pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> anyhow::Result<()> {
     // Start IPC first so clients can watch bootstrap progress.
-    #[cfg(unix)]
     let hub = crate::ipc::Hub::new(args.socks_port, args.dns_port);
 
-    #[cfg(unix)]
     let socket_path = args
         .socket
         .clone()
         .unwrap_or_else(|| tobro_ipc::socket_path(&state_dir));
 
-    #[cfg(unix)]
     match tobro_ipc::Server::bind(&socket_path).await {
         Ok(server) => {
             let hub = Arc::clone(&hub);

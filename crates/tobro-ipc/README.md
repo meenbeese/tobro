@@ -12,8 +12,9 @@ A 4-byte big-endian length prefix followed by a UTF-8 JSON document
 Unix domain socket at `<state-dir>/tobrod.sock`, in a `0700` directory with a
 `0600` socket. Stale sockets are replaced; a live one is an error.
 
-Windows named pipes are part of the M1 IPC work. On non-Unix targets this crate
-exposes the protocol types but not `Client`/`Server`.
+Windows names a pipe `\\.\pipe\tobro-<hash>` from the same path (FNV-1a of the
+state path, so both processes agree without a discovery file). A live daemon
+holds the first pipe instance, so binding when one is running fails.
 
 ## M0 surface
 

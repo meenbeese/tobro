@@ -141,7 +141,10 @@ impl Server {
     }
 
     /// Accept one connection.
-    pub async fn accept(&self) -> Result<Connection, IpcError> {
+    ///
+    /// Takes `&mut self` to match the named-pipe transport, where accepting
+    /// replaces the pending pipe instance.
+    pub async fn accept(&mut self) -> Result<Connection, IpcError> {
         let (stream, _address) = self.listener.accept().await?;
         Ok(Framed::new(stream, JsonRpcCodec::new()))
     }
@@ -191,7 +194,7 @@ mod tests {
     async fn client_and_server_exchange_messages() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("tobrod.sock");
-        let server = Server::bind(&path).await?;
+        let mut server = Server::bind(&path).await?;
 
         let client = async {
             let mut client = Client::connect(&path).await?;

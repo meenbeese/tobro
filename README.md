@@ -3,7 +3,8 @@
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
 **Status:** M0 spike in progress. Arti bootstrap/listeners and the local IPC
-socket/client are implemented; the Tauri window, ADRs, and benchmarks are next.
+socket/client (Unix socket + Windows named pipe) are implemented; the Tauri
+window, ADRs, and benchmarks are next.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
