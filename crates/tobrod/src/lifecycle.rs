@@ -46,6 +46,7 @@ pub enum State {
 
 impl State {
     /// Whether the daemon is usable for proxy traffic.
+    #[allow(dead_code)] // M1 skeleton API surface
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
     }

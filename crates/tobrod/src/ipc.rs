@@ -4,7 +4,7 @@
 //! enforces method allowlist, version handshake, and dispatches connect/stop.
 
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -181,12 +181,131 @@ fn hello() -> Hello {
 // M1 supervisor-backed IPC server
 // ---------------------------------------------------------------------------
 
-use crate::supervisor::{Snapshot, SupervisorEvent, SupervisorHandle};
+use crate::lifecycle::State;
+use crate::supervisor::{SupervisorEvent, SupervisorHandle};
+use std::future::Future;
 use tobro_tor::adapter::ListenerConfig;
 
-fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
+/// Actions the IPC layer can invoke. Implemented by [`SupervisorHandle`] and by
+/// test mocks (avoiding real Tor/bootstrap).
+pub trait DaemonControl: Clone + Send + Sync + 'static {
+    /// Snapshot for `daemon.status`.
+    fn snapshot(&self) -> crate::supervisor::Snapshot;
+    /// Request connect/start.
+    fn connect(
+        &self,
+        state_dir: std::path::PathBuf,
+        cache_dir: std::path::PathBuf,
+        listeners: ListenerConfig,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+    /// Request disconnect/stop.
+    fn disconnect(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// Reload and validate configuration. Returns a JSON summary.
+    fn reload_config(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Subscribe to supervisor events.
+    fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
+}
+
+/// Supervisor handle paired with config path for IPC reload.
+#[derive(Debug, Clone)]
+pub struct SupervisorControl {
+    handle: SupervisorHandle,
+    config_path: std::path::PathBuf,
+}
+
+impl SupervisorControl {
+    /// Create a control wrapper.
+    pub fn new(handle: SupervisorHandle, config_path: std::path::PathBuf) -> Self {
+        Self {
+            handle,
+            config_path,
+        }
+    }
+}
+
+impl DaemonControl for SupervisorControl {
+    fn snapshot(&self) -> crate::supervisor::Snapshot {
+        self.handle.snapshot()
+    }
+
+    async fn connect(
+        &self,
+        state_dir: std::path::PathBuf,
+        cache_dir: std::path::PathBuf,
+        listeners: ListenerConfig,
+    ) -> Result<(), String> {
+        self.handle
+            .connect(state_dir, cache_dir, listeners)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn disconnect(&self) -> Result<(), String> {
+        self.handle.disconnect().await.map_err(|e| e.to_string())
+    }
+
+    async fn reload_config(&self) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = tobro_config::Config::load_or_default(&path)
+                .map_err(|e| format!("failed to load {}: {e}", path.display()))?;
+            config
+                .validate()
+                .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+            Ok(json!({
+                "ok": true,
+                "action": "reload_config",
+                "path": path.display().to_string(),
+                "apply": "validated; restart connection to apply listener/proxy changes",
+                "proxy": { "socks_port": config.proxy.socks_port, "dns_port": config.proxy.dns_port },
+            }))
+        })
+        .await
+        .map_err(|e| format!("reload task failed: {e}"))?
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
+        self.handle.subscribe_events()
+    }
+}
+
+impl DaemonControl for SupervisorHandle {
+    fn snapshot(&self) -> crate::supervisor::Snapshot {
+        SupervisorHandle::snapshot(self)
+    }
+
+    async fn connect(
+        &self,
+        state_dir: std::path::PathBuf,
+        cache_dir: std::path::PathBuf,
+        listeners: ListenerConfig,
+    ) -> Result<(), String> {
+        SupervisorHandle::connect(self, state_dir, cache_dir, listeners)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn disconnect(&self) -> Result<(), String> {
+        SupervisorHandle::disconnect(self)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn reload_config(&self) -> Result<serde_json::Value, String> {
+        Err("config reload requires daemon config path context".to_owned())
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
+        SupervisorHandle::subscribe_events(self)
+    }
+}
+
+pub fn snapshot_to_status(
+    snapshot: &crate::supervisor::Snapshot,
+    started: Instant,
+) -> DaemonStatus {
     let (state, bootstrap) = match &snapshot.state {
-        crate::lifecycle::State::Stopped => (
+        State::Stopped => (
             DaemonState::Stopped,
             BootstrapProgress {
                 percent: 0,
@@ -195,8 +314,8 @@ fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
                 detail: "stopped".to_owned(),
             },
         ),
-        crate::lifecycle::State::Starting => (DaemonState::Starting, BootstrapProgress::default()),
-        crate::lifecycle::State::Bootstrapping { percent, detail } => (
+        State::Starting => (DaemonState::Starting, BootstrapProgress::default()),
+        State::Bootstrapping { percent, detail } => (
             DaemonState::Bootstrapping,
             BootstrapProgress {
                 percent: percent.unwrap_or(0),
@@ -205,7 +324,7 @@ fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
                 detail: detail.clone(),
             },
         ),
-        crate::lifecycle::State::Ready => (
+        State::Ready => (
             DaemonState::Serving,
             BootstrapProgress {
                 percent: 100,
@@ -214,7 +333,7 @@ fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
                 detail: "ready".to_owned(),
             },
         ),
-        crate::lifecycle::State::Stopping => (
+        State::Stopping => (
             DaemonState::Stopping,
             BootstrapProgress {
                 percent: 100,
@@ -223,7 +342,7 @@ fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
                 detail: "stopping".to_owned(),
             },
         ),
-        crate::lifecycle::State::Failed { message, .. } => (
+        State::Failed { message, .. } => (
             DaemonState::Error,
             BootstrapProgress {
                 percent: 0,
@@ -248,10 +367,10 @@ fn snapshot_to_status(snapshot: &Snapshot, started: Instant) -> DaemonStatus {
     }
 }
 
-/// Accept connections and dispatch M1 methods to the supervisor.
-pub async fn serve_daemon(
+/// Accept connections and dispatch M1 methods to the control plane.
+pub async fn serve_daemon<C: DaemonControl>(
     mut server: Server,
-    handle: SupervisorHandle,
+    control: C,
     state_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
     default_listeners: ListenerConfig,
@@ -260,14 +379,14 @@ pub async fn serve_daemon(
     tracing::info!(socket = %server.path().display(), "IPC listening (M1)");
     loop {
         let connection = server.accept().await?;
-        let handle = handle.clone();
+        let control = control.clone();
         let state_dir = state_dir.clone();
         let cache_dir = cache_dir.clone();
         let default_listeners = default_listeners.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_daemon(
                 connection,
-                handle,
+                control,
                 state_dir,
                 cache_dir,
                 default_listeners,
@@ -281,27 +400,36 @@ pub async fn serve_daemon(
     }
 }
 
-async fn handle_daemon(
+/// Per-connection idle/read timeout (M1 baseline; avoids stuck handlers).
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+async fn handle_daemon<C: DaemonControl>(
     mut connection: Connection,
-    handle: SupervisorHandle,
+    control: C,
     state_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
     default_listeners: ListenerConfig,
     started: Instant,
 ) -> Result<(), IpcError> {
-    #[cfg(unix)]
     check_peer_auth(&connection)?;
 
-    let mut events = handle.subscribe_events();
+    let mut events = control.subscribe_events();
     let mut handshaken = false;
 
     loop {
         tokio::select! {
-            incoming = connection.next() => {
+            incoming = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, connection.next()) => {
+                let incoming = match incoming {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::debug!("IPC connection idle timeout");
+                        return Ok(());
+                    }
+                };
                 match incoming {
                     Some(Ok(Message::Request(request))) => {
                         let response = dispatch_daemon(
-                            &handle,
+                            &control,
                             &state_dir,
                             &cache_dir,
                             &default_listeners,
@@ -324,7 +452,18 @@ async fn handle_daemon(
                             connection.send(Message::Notification(notification)).await?;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Coherent resync path: broadcast lagged; send current state so
+                        // clients can reconcile without guessing. Clients may also call
+                        // daemon.status.
+                        let snapshot = control.snapshot();
+                        let status = snapshot_to_status(&snapshot, started);
+                        let notification = RpcNotification::new(
+                            notifications::STATE_CHANGED,
+                            Some(json!({ "state": status.state, "resync": true })),
+                        );
+                        connection.send(Message::Notification(notification)).await?;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
@@ -332,22 +471,48 @@ async fn handle_daemon(
     }
 }
 
-#[cfg(unix)]
+/// Peer-auth enforcement.
+///
+/// Unix: verifies AF_UNIX peer uid matches the daemon's effective uid (using
+/// `rustix` for a safe uid query). The socket is also in a 0700 dir with 0600 mode.
+/// Windows: named-pipe creation currently uses the process default security descriptor;
+/// constructing a current-user DACL via `windows-sys`/`SECURITY_ATTRIBUTES` requires
+/// unsafe Win32 calls, which conflicts with the workspace `unsafe_code = forbid` lint.
+/// Follow-up: add an approved security-helper abstraction or a narrowly-scoped
+/// `#[allow(unsafe_code)]` module for DACL creation and client SID verification.
 fn check_peer_auth(connection: &Connection) -> Result<(), IpcError> {
-    // Obtain peer credentials (ensures a same-host Unix socket peer and gives us
-    // its uid for logging/auditing). Socket is created in a 0700 directory with
-    // 0600 permissions, which restricts access to the owning user. A strict
-    // uid==euid comparison requires platform FFI unavailable under the workspace's
-    // `unsafe_code = "forbid"` lint; M1 hardening can add a safe wrapper dep.
-    let _cred = connection
-        .get_ref()
-        .peer_cred()
-        .map_err(|e| IpcError::Protocol(format!("could not determine peer credentials: {e}")))?;
+    #[cfg(unix)]
+    {
+        let cred = connection.get_ref().peer_cred().map_err(|e| {
+            IpcError::Protocol(format!("could not determine peer credentials: {e}"))
+        })?;
+        let peer_uid = cred.uid();
+        let my_uid = rustix::process::geteuid().as_raw();
+        if peer_uid != my_uid {
+            return Err(IpcError::Protocol(format!(
+                "peer uid {peer_uid} does not match daemon euid {my_uid}"
+            )));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = connection;
+        // Follow-up: enforce named-pipe DACL / verify client user SID.
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = connection;
+    }
     Ok(())
 }
 
-async fn dispatch_daemon(
-    handle: &SupervisorHandle,
+/// Validate method params (per-method schema baseline; M1 is explicit no-params).
+fn validate_params(method: &str, params: &Option<serde_json::Value>) -> Result<(), RpcError> {
+    tobro_ipc::validate_no_params(method, params)
+}
+
+pub async fn dispatch_daemon<C: DaemonControl>(
+    control: &C,
     state_dir: &std::path::Path,
     cache_dir: &std::path::Path,
     default_listeners: &ListenerConfig,
@@ -367,22 +532,26 @@ async fn dispatch_daemon(
             RpcError::unauthorized("call daemon.hello before other methods"),
         );
     }
+    if let Err(err) = validate_params(method, &request.params) {
+        return RpcResponse::error(id, err);
+    }
 
     match method {
         methods::HELLO => {
+            // Enforce handshake: hello is the preflight method and establishes it.
             *handshaken = true;
             encode(id, &hello())
         }
         methods::STATUS => {
-            let snapshot = handle.snapshot();
+            let snapshot = control.snapshot();
             encode(id, &snapshot_to_status(&snapshot, started))
         }
         methods::CONNECT => {
-            let listeners = handle
+            let listeners = control
                 .snapshot()
                 .listeners
                 .unwrap_or_else(|| default_listeners.clone());
-            match handle
+            match control
                 .connect(state_dir.to_path_buf(), cache_dir.to_path_buf(), listeners)
                 .await
             {
@@ -392,9 +561,13 @@ async fn dispatch_daemon(
                 }
             }
         }
-        methods::STOP => match handle.disconnect().await {
+        methods::STOP => match control.disconnect().await {
             Ok(()) => encode(id, &json!({ "ok": true, "action": "stop" })),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("stop failed: {e}"))),
+        },
+        methods::RELOAD_CONFIG => match control.reload_config().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(e)),
         },
         other => RpcResponse::error(id, RpcError::method_not_found(other)),
     }
@@ -404,12 +577,12 @@ fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotific
     match event {
         SupervisorEvent::StateChanged(snapshot) => {
             let state = match snapshot.state {
-                crate::lifecycle::State::Starting => DaemonState::Starting,
-                crate::lifecycle::State::Bootstrapping { .. } => DaemonState::Bootstrapping,
-                crate::lifecycle::State::Ready => DaemonState::Serving,
-                crate::lifecycle::State::Stopping => DaemonState::Stopping,
-                crate::lifecycle::State::Stopped => DaemonState::Stopped,
-                crate::lifecycle::State::Failed { .. } => DaemonState::Error,
+                State::Starting => DaemonState::Starting,
+                State::Bootstrapping { .. } => DaemonState::Bootstrapping,
+                State::Ready => DaemonState::Serving,
+                State::Stopping => DaemonState::Stopping,
+                State::Stopped => DaemonState::Stopped,
+                State::Failed { .. } => DaemonState::Error,
             };
             Some(RpcNotification::new(
                 notifications::STATE_CHANGED,
@@ -432,5 +605,231 @@ fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotific
             notifications::STATE_CHANGED,
             Some(json!({ "state": "error", "message": message })),
         )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod daemon_tests {
+    use super::*;
+    use crate::lifecycle::{Desired, State};
+    use crate::supervisor::{Snapshot, SupervisorEvent};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tobro_tor::adapter::ListenerConfig;
+
+    #[derive(Debug, Clone)]
+    struct MockControl {
+        snapshot: Arc<Mutex<Snapshot>>,
+        connects: Arc<Mutex<u32>>,
+        disconnects: Arc<Mutex<u32>>,
+        _events_tx: broadcast::Sender<SupervisorEvent>,
+        events_tx: broadcast::Sender<SupervisorEvent>,
+    }
+
+    impl MockControl {
+        fn new() -> Self {
+            let (events_tx, _) = broadcast::channel(16);
+            Self {
+                snapshot: Arc::new(Mutex::new(Snapshot {
+                    desired: Desired::Stopped,
+                    state: State::Stopped,
+                    listeners: None,
+                })),
+                connects: Arc::new(Mutex::new(0)),
+                disconnects: Arc::new(Mutex::new(0)),
+                _events_tx: events_tx.clone(),
+                events_tx,
+            }
+        }
+
+        fn set_state(&self, desired: Desired, state: State, listeners: Option<ListenerConfig>) {
+            if let Ok(mut s) = self.snapshot.lock() {
+                *s = Snapshot {
+                    desired,
+                    state,
+                    listeners,
+                };
+            }
+        }
+    }
+
+    impl DaemonControl for MockControl {
+        fn snapshot(&self) -> Snapshot {
+            self.snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        async fn connect(
+            &self,
+            _state_dir: PathBuf,
+            _cache_dir: PathBuf,
+            listeners: ListenerConfig,
+        ) -> Result<(), String> {
+            *self.connects.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            self.set_state(Desired::Connected, State::Ready, Some(listeners));
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<(), String> {
+            *self.disconnects.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            self.set_state(Desired::Stopped, State::Stopped, None);
+            Ok(())
+        }
+
+        async fn reload_config(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "reload_config", "mock": true }))
+        }
+
+        fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
+            self.events_tx.subscribe()
+        }
+    }
+
+    fn req(id: u64, method: &str, params: Option<serde_json::Value>) -> RpcRequest {
+        RpcRequest::new(RequestId::Number(id), method).with_params(params)
+    }
+
+    fn default_ctx() -> (PathBuf, PathBuf, ListenerConfig, Instant) {
+        (
+            PathBuf::from("/tmp/state"),
+            PathBuf::from("/tmp/cache"),
+            ListenerConfig::default(),
+            Instant::now(),
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_handshake_rejects_non_preflight() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = false;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::STATUS, None),
+        )
+        .await;
+        let err = resp.error.expect("should error");
+        assert_eq!(err.code, tobro_ipc::codes::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn allowlist_rejects_unknown_method() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, "daemon.evil", None),
+        )
+        .await;
+        let err = resp.error.expect("should error");
+        assert_eq!(err.code, tobro_ipc::codes::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn param_validation_rejects_unexpected_params() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::STATUS, Some(json!({"nope": true}))),
+        )
+        .await;
+        let err = resp.error.expect("should error");
+        assert_eq!(err.code, tobro_ipc::codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn param_validation_accepts_null_and_empty_object() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        for params in [None, Some(json!(null)), Some(json!({}))] {
+            let resp = dispatch_daemon(
+                &control,
+                &state_dir,
+                &cache_dir,
+                &listeners,
+                started,
+                &mut handshaken,
+                req(1, methods::STATUS, params),
+            )
+            .await;
+            assert!(resp.error.is_none(), "params should be accepted");
+            assert!(resp.result.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_connect_status_stop_flow_in_process() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tobrod.sock");
+        let mut server = Server::bind(&path).await?;
+        let control = MockControl::new();
+        let control_srv = control.clone();
+
+        let daemon = tokio::spawn(async move {
+            let conn = server.accept().await?;
+            handle_daemon(
+                conn,
+                control_srv,
+                PathBuf::from("/tmp/state"),
+                PathBuf::from("/tmp/cache"),
+                ListenerConfig::default(),
+                Instant::now(),
+            )
+            .await
+        });
+
+        // Give server a moment to accept.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = tobro_ipc::Client::connect(&path).await?;
+
+        let hello = client.handshake().await?;
+        assert_eq!(hello.rpc_version, RPC_VERSION);
+
+        let status = client.call(methods::STATUS, None).await?;
+        assert_eq!(status["state"], "stopped");
+
+        let connect = client.call(methods::CONNECT, None).await?;
+        assert_eq!(connect["ok"], true);
+        assert_eq!(connect["action"], "connect");
+
+        let status = client.call(methods::STATUS, None).await?;
+        assert_eq!(status["state"], "serving");
+
+        let stop = client.call(methods::STOP, None).await?;
+        assert_eq!(stop["ok"], true);
+        assert_eq!(stop["action"], "stop");
+
+        let status = client.call(methods::STATUS, None).await?;
+        assert_eq!(status["state"], "stopped");
+
+        assert_eq!(*control.connects.lock().unwrap(), 1);
+        assert_eq!(*control.disconnects.lock().unwrap(), 1);
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(1), daemon).await;
+        Ok(())
     }
 }

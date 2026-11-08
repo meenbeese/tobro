@@ -14,10 +14,11 @@
 //!
 //! # M1 surface
 //!
-//! Methods: `daemon.hello`, `daemon.status`, `daemon.connect`, `daemon.stop`.
+//! Methods: `daemon.hello`, `daemon.status`, `daemon.connect`, `daemon.stop`,
+//! `daemon.reload_config`.
 //! Notifications: `bootstrap.progress`, `daemon.state_changed`.
-//! Servers enforce a method allowlist and version handshake; peer identity checks
-//! are transport/platform-specific hardening.
+//! Servers enforce a method allowlist, version/hello preflight, explicit no-params
+//! validation, peer-identity checks (platform-specific), and idle-connection timeouts.
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,8 @@ pub mod methods {
     pub const CONNECT: &str = "daemon.connect";
     /// Request that the daemon stop/disconnect Tor.
     pub const STOP: &str = "daemon.stop";
+    /// Reload and validate configuration from disk (apply semantics are method-specific).
+    pub const RELOAD_CONFIG: &str = "daemon.reload_config";
 
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
@@ -68,8 +71,35 @@ pub mod methods {
 pub fn is_allowed_method(method: &str) -> bool {
     matches!(
         method,
-        methods::HELLO | methods::STATUS | methods::CONNECT | methods::STOP
+        methods::HELLO
+            | methods::STATUS
+            | methods::CONNECT
+            | methods::STOP
+            | methods::RELOAD_CONFIG
     )
+}
+
+/// Validate that an M1 method's params are absent/null/empty (no-params contract).
+pub fn validate_no_params(method: &str, params: &Option<Value>) -> Result<(), RpcError> {
+    match method {
+        methods::HELLO
+        | methods::STATUS
+        | methods::CONNECT
+        | methods::STOP
+        | methods::RELOAD_CONFIG => {
+            if let Some(p) = params
+                && !p.is_null()
+                && !(p.is_object() && p.as_object().is_some_and(|o| o.is_empty()))
+            {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "this method takes no parameters",
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Notification names used by the M0 IPC surface.

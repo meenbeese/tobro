@@ -74,19 +74,11 @@ impl Default for Config {
 }
 
 /// General application settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     /// Whether the user wants tobro started at login (wiring arrives in M4).
     pub start_on_login: bool,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self {
-            start_on_login: false,
-        }
-    }
 }
 
 /// Local proxy listener settings.

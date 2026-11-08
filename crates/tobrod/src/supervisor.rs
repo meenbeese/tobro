@@ -43,6 +43,7 @@ pub enum Command {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Desired intent.
+    #[allow(dead_code)] // read by IPC/status consumers as API evolves
     pub desired: Desired,
     /// Lifecycle state.
     pub state: State,
@@ -110,6 +111,7 @@ impl SupervisorHandle {
     }
 
     /// Subscribe to snapshots.
+    #[allow(dead_code)] // M1 API surface for GUI/observers
     pub fn subscribe_status(&self) -> watch::Receiver<Snapshot> {
         self.status_rx.clone()
     }
@@ -574,6 +576,7 @@ fn start_worker(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
