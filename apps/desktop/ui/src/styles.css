@@ -77,7 +77,24 @@ button {
 button:disabled { opacity: 0.5; cursor: default; }
 .primary { background: var(--accent); color: var(--accent-fg); }
 .danger { background: var(--bad); color: #fff; }
-.logs h2 { margin: 0 0 8px; font-size: 0.95rem; color: var(--muted); }
+.logs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.logs h2 { margin: 0; font-size: 0.95rem; color: var(--muted); }
+.logs.collapsed .logs-header { margin-bottom: 0; }
+.logs-toggle {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+.logs-toggle:hover { color: var(--fg); }
 .logs ol {
   margin: 0;
   padding: 0;
@@ -88,3 +105,28 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .logs li { padding: 2px 0; border-bottom: 1px solid var(--border); }
 .logs li.error { color: var(--bad); }
+.port-editor { margin: 16px 0; }
+.port-editor h2 { margin: 0 0 8px; font-size: 0.95rem; color: var(--muted); }
+.port-editor p { margin: 0 0 10px; font-size: 0.9rem; }
+.port-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.port-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.port-grid input {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.error { color: var(--bad); }

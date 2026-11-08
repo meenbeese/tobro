@@ -7058,6 +7058,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tobro-config",
  "tobro-ipc",
  "tokio",
 ]

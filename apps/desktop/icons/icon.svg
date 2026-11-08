@@ -49,12 +49,6 @@
     <!-- core -->
     <circle cx="256" cy="256" r="28" fill="url(#core)"/>
     <circle cx="256" cy="256" r="28" fill="none" stroke="#FFF0E4" stroke-opacity="0.55" stroke-width="3"/>
-
-    <!-- slice highlight/cut facet to read as "sliced" -->
-    <path d="M256 68 L430 182 L430 330 L256 444 L82 330 L82 182 Z" fill="none" stroke="#FFF3EA" stroke-opacity="0.16" stroke-width="8" stroke-linejoin="round"/>
-    <path d="M256 256 L256 68" stroke="#FFF3EA" stroke-opacity="0.18" stroke-width="6" stroke-linecap="round"/>
-    <path d="M256 256 L418 162" stroke="#7A2E12" stroke-opacity="0.10" stroke-width="6" stroke-linecap="round"/>
-    <path d="M256 256 L418 350" stroke="#FFF3EA" stroke-opacity="0.10" stroke-width="6" stroke-linecap="round"/>
   </g>
 
   <!-- subtle rim -->

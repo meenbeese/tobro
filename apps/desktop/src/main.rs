@@ -21,6 +21,7 @@ use tobro_ipc::{Client, DaemonStatus, Message, methods, socket_path};
 enum IpcCommand {
     Connect(oneshot::Sender<Result<Value, String>>),
     Stop(oneshot::Sender<Result<Value, String>>),
+    ReloadConfig(oneshot::Sender<Result<Value, String>>),
 }
 
 #[derive(Debug)]
@@ -79,6 +80,60 @@ async fn daemon_stop(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(|_| "daemon connection task dropped the response".to_owned())?
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProxyPorts {
+    socks_port: u16,
+    http_port: u16,
+    dns_port: u16,
+    config_path: String,
+}
+
+#[tauri::command]
+fn get_proxy_ports() -> Result<ProxyPorts, String> {
+    let path = tobro_config::default_path().map_err(|e| e.to_string())?;
+    let config = tobro_config::Config::load_or_default(&path).map_err(|e| e.to_string())?;
+    Ok(ProxyPorts {
+        socks_port: config.proxy.socks_port,
+        http_port: config.proxy.effective_http_port(),
+        dns_port: config.proxy.dns_port,
+        config_path: path.display().to_string(),
+    })
+}
+
+#[tauri::command]
+async fn save_proxy_ports(
+    state: State<'_, AppState>,
+    socks_port: u16,
+    http_port: u16,
+    dns_port: u16,
+) -> Result<Value, String> {
+    let path = tobro_config::default_path().map_err(|e| e.to_string())?;
+    let mut config = tobro_config::Config::load_or_default(&path).map_err(|e| e.to_string())?;
+    config.proxy.socks_port = socks_port;
+    config.proxy.http_port = http_port;
+    config.proxy.dns_port = dns_port;
+    config.validate().map_err(|e| e.to_string())?;
+    config.save(&path).map_err(|e| e.to_string())?;
+
+    let (tx, rx) = oneshot::channel();
+    let reload = if state.commands.send(IpcCommand::ReloadConfig(tx)).await.is_ok() {
+        rx.await.ok().and_then(Result::ok)
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "ok": true,
+        "config_path": path.display().to_string(),
+        "proxy": {
+            "socks_port": config.proxy.socks_port,
+            "http_port": config.proxy.effective_http_port(),
+            "dns_port": config.proxy.dns_port,
+        },
+        "reload": reload,
+    }))
+}
+
 fn daemon_socket() -> Result<PathBuf, String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|arg| arg == "--socket") {
@@ -133,7 +188,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             status,
             daemon_connect,
-            daemon_stop
+            daemon_stop,
+            get_proxy_ports,
+            save_proxy_ports
         ])
         .build(tauri::generate_context!());
 
@@ -244,7 +301,7 @@ async fn watch_daemon(
 fn reject_command(cmd: IpcCommand, message: &str) {
     let err = Err(message.to_owned());
     match cmd {
-        IpcCommand::Connect(tx) | IpcCommand::Stop(tx) => {
+        IpcCommand::Connect(tx) | IpcCommand::Stop(tx) | IpcCommand::ReloadConfig(tx) => {
             let _ = tx.send(err);
         }
     }
@@ -303,6 +360,14 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
         IpcCommand::Stop(tx) => {
             let result = client
                 .call(methods::STOP, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            refresh_status(handle, client).await;
+        }
+        IpcCommand::ReloadConfig(tx) => {
+            let result = client
+                .call(methods::RELOAD_CONFIG, None)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
