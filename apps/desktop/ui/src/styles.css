@@ -84,7 +84,9 @@ button:disabled { opacity: 0.5; cursor: default; }
   gap: 12px;
   margin-bottom: 8px;
 }
+.logs-header-actions { display: flex; align-items: center; gap: 8px; }
 .logs h2 { margin: 0; font-size: 0.95rem; color: var(--muted); }
+.logs-count { font-size: 0.85rem; }
 .logs.collapsed .logs-header { margin-bottom: 0; }
 .logs-toggle {
   background: transparent;
@@ -95,16 +97,73 @@ button:disabled { opacity: 0.5; cursor: default; }
   font-size: 0.85rem;
 }
 .logs-toggle:hover { color: var(--fg); }
-.logs ol {
+.log-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.log-control input[type="search"],
+.log-control select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.log-control input[type="search"] { min-width: 160px; }
+.log-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.log-actions { display: flex; gap: 6px; margin-left: auto; }
+.log-actions button, .log-controls button {
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.log-actions button:hover:not(:disabled) { border-color: var(--muted); }
+.log-message { margin: 0 0 8px; font-size: 0.85rem; }
+.log-list {
   margin: 0;
   padding: 0;
   list-style: none;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-  max-height: 220px;
+  max-height: 280px;
   overflow: auto;
+  border-top: 1px solid var(--border);
 }
-.logs li { padding: 2px 0; border-bottom: 1px solid var(--border); }
-.logs li.error { color: var(--bad); }
+.log-line {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.log-line.error { color: var(--bad); }
+.log-ts { color: var(--muted); white-space: nowrap; }
+.log-level { color: var(--muted); text-transform: uppercase; font-size: 0.9em; }
+.log-text { word-break: break-word; white-space: pre-wrap; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .port-editor { margin: 16px 0; }
 .port-editor h2 { margin: 0 0 8px; font-size: 0.95rem; color: var(--muted); }
 .port-editor p { margin: 0 0 10px; font-size: 0.9rem; }

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { LogViewer, type LogEntry } from "./LogViewer";
 
 type DaemonState =
   | "starting"
@@ -24,12 +25,6 @@ interface DaemonStatus {
   socks_port?: number;
   http_port?: number;
   dns_port?: number;
-}
-
-interface LogEntry {
-  id: number;
-  text: string;
-  level: "info" | "error";
 }
 
 interface ProxyPorts {
@@ -75,7 +70,6 @@ export default function App() {
   const [daemonInfo, setDaemonInfo] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logsOpen, setLogsOpen] = useState(true);
   const [portInputs, setPortInputs] = useState<Record<PortField, string>>({
     socks_port: "9050",
     http_port: "9050",
@@ -88,9 +82,15 @@ export default function App() {
   const [portsError, setPortsError] = useState<string>("");
   const nextLogId = useRef(1);
 
-  function appendLog(text: string, level: "info" | "error" = "info") {
-    const entry = { id: nextLogId.current++, text, level };
-    setLogs((prev) => [...prev.slice(-199), entry]);
+  function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
+    const entry: LogEntry = {
+      id: nextLogId.current++,
+      ts: new Date().toISOString(),
+      text,
+      level,
+      source,
+    };
+    setLogs((prev) => [...prev.slice(-499), entry]);
   }
 
   async function loadPorts() {
@@ -391,30 +391,7 @@ export default function App() {
         </div>
       </section>
 
-      <section className={`card logs ${logsOpen ? "open" : "collapsed"}`}>
-        <div className="logs-header">
-          <h2>Log</h2>
-          <button
-            type="button"
-            className="logs-toggle"
-            aria-expanded={logsOpen}
-            aria-controls="event-log"
-            onClick={() => setLogsOpen((open) => !open)}
-          >
-            {logsOpen ? "Hide" : "Show"}{logs.length > 0 ? ` (${logs.length})` : ""}
-          </button>
-        </div>
-        {logsOpen ? (
-          <ol id="event-log" aria-label="Event log">
-            {logs.length === 0 ? <li className="muted">No events yet.</li> : null}
-            {logs.map((entry) => (
-              <li key={entry.id} className={entry.level === "error" ? "error" : ""}>
-                {entry.text}
-              </li>
-            ))}
-          </ol>
-        ) : null}
-      </section>
+      <LogViewer entries={logs} onClear={() => setLogs([])} />
     </main>
   );
 }

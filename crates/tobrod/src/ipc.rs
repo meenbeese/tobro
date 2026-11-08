@@ -17,6 +17,8 @@ use tobro_ipc::{
     notifications,
 };
 
+use crate::redact::redact_secrets;
+
 /// Shared daemon state observed by IPC clients.
 #[derive(Debug)]
 pub struct Hub {
@@ -55,8 +57,8 @@ impl Hub {
         let progress = BootstrapProgress {
             percent,
             ready,
-            blocked,
-            detail,
+            blocked: blocked.map(|s| redact_secrets(&s)),
+            detail: redact_secrets(&detail),
         };
         self.update(|status| {
             status.bootstrap = progress.clone();
@@ -566,7 +568,7 @@ pub fn snapshot_to_status(
                 percent: percent.unwrap_or(0),
                 ready: false,
                 blocked: None,
-                detail: detail.clone(),
+                detail: redact_secrets(detail),
             },
         ),
         State::Ready => (
@@ -587,15 +589,18 @@ pub fn snapshot_to_status(
                 detail: "stopping".to_owned(),
             },
         ),
-        State::Failed { message, .. } => (
-            DaemonState::Error,
-            BootstrapProgress {
-                percent: 0,
-                ready: false,
-                blocked: Some(message.clone()),
-                detail: message.clone(),
-            },
-        ),
+        State::Failed { message, .. } => {
+            let redacted = redact_secrets(message);
+            (
+                DaemonState::Error,
+                BootstrapProgress {
+                    percent: 0,
+                    ready: false,
+                    blocked: Some(redacted.clone()),
+                    detail: redacted,
+                },
+            )
+        }
     };
     let (socks_port, http_port, dns_port) = snapshot
         .listeners
@@ -930,7 +935,7 @@ fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotific
                 percent: percent.unwrap_or(0),
                 ready: false,
                 blocked: None,
-                detail,
+                detail: redact_secrets(&detail),
             };
             Some(RpcNotification::new(
                 notifications::BOOTSTRAP_PROGRESS,
@@ -939,7 +944,7 @@ fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotific
         }
         SupervisorEvent::Failed { message } => Some(RpcNotification::new(
             notifications::STATE_CHANGED,
-            Some(json!({ "state": "error", "message": message })),
+            Some(json!({ "state": "error", "message": redact_secrets(&message) })),
         )),
     }
 }

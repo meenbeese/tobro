@@ -3,8 +3,10 @@
 //! M1 exit gate requires that logs contain no secrets in a redaction test.
 //! This module provides conservative, pattern-based redaction for values that
 //! must never appear in tracing output or exported diagnostics.
+//!
+//! M2 hardening: applied at IPC/event boundaries and available to logging/diagnostics call sites.
 
-#![allow(dead_code)] // M1 utility surface and redaction tests; wired into logging/diagnostics as call sites adopt it.
+#![allow(dead_code)] // `Redacted<T>` and some helpers may be adopted incrementally.
 
 /// Placeholder used when sensitive material is removed.
 pub const REDACTED: &str = "[REDACTED]";
@@ -31,12 +33,21 @@ fn redact_labeled_secrets(input: &str) -> String {
         "passwd",
         "secret",
         "token",
+        "api_key",
+        "api-key",
+        "access_token",
+        "access-token",
+        "private_key",
+        "private-key",
         "credential",
         "credentials",
         "x25519",
+        "ed25519",
         "client_auth",
         "client-auth",
         "auth_private",
+        "cert",
+        "fingerprint",
     ];
 
     let mut out = String::with_capacity(input.len());
@@ -166,12 +177,15 @@ fn redact_bridge_like_lines(input: &str) -> String {
     let mut out = Vec::new();
     for line in input.lines() {
         let trimmed = line.trim_start();
-        let is_bridge = trimmed.starts_with("Bridge ")
-            || trimmed.starts_with("obfs4 ")
-            || trimmed.starts_with("snowflake ")
-            || trimmed.starts_with("webtunnel ")
-            || trimmed.starts_with("meek_lite ")
-            || trimmed.starts_with("dnstt ");
+        let lower = trimmed.to_ascii_lowercase();
+        let is_bridge = lower.starts_with("bridge ")
+            || lower.starts_with("obfs4 ")
+            || lower.starts_with("snowflake ")
+            || lower.starts_with("webtunnel ")
+            || lower.starts_with("meek_lite ")
+            || lower.starts_with("meek ")
+            || lower.starts_with("conjure ")
+            || lower.starts_with("dnstt ");
         if is_bridge {
             let prefix = trimmed.split_whitespace().next().unwrap_or("Bridge");
             out.push(format!("{prefix} {REDACTED}"));
@@ -272,6 +286,22 @@ mod tests {
     fn keeps_non_sensitive_text() {
         let input = "bootstrap 50%: loading directory information";
         assert_eq!(redact_secrets(input), input);
+    }
+
+    #[test]
+    fn redacts_case_insensitive_bridge_lines() {
+        let input = "bridge obfs4 192.0.2.1:1 ABC cert=x";
+        let redacted = redact_secrets(input);
+        assert!(!redacted.contains("192.0.2.1"), "{redacted}");
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    }
+
+    #[test]
+    fn redacts_api_key_labels() {
+        let input = "api_key=secret123 access-token: abc";
+        let redacted = redact_secrets(input);
+        assert!(!redacted.contains("secret123"), "{redacted}");
+        assert!(!redacted.contains("abc"), "{redacted}");
     }
 
     #[test]
