@@ -27,6 +27,7 @@ interface DaemonStatus {
   socks_port?: number;
   http_port?: number;
   dns_port?: number;
+  bind_all_interfaces?: boolean;
 }
 
 interface TobroEvent {
@@ -230,13 +231,18 @@ export default function App() {
           </div>
         ) : null}
         {status?.bootstrap?.blocked ? <p className="blocked">Blocked: {status.bootstrap.blocked}</p> : null}
+        {status?.bind_all_interfaces ? (
+          <p className="error bind-all-warning" role="alert">
+            Security warning: listeners are bound to all interfaces (SOCKS/HTTP/DNS exposed beyond localhost). Use firewall rules and trusted networks only.
+          </p>
+        ) : null}
         <div className="ports muted">
-          <span>active SOCKS {status?.socks_port ?? "—"}</span>
-          <span>active HTTP {status?.http_port ?? status?.socks_port ?? "—"}</span>
-          <span>active DNS {status?.dns_port ?? "—"}</span>
+          <span>active SOCKS {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.socks_port ?? "—"}</span>
+          <span>active HTTP {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.http_port ?? status?.socks_port ?? "—"}</span>
+          <span>active DNS {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.dns_port ?? "—"}</span>
         </div>
         <p className="muted ports-hint">
-          Listener port configuration and config import/export moved to <button type="button" className="link-button" onClick={() => setSettingsOpen(true)}>Advanced settings</button> (power-user gated).
+          Listener settings and config import/export are in <button type="button" className="link-button" onClick={() => setSettingsOpen(true)}>Advanced settings</button> (power-user gated).
         </p>
         <div className="actions">
           {!isActive ? (

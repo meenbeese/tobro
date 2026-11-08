@@ -28,6 +28,9 @@ pub struct ListenerConfig {
     pub http_port: u16,
     /// UDP DNS proxy port.
     pub dns_port: u16,
+    /// Bind listeners on all interfaces instead of loopback only (opt-in).
+    #[serde(default)]
+    pub bind_all_interfaces: bool,
 }
 
 impl Default for ListenerConfig {
@@ -36,6 +39,7 @@ impl Default for ListenerConfig {
             socks_port: crate::DEFAULT_SOCKS_PORT,
             http_port: crate::DEFAULT_HTTP_PORT,
             dns_port: crate::DEFAULT_DNS_PORT,
+            bind_all_interfaces: false,
         }
     }
 }
@@ -150,6 +154,7 @@ impl PreparedService {
             &self.cache_dir,
             self.listeners.socks_port,
             self.listeners.dns_port,
+            self.listeners.bind_all_interfaces,
         );
         tokio::pin!(serve);
 

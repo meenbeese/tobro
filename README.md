@@ -2,7 +2,7 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0 complete; M1 wrapped; M2 in progress.
+**Status:** M0-M1 complete; M2 in progress.
 
 M1 delivered the control plane and desktop shell: Arti bootstrap/listeners,
 local IPC (Unix socket + Windows named pipe), `tobro-config`/`tobro-store`,
@@ -14,18 +14,23 @@ and unsigned packaging smoke builds.
 
 M2 progress so far: CI speedups (safe caching/prebuilt Tauri CLI), configurable
 proxy/DNS ports with conflict detection/helpers and honest SOCKS+HTTP listener
-semantics, `daemon.new_identity` (new circuits via supervised restart while
-preserving guard/state dirs) with tests/CLI/UI, daemon config API
-(`config.get`/`config.validate`/`config.apply`, redacted/no secrets, patch-based,
-deny-unknown-fields preserved), `tobroctl config get|validate|apply`, desktop
-Advanced Settings behind a power-user gate with listener-port editing and config
-import/export (no secrets), and a standalone log viewer (filters, copy/save,
-wrap, persisted redaction preference) plus daemon/UI redaction hardening.
+semantics, bind-all-interfaces opt-in (`proxy.bind_all_interfaces`, default off)
+with bind-aware port checks and clear security/firewall warnings in config/IPC/UI,
+DNS/`.onion` wiring verification (CI unit/config tests) plus an opt-in runtime
+`.onion` resolution check via `tobrod spike --dns-check-host <v3>.onion`
+(UDP-only Arti DNS, retry-aware), `daemon.new_identity` (new circuits via
+supervised restart while preserving guard/state dirs) with tests/CLI/UI, daemon
+config API (`config.get`/`config.validate`/`config.apply`, redacted/no secrets,
+patch-based, deny-unknown-fields preserved), `tobroctl config get|validate|apply`,
+desktop Advanced Settings behind a power-user gate with listener/bind-all
+editing and config import/export (no secrets), and a standalone log viewer
+(filters, copy/save, wrap, persisted redaction preference) plus daemon/UI
+redaction hardening.
 
-M2 still open: bind-all-interfaces (opt-in + warnings), DNS/`.onion` wiring
-verification/test, exit country/IPv6/`StreamPrefs`, stream isolation, supported
+M2 still open: exit country/IPv6/`StreamPrefs`, stream isolation, supported
 node restrictions/unsupported-knob UX, and runtime/cross-OS verification for M2
-exit criteria (new identity behavior, port conflicts).
+exit criteria (new identity, port conflicts, bind-all exposure, opt-in `.onion`
+resolution on a live Tor network).
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -36,6 +41,40 @@ exit criteria (new identity behavior, port conflicts).
 - **Platforms:** macOS, Windows, Linux.
 - **Scope:** connect/disconnect, bridges and pluggable transports, proxy services, onion services, Kindness Mode, tray/autostart, CLI.
 - **Non-goals:** mobile, Tor relay/exit mode, raw `torrc` compatibility, bundled browser.
+
+### System overview
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│                        User session                              │
+│                                                                  │
+│  ┌────────────────────┐        JSON-RPC 2.0        ┌───────────┐ │
+│  │  tobro GUI         │◄──────────────────────────►│  tobrod   │ │
+│  │  Tauri 2 + React   │   UDS / named pipe         │  daemon   │ │
+│  │  tray, windows     │   events + commands        │           │ │
+│  └────────────────────┘                            └─────┬─────┘ │
+│                                                          │       │
+│  ┌────────────────────┐                                  │       │
+│  │  tobroctl CLI      │◄─────────────────────────────────┤       │
+│  └────────────────────┘                                  │       │
+│                                                          │       │
+│                                          ┌───────────────┼───────┐
+│                                          │               │       │
+│                                    ┌─────▼─────┐   ┌─────▼─────┐ │
+│                                    │  Arti     │   │ PT manager│ │
+│                                    │  client   │   │ sidecars  │ │
+│                                    └─────┬─────┘   └─────┬─────┘ │
+│                                          │               │       │
+│                                    ┌─────▼───────────────▼─────┐ │
+│                                    │  Tor network (bridges)    │ │
+│                                    └───────────────────────────┘ │
+│                                                                  │
+│  ┌─────────────────────────────┐        ┌──────────────────────┐ │
+│  │  tobro-helper (privileged)  │◄──────►│  TUN / routes / DNS  │ │
+│  │  optional, TUN mode only    │        │  (post-1.0)          │ │
+│  └─────────────────────────────┘        └──────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 ## Try the daemon
 
@@ -107,4 +146,3 @@ on close; quit from the tray menu to exit the GUI. The daemon is independent.
 ## License
 
 GPL-3.0-only — see [LICENSE.txt](LICENSE.txt).
-

@@ -40,10 +40,16 @@ interface ProxyPorts {
   socks_port: number;
   http_port: number;
   dns_port: number;
+  bind_all_interfaces?: boolean;
   config_path?: string;
 }
 
 type PortField = "socks_port" | "http_port" | "dns_port";
+
+const BIND_ALL_WARNING =
+  "Binding listeners to all interfaces exposes SOCKS, HTTP CONNECT, and DNS to other devices on reachable networks. " +
+  "Other hosts may be able to route traffic through Tor from this machine. Only enable on trusted networks, " +
+  "and configure your OS/router firewall to restrict access to these ports. Disable bind-all when not needed.";
 
 function downloadJson(filename: string, value: unknown) {
   const text = `${JSON.stringify(value, null, 2)}\n`;
@@ -109,12 +115,13 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
   const [powerUser, setPowerUser] = useState(readPowerUser);
   const [busy, setBusy] = useState(false);
 
-  // Listener ports
+  // Listener settings
   const [portInputs, setPortInputs] = useState<Record<PortField, string>>({
     socks_port: "9050",
     http_port: "9050",
     dns_port: "9053",
   });
+  const [bindAllInterfaces, setBindAllInterfaces] = useState(false);
   const [portsDirty, setPortsDirty] = useState(false);
   const [portsBusy, setPortsBusy] = useState(false);
   const [portsMessage, setPortsMessage] = useState("");
@@ -140,6 +147,7 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
         http_port: String(loaded.http_port),
         dns_port: String(loaded.dns_port),
       });
+      setBindAllInterfaces(Boolean(loaded.bind_all_interfaces));
       if (loaded.config_path) setConfigPath(loaded.config_path);
       setPortsDirty(false);
       setPortsError("");
@@ -177,6 +185,22 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
     });
   }
 
+  function onBindAllChange(enabled: boolean) {
+    setPortsError("");
+    setPortsMessage("");
+    if (enabled && !bindAllInterfaces) {
+      const confirmed = window.confirm(
+        "Security warning: bind listeners to all interfaces?\n\n" +
+          BIND_ALL_WARNING +
+          "\n\nClick OK only if you understand the risk and have firewall rules in place.",
+      );
+      if (!confirmed) return;
+      log("bind-all-interfaces opt-in acknowledged by user");
+    }
+    setBindAllInterfaces(enabled);
+    setPortsDirty(true);
+  }
+
   async function onSavePorts(e: FormEvent) {
     e.preventDefault();
     const socksPort = parsePort(portInputs.socks_port);
@@ -195,13 +219,14 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
         proxy?: ProxyPorts;
         reload?: { apply?: string; warnings?: string[] } | null;
         config_path?: unknown;
-      }>("save_proxy_ports", { socksPort, httpPort, dnsPort });
+      }>("save_proxy_ports", { socksPort, httpPort, dnsPort, bindAllInterfaces });
       if (result.proxy) {
         setPortInputs({
           socks_port: String(result.proxy.socks_port),
           http_port: String(result.proxy.http_port),
           dns_port: String(result.proxy.dns_port),
         });
+        setBindAllInterfaces(Boolean(result.proxy.bind_all_interfaces));
         if (result.proxy.config_path) setConfigPath(result.proxy.config_path);
       } else if (typeof result.config_path === "string") {
         setConfigPath(result.config_path);
@@ -209,9 +234,12 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
       setPortsDirty(false);
       const apply = result.reload?.apply;
       const warnings = result.reload?.warnings ?? [];
+      const bind = bindAllInterfaces ? ", bind all interfaces" : "";
       const msg = apply ? `Saved. ${apply}` : "Saved to config.";
       setPortsMessage(warnings.length ? `${msg} Warnings: ${warnings.join(" | ")}` : msg);
-      log(`ports saved (SOCKS ${socksPort}, HTTP ${httpPort || socksPort}, DNS ${dnsPort})`);
+      log(
+        `listener settings saved (SOCKS ${socksPort}, HTTP ${httpPort || socksPort}, DNS ${dnsPort}${bind})`,
+      );
       if (warnings.length) log(warnings.join(" | "), "error");
       onApplied?.();
     } catch (err) {
@@ -360,9 +388,9 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
           </div>
 
           <form className="settings-section port-editor" onSubmit={onSavePorts}>
-            <h3>Listener ports</h3>
+            <h3>Listener settings</h3>
             <p className="muted">
-              Configure local SOCKS/HTTP and DNS ports. With the current Arti backend, SOCKS and HTTP share one listener, so HTTP should match SOCKS (use <code>0</code> to follow SOCKS). Active listener changes require stop/connect.
+              Configure local SOCKS/HTTP and DNS ports. With the current Arti backend, SOCKS and HTTP share one listener, so HTTP should match SOCKS (use <code>0</code> to follow SOCKS). By default listeners bind to loopback only. Active listener changes require stop/connect.
             </p>
             <div className="port-grid">
               <label>
@@ -378,11 +406,31 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
                 <input type="number" min={1} max={65535} inputMode="numeric" value={portInputs.dns_port} onChange={(e) => updatePort("dns_port", e.target.value)} />
               </label>
             </div>
+            <div className="bind-all-setting">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={bindAllInterfaces}
+                  onChange={(e) => onBindAllChange(e.target.checked)}
+                  disabled={portsBusy}
+                />
+                Bind listeners to all interfaces (opt-in, dangerous)
+              </label>
+              {bindAllInterfaces ? (
+                <div className="error bind-all-warning" role="alert">
+                  <strong>Security warning / firewall guidance:</strong> {BIND_ALL_WARNING}
+                </div>
+              ) : (
+                <p className="muted bind-all-guidance">
+                  Off by default. Enable only if you need other devices on a trusted network to use this Tor proxy, and restrict access with firewall rules.
+                </p>
+              )}
+            </div>
             {configPath ? <p className="muted config-hint">Config: <code>{configPath}</code></p> : null}
             {portsError ? <p className="error">{portsError}</p> : null}
             {portsMessage ? <p className="muted">{portsMessage}</p> : null}
             <div className="actions">
-              <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save ports"}</button>
+              <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save listener settings"}</button>
               <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reset</button>
             </div>
           </form>
@@ -414,7 +462,7 @@ export function AdvancedSettings({ onClose, onApplied, appendLog }: AdvancedSett
               className="config-textarea"
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
-              placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053 }\n}'}
+              placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053, "bind_all_interfaces": false }\n}'}
               spellCheck={false}
               rows={10}
             />

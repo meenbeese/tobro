@@ -38,6 +38,7 @@ impl Hub {
                 socks_port,
                 http_port,
                 dns_port,
+                bind_all_interfaces: false,
                 pid: std::process::id(),
                 uptime_ms: 0,
             }),
@@ -282,13 +283,10 @@ fn config_effects(
 ) -> serde_json::Value {
     let listeners_changed = current.proxy.socks_port != next.proxy.socks_port
         || current.proxy.effective_http_port() != next.proxy.effective_http_port()
-        || current.proxy.dns_port != next.proxy.dns_port;
+        || current.proxy.dns_port != next.proxy.dns_port
+        || current.proxy.bind_all_interfaces != next.proxy.bind_all_interfaces;
     let restart_required = listeners_changed;
-    let mut warnings = Vec::new();
-    let conflicts = tobro_config::port_conflicts(&next.proxy);
-    if !conflicts.is_empty() {
-        warnings.extend(conflicts);
-    }
+    let mut warnings = tobro_config::proxy_warnings(&next.proxy);
     if running && restart_required {
         warnings.push(
             "active listeners require stop/connect (or restart) for network listener changes to take effect"
@@ -305,13 +303,13 @@ fn config_effects(
 
 fn config_get_at(path: &std::path::Path) -> Result<serde_json::Value, String> {
     let config = load_current_config(path)?;
-    let conflicts = tobro_config::port_conflicts(&config.proxy);
+    let warnings = tobro_config::proxy_warnings(&config.proxy);
     Ok(json!({
         "ok": true,
         "action": "config.get",
         "path": path.display().to_string(),
         "config": redacted_config_value(&config)?,
-        "warnings": conflicts,
+        "warnings": warnings,
     }))
 }
 
@@ -346,6 +344,7 @@ fn config_apply_patch(
         socks_port: next.proxy.socks_port,
         http_port: next.proxy.effective_http_port(),
         dns_port: next.proxy.dns_port,
+        bind_all_interfaces: next.proxy.bind_all_interfaces,
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -361,6 +360,7 @@ fn config_apply_patch(
             "socks_port": next_listeners.socks_port,
             "http_port": next_listeners.effective_http_port(),
             "dns_port": next_listeners.dns_port,
+            "bind_all_interfaces": next_listeners.bind_all_interfaces,
         },
         "effects": effects,
     }))
@@ -454,11 +454,12 @@ impl DaemonControl for SupervisorControl {
             config
                 .validate()
                 .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
-            let conflicts = tobro_config::port_conflicts(&config.proxy);
+            let warnings = tobro_config::proxy_warnings(&config.proxy);
             let next = ListenerConfig {
                 socks_port: config.proxy.socks_port,
                 http_port: config.proxy.effective_http_port(),
                 dns_port: config.proxy.dns_port,
+                bind_all_interfaces: config.proxy.bind_all_interfaces,
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
@@ -477,11 +478,12 @@ impl DaemonControl for SupervisorControl {
                 "proxy": {
                     "socks_port": next.socks_port,
                     "http_port": next.effective_http_port(),
-                    "dns_port": next.dns_port
+                    "dns_port": next.dns_port,
+                    "bind_all_interfaces": next.bind_all_interfaces
                 },
             });
-            if !conflicts.is_empty() {
-                result["warnings"] = json!(conflicts);
+            if !warnings.is_empty() {
+                result["warnings"] = json!(warnings);
             }
             Ok(result)
         })
@@ -601,17 +603,25 @@ pub fn snapshot_to_status(
             )
         }
     };
-    let (socks_port, http_port, dns_port) = snapshot
+    let (socks_port, http_port, dns_port, bind_all_interfaces) = snapshot
         .listeners
         .as_ref()
-        .map(|l| (l.socks_port, l.effective_http_port(), l.dns_port))
-        .unwrap_or((9050, 9050, 9053));
+        .map(|l| {
+            (
+                l.socks_port,
+                l.effective_http_port(),
+                l.dns_port,
+                l.bind_all_interfaces,
+            )
+        })
+        .unwrap_or((9050, 9050, 9053, false));
     DaemonStatus {
         state,
         bootstrap,
         socks_port,
         http_port,
         dns_port,
+        bind_all_interfaces,
         pid: std::process::id(),
         uptime_ms: started.elapsed().as_millis() as u64,
     }
@@ -813,8 +823,14 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                     socks_port: connect_listeners.socks_port,
                     http_port: connect_listeners.effective_http_port(),
                     dns_port: connect_listeners.dns_port,
+                    bind_all_interfaces: connect_listeners.bind_all_interfaces,
                 };
                 let conflicts = tobro_config::port_conflicts(&probe);
+                if probe.bind_all_interfaces {
+                    for warning in tobro_config::bind_all_interfaces_warnings(&probe) {
+                        tracing::warn!(%warning, "bind-all-interfaces enabled at connect");
+                    }
+                }
                 if !conflicts.is_empty() {
                     return RpcResponse::error(
                         id,

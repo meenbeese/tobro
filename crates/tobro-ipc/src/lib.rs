@@ -588,6 +588,9 @@ pub struct DaemonStatus {
     pub http_port: u16,
     /// Local DNS port.
     pub dns_port: u16,
+    /// Whether listeners bind all interfaces instead of loopback only (opt-in).
+    #[serde(default)]
+    pub bind_all_interfaces: bool,
     /// Daemon process id.
     pub pid: u32,
     /// Time since the daemon started.

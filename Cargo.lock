@@ -7103,6 +7103,7 @@ dependencies = [
  "arti-client",
  "futures",
  "serde",
+ "serde_json",
  "tokio",
  "tor-config",
  "tor-rtcompat",

@@ -203,7 +203,13 @@ pub async fn run(args: SpikeArgs, state_dir: PathBuf, cache_dir: PathBuf) -> any
         tokio::spawn(async move { dns_check_with_retry(dns_addr, &host, limit).await })
     });
 
-    let serve = tobro_tor::serve(&state_dir, &cache_dir, args.socks_port, args.dns_port);
+    let serve = tobro_tor::serve(
+        &state_dir,
+        &cache_dir,
+        args.socks_port,
+        args.dns_port,
+        false,
+    );
     tokio::pin!(serve);
 
     if args.exit_after_check && (socks_check.is_some() || dns_check.is_some()) {

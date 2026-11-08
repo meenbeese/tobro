@@ -145,6 +145,8 @@ struct ProxyPorts {
     socks_port: u16,
     http_port: u16,
     dns_port: u16,
+    #[serde(default)]
+    bind_all_interfaces: bool,
     config_path: String,
 }
 
@@ -167,6 +169,10 @@ async fn get_proxy_ports(state: State<'_, AppState>) -> Result<ProxyPorts, Strin
                 .get("dns_port")
                 .and_then(Value::as_u64)
                 .unwrap_or(9053) as u16,
+            bind_all_interfaces: proxy
+                .get("bind_all_interfaces")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             config_path: result
                 .get("path")
                 .and_then(Value::as_str)
@@ -180,6 +186,7 @@ async fn get_proxy_ports(state: State<'_, AppState>) -> Result<ProxyPorts, Strin
         socks_port: config.proxy.socks_port,
         http_port: config.proxy.effective_http_port(),
         dns_port: config.proxy.dns_port,
+        bind_all_interfaces: config.proxy.bind_all_interfaces,
         config_path: path.display().to_string(),
     })
 }
@@ -190,12 +197,14 @@ async fn save_proxy_ports(
     socks_port: u16,
     http_port: u16,
     dns_port: u16,
+    bind_all_interfaces: bool,
 ) -> Result<Value, String> {
     let patch = json!({
         "proxy": {
             "socks_port": socks_port,
             "http_port": http_port,
-            "dns_port": dns_port
+            "dns_port": dns_port,
+            "bind_all_interfaces": bind_all_interfaces
         }
     });
 
@@ -225,7 +234,8 @@ async fn save_proxy_ports(
             "proxy": result.get("proxy").cloned().unwrap_or_else(|| json!({
                 "socks_port": socks_port,
                 "http_port": http_port,
-                "dns_port": dns_port
+                "dns_port": dns_port,
+                "bind_all_interfaces": bind_all_interfaces
             })),
             "reload": { "apply": apply, "warnings": warnings },
             "config": result.get("config").cloned(),
@@ -237,8 +247,10 @@ async fn save_proxy_ports(
     config.proxy.socks_port = socks_port;
     config.proxy.http_port = http_port;
     config.proxy.dns_port = dns_port;
+    config.proxy.bind_all_interfaces = bind_all_interfaces;
     config.validate().map_err(|e| e.to_string())?;
     config.save(&path).map_err(|e| e.to_string())?;
+    let warnings = tobro_config::proxy_warnings(&config.proxy);
     Ok(json!({
         "ok": true,
         "config_path": path.display().to_string(),
@@ -246,8 +258,9 @@ async fn save_proxy_ports(
             "socks_port": config.proxy.socks_port,
             "http_port": config.proxy.effective_http_port(),
             "dns_port": config.proxy.dns_port,
+            "bind_all_interfaces": config.proxy.bind_all_interfaces,
         },
-        "reload": { "apply": "saved to config; daemon was unreachable, so it was not reloaded", "warnings": [] },
+        "reload": { "apply": "saved to config; daemon was unreachable, so it was not reloaded", "warnings": warnings },
     }))
 }
 

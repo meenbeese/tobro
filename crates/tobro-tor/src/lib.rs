@@ -230,11 +230,15 @@ impl Tor {
 /// `state_dir` and `cache_dir` must be the same directories the observing
 /// [`Tor`] client used; Arti caches the network consensus there, so the
 /// serving client bootstraps from disk instead of re-downloading.
+///
+/// When `bind_all_interfaces` is true, listeners bind to `0.0.0.0` (opt-in;
+/// exposes proxies to reachable networks and requires firewall care).
 pub async fn serve(
     state_dir: &Path,
     cache_dir: &Path,
     socks_port: u16,
     dns_port: u16,
+    bind_all_interfaces: bool,
 ) -> anyhow::Result<()> {
     let config = client_config(state_dir, cache_dir)?;
 
@@ -250,8 +254,8 @@ pub async fn serve(
 
     arti::run_proxy(
         runtime,
-        Listen::new_localhost(socks_port),
-        Listen::new_localhost(dns_port),
+        listen_for_port(socks_port, bind_all_interfaces)?,
+        listen_for_port(dns_port, bind_all_interfaces)?,
         ListenProtocols::SocksAndHttpConnect,
         ConfigurationSources::new_empty(),
         ConfigurationTree::default(),
@@ -259,6 +263,19 @@ pub async fn serve(
         config,
     )
     .await
+}
+
+fn listen_for_port(port: u16, bind_all_interfaces: bool) -> anyhow::Result<Listen> {
+    if !bind_all_interfaces {
+        return Ok(Listen::new_localhost(port));
+    }
+    // tor-config 0.48 exposes localhost constructors but builds other listen
+    // specs via serde. Binding all interfaces is an explicit opt-in (M2/F-13).
+    let listen: Listen = serde_json::from_value(serde_json::Value::String(format!(
+        "0.0.0.0:{port}"
+    )))
+    .with_context(|| format!("could not build an all-interfaces listener for port {port}"))?;
+    Ok(listen)
 }
 
 fn client_config(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<TorClientConfig> {
@@ -315,7 +332,7 @@ pub fn parse_http_status(response: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_http_status;
+    use super::{listen_for_port, parse_http_status};
 
     #[test]
     fn parses_http_status_lines() {
@@ -327,5 +344,14 @@ mod tests {
         assert_eq!(parse_http_status(b"garbage\r\n"), None);
         assert_eq!(parse_http_status(b"HTTP/1.0 nope\r\n"), None);
         assert_eq!(parse_http_status(b""), None);
+    }
+
+    #[test]
+    fn builds_localhost_and_all_interfaces_listeners() -> Result<(), Box<dyn std::error::Error>> {
+        let local = listen_for_port(9050, false)?;
+        assert!(local.is_loopback_only());
+        let all = listen_for_port(9050, true)?;
+        assert!(!all.is_loopback_only());
+        Ok(())
     }
 }

@@ -90,6 +90,9 @@ fn default_http_port_follow() -> u16 {
 /// Arti 2.8 serves SOCKS5 and HTTP CONNECT on the same local TCP listener
 /// (`ListenProtocols::SocksAndHttpConnect`). Until separate listeners are
 /// supported, `http_port` must match `socks_port`; `0` means "use `socks_port`".
+///
+/// By default listeners bind to loopback only. `bind_all_interfaces` is an
+/// explicit opt-in (M2/F-13) and exposes proxies to reachable networks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
@@ -102,6 +105,13 @@ pub struct ProxyConfig {
     pub http_port: u16,
     /// UDP DNS proxy port.
     pub dns_port: u16,
+    /// Bind proxy/DNS listeners on all interfaces instead of loopback only.
+    ///
+    /// Opt-in only. When enabled, other devices on reachable networks may be
+    /// able to use your local Tor proxy; configure OS/router firewall rules and
+    /// only enable on trusted networks.
+    #[serde(default)]
+    pub bind_all_interfaces: bool,
 }
 
 impl Default for ProxyConfig {
@@ -111,6 +121,7 @@ impl Default for ProxyConfig {
             // Combined with SOCKS under Arti 2.8; keep explicit for config parity.
             http_port: 9050,
             dns_port: 9053,
+            bind_all_interfaces: false,
         }
     }
 }
@@ -235,12 +246,35 @@ pub fn validate_port(name: &str, port: u16) -> Result<(), ConfigError> {
 /// This performs a best-effort bind probe. It cannot guarantee availability
 /// (TOCTOU), but it provides actionable feedback before Tor starts.
 pub fn tcp_port_available(port: u16) -> bool {
-    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+    tcp_port_available_with(port, false)
 }
 
 /// Check whether a local UDP port appears available on loopback.
 pub fn udp_port_available(port: u16) -> bool {
-    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+    udp_port_available_with(port, false)
+}
+
+/// Check whether a local TCP port appears available for the configured bind scope.
+///
+/// When `bind_all_interfaces` is true, probes `0.0.0.0` (best-effort; exposure
+/// risk is reported separately via warnings).
+pub fn tcp_port_available_with(port: u16, bind_all_interfaces: bool) -> bool {
+    let addr = if bind_all_interfaces {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    std::net::TcpListener::bind((addr, port)).is_ok()
+}
+
+/// Check whether a local UDP port appears available for the configured bind scope.
+pub fn udp_port_available_with(port: u16, bind_all_interfaces: bool) -> bool {
+    let addr = if bind_all_interfaces {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    std::net::UdpSocket::bind((addr, port)).is_ok()
 }
 
 /// Best-effort description of the process occupying a local port.
@@ -341,46 +375,77 @@ pub fn next_available_port(start: u16, is_available: impl Fn(u16) -> bool) -> Op
 }
 
 /// Report listener port conflicts with actionable suggestions.
+/// Report listener port conflicts with actionable suggestions.
 pub fn port_conflicts(proxy: &ProxyConfig) -> Vec<String> {
     let mut conflicts = Vec::new();
+    let bind_all = proxy.bind_all_interfaces;
     let http_port = proxy.effective_http_port();
-    if !tcp_port_available(proxy.socks_port) {
+    let tcp_ok = |p: u16| tcp_port_available_with(p, bind_all);
+    let udp_ok = |p: u16| udp_port_available_with(p, bind_all);
+    let scope = if bind_all {
+        "all interfaces"
+    } else {
+        "loopback"
+    };
+    if !tcp_ok(proxy.socks_port) {
         let owner = port_owner_hint(proxy.socks_port, "tcp")
             .map(|o| format!("; {o}"))
             .unwrap_or_default();
-        let suggestion =
-            next_available_port(proxy.socks_port.saturating_add(1), tcp_port_available)
-                .map(|p| format!("; next free TCP port: {p}"))
-                .unwrap_or_default();
-        conflicts.push(format!(
-            "proxy.socks_port {} (SOCKS/HTTP TCP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
-            proxy.socks_port
-        ));
-    }
-    if http_port != proxy.socks_port && !tcp_port_available(http_port) {
-        let owner = port_owner_hint(http_port, "tcp")
-            .map(|o| format!("; {o}"))
-            .unwrap_or_default();
-        let suggestion = next_available_port(http_port.saturating_add(1), tcp_port_available)
+        let suggestion = next_available_port(proxy.socks_port.saturating_add(1), tcp_ok)
             .map(|p| format!("; next free TCP port: {p}"))
             .unwrap_or_default();
         conflicts.push(format!(
-            "proxy.http_port {http_port} (HTTP TCP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process."
+            "proxy.socks_port {} (SOCKS/HTTP TCP, {scope}) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
+            proxy.socks_port
         ));
     }
-    if !udp_port_available(proxy.dns_port) {
+    if http_port != proxy.socks_port && !tcp_ok(http_port) {
+        let owner = port_owner_hint(http_port, "tcp")
+            .map(|o| format!("; {o}"))
+            .unwrap_or_default();
+        let suggestion = next_available_port(http_port.saturating_add(1), tcp_ok)
+            .map(|p| format!("; next free TCP port: {p}"))
+            .unwrap_or_default();
+        conflicts.push(format!(
+            "proxy.http_port {http_port} (HTTP TCP, {scope}) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process."
+        ));
+    }
+    if !udp_ok(proxy.dns_port) {
         let owner = port_owner_hint(proxy.dns_port, "udp")
             .map(|o| format!("; {o}"))
             .unwrap_or_default();
-        let suggestion = next_available_port(proxy.dns_port.saturating_add(1), udp_port_available)
+        let suggestion = next_available_port(proxy.dns_port.saturating_add(1), udp_ok)
             .map(|p| format!("; next free UDP port: {p}"))
             .unwrap_or_default();
         conflicts.push(format!(
-            "proxy.dns_port {} (DNS UDP) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
+            "proxy.dns_port {} (DNS UDP, {scope}) is already in use or unavailable{owner}{suggestion}. Change the port in config or stop the conflicting process.",
             proxy.dns_port
         ));
     }
     conflicts
+}
+
+/// Security and firewall guidance when `bind_all_interfaces` is enabled.
+pub fn bind_all_interfaces_warnings(proxy: &ProxyConfig) -> Vec<String> {
+    if !proxy.bind_all_interfaces {
+        return Vec::new();
+    }
+    vec![
+        format!(
+            "SECURITY WARNING: proxy.bind_all_interfaces is enabled. SOCKS ({}), HTTP CONNECT ({}), and DNS ({}, UDP) listeners may accept connections from other devices on reachable networks.",
+            proxy.socks_port,
+            proxy.effective_http_port(),
+            proxy.dns_port
+        ),
+        "Only enable this on trusted networks. Configure your OS/router firewall to restrict who can reach these ports, and disable bind-all when not needed. Other hosts using these proxies can route traffic through Tor from your machine.".to_owned(),
+    ]
+}
+
+/// All non-fatal proxy warnings: security guidance plus port conflicts.
+pub fn proxy_warnings(proxy: &ProxyConfig) -> Vec<String> {
+    let mut warnings = bind_all_interfaces_warnings(proxy);
+    warnings.extend(port_conflicts(proxy));
+    warnings
 }
 
 impl Config {
@@ -536,6 +601,7 @@ level = "info"
             socks_port,
             http_port: 0,
             dns_port,
+            bind_all_interfaces: false,
         };
         let conflicts = port_conflicts(&proxy);
         assert!(

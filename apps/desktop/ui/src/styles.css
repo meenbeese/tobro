@@ -306,3 +306,8 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .settings-section h3 { margin: 0 0 8px; font-size: 1rem; }
 .settings-section p { margin: 0 0 10px; font-size: 0.9rem; }
+.bind-all-setting { margin: 12px 0; }
+.checkbox-label { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 0.95rem; }
+.checkbox-label input[type="checkbox"] { margin-top: 2px; }
+.bind-all-warning, .bind-all-guidance { margin: 8px 0 0; font-size: 0.9rem; }
+.bind-all-warning { padding: 10px 12px; border: 1px solid var(--warn, #b45309); border-radius: 8px; }
