@@ -17,6 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   fmt:
@@ -25,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-fmt
+          cache-on-failure: true
       - run: cargo fmt --all --check
 
   build:
@@ -54,6 +58,9 @@ jobs:
             librsvg2-dev
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-build
+          cache-on-failure: true
 
       # Workspace lints are `warn`; -D warnings turns them into hard
       # failures so the CI bar matches the lint config in Cargo.toml.
@@ -84,9 +91,18 @@ jobs:
             librsvg2-dev
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-package-smoke
+          cache-on-failure: true
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('apps/desktop/ui/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
 
       - name: Install frontend deps
         working-directory: apps/desktop/ui
@@ -97,7 +113,9 @@ jobs:
         run: bun run build
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0.0" --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
 
       - name: Smoke build desktop app (unsigned, no bundle)
         run: cargo tauri build --ci --no-bundle --config apps/desktop/tauri.conf.json
