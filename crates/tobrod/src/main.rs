@@ -6,6 +6,7 @@
 
 mod ipc;
 mod lifecycle;
+pub(crate) mod pt_supervisor;
 pub(crate) mod redact;
 mod spike;
 mod supervisor;
