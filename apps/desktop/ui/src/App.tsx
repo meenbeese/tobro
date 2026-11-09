@@ -3,6 +3,8 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import appIconUrl from "./assets/icon.svg";
+import { StatusIcon } from "./StatusIcon";
+import { ConnectionInfo } from "./ConnectionInfo";
 
 type DaemonState =
   | "starting"
@@ -71,6 +73,7 @@ export default function App() {
   const [unlockPassword, setUnlockPassword] = useState("");
   const [unlockError, setUnlockError] = useState("");
   const [unlockBusy, setUnlockBusy] = useState(false);
+  const [connectedAt, setConnectedAt] = useState<number | null>(null);
   const idleTimer = useRef<number | null>(null);
 
   function appendLog(text: string, level: "info" | "error" = "info", source = "ui") {
@@ -87,10 +90,23 @@ export default function App() {
         const { kind, payload } = event.payload;
         if (kind === "status") {
           if (payload && typeof payload === "object") {
-            setStatus(payload as DaemonStatus);
+            const newStatus = payload as DaemonStatus;
+            setStatus((prev) => {
+              const prevState = prev?.state;
+              const nextState = newStatus.state;
+              const wasConnected = prevState === "connected" || prevState === "serving";
+              const isNowConnected = nextState === "connected" || nextState === "serving";
+              if (!wasConnected && isNowConnected) {
+                setConnectedAt(Date.now());
+              } else if (wasConnected && !isNowConnected) {
+                setConnectedAt(null);
+              }
+              return newStatus;
+            });
             setReachable(true);
           } else {
             setStatus(null);
+            setConnectedAt(null);
           }
           return;
         }
@@ -115,6 +131,7 @@ export default function App() {
         if (kind === "unreachable") {
           setReachable(false);
           setStatus(null);
+          setConnectedAt(null);
           const p = payload as { error?: string };
           if (p?.error) appendLog(p.error, "error", "daemon");
           return;
@@ -139,7 +156,13 @@ export default function App() {
       });
       try {
         const initial = await invoke<DaemonStatus>("status");
-        if (initial) setStatus(initial);
+        if (initial) {
+          setStatus(initial);
+          const s = initial.state;
+          if (s === "connected" || s === "serving") {
+            setConnectedAt((prev) => prev ?? Date.now());
+          }
+        }
       } catch {
         // daemon watcher will report reachability
       }
@@ -444,8 +467,39 @@ export default function App() {
         </nav>
       </header>
 
-      <section className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"}`}>
-        <p className="headline">{headline}</p>
+      <section className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"} ${status?.state === "bootstrapping" || status?.state === "starting" ? "status-animating" : ""}`}>
+        <div className="status-header">
+          <StatusIcon state={status?.state} reachable={reachable} size={28} />
+          <div className="status-title-group">
+            <p className="headline">{headline}</p>
+            {reachable ? (
+              (() => {
+                const badgeLabel =
+                  status?.state === "connected" || status?.state === "serving"
+                    ? "Connected"
+                    : status?.state === "bootstrapping"
+                      ? "Bootstrapping"
+                      : status?.state === "starting"
+                        ? "Starting"
+                        : status?.state === "stopping"
+                          ? "Stopping"
+                          : status?.state === "stopped"
+                            ? "Stopped"
+                            : status?.state === "error"
+                              ? "Error"
+                              : "Unknown";
+                const headlineLower = headline.toLowerCase();
+                const badgeLower = badgeLabel.toLowerCase();
+                if (headlineLower === badgeLower || headlineLower === `${badgeLower}…` || headlineLower.startsWith(badgeLower)) {
+                  return null;
+                }
+                return <span className={`status-badge status-badge-${status?.state ?? "unknown"}`}>{badgeLabel}</span>;
+              })()
+            ) : (
+              <span className="status-badge status-badge-unreachable">Offline</span>
+            )}
+          </div>
+        </div>
         {!reachable ? (
           <p className="muted" style={{ marginTop: 0 }}>
             If the local <code>tobrod</code> daemon is not running, Tobro will try to start it automatically when you connect.
@@ -462,11 +516,7 @@ export default function App() {
             Security warning: listeners are bound to all interfaces (SOCKS/HTTP/DNS exposed beyond localhost). Use firewall rules and trusted networks only.
           </p>
         ) : null}
-        <div className="ports muted">
-          <span>active SOCKS {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.socks_port ?? "—"}</span>
-          <span>active HTTP {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.http_port ?? status?.socks_port ?? "—"}</span>
-          <span>active DNS {status?.bind_all_interfaces ? "0.0.0.0:" : "127.0.0.1:"}{status?.dns_port ?? "—"}</span>
-        </div>
+        <ConnectionInfo status={status} reachable={reachable} connectedAt={connectedAt} />
         <p className="muted ports-hint">
           Proxy, node, and advanced Tor settings are in <button type="button" className="link-button" onClick={() => void openSettings()}>Settings</button>.
         </p>
