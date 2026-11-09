@@ -5,6 +5,20 @@ export interface AboutProps {
   onClose: () => void;
 }
 
+const HELP_LINKS = [
+  { label: "Tor Project", url: "https://www.torproject.org/", note: "Tor network and documentation" },
+  { label: "Arti (Tor in Rust)", url: "https://gitlab.torproject.org/tpo/core/arti", note: "Embedded Tor implementation used by Tobro" },
+  { label: "Tauri", url: "https://tauri.app/", note: "Desktop app framework" },
+];
+
+async function openExternal(url: string) {
+  try {
+    await invoke("open_external_url", { url });
+  } catch {
+    // fallback: no-op in restricted contexts
+  }
+}
+
 interface DaemonStatus {
   state?: string;
   socks_port?: number;
@@ -27,7 +41,7 @@ const DEPENDENCIES: DependencyInfo[] = [
   { name: "Tauri", version: "2.x", note: "Desktop shell" },
   { name: "React", version: "19.x", note: "UI framework" },
   { name: "TypeScript", version: "5.6.x", note: "UI type checking" },
-  { name: "Vite", version: "6.x", note: "UI build tooling" },
+  { name: "Vite", version: "8.x", note: "UI build tooling" },
   { name: "serde / serde_json", version: "1.x", note: "Serialization and IPC payloads" },
   { name: "clap", version: "4.x", note: "CLI parsing (tobrod/tobroctl)" },
   { name: "libsql", version: "0.6.x", note: "Embedded local storage (tobro-store)" },
@@ -36,6 +50,14 @@ const DEPENDENCIES: DependencyInfo[] = [
 export function About({ onClose }: AboutProps) {
   const [runtime, setRuntime] = useState<string>("Checking daemon runtime…");
   const [status, setStatus] = useState<string>("");
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   useEffect(() => {
     let cancelled = false;
@@ -103,6 +125,18 @@ export function About({ onClose }: AboutProps) {
           <h3>Runtime (best effort)</h3>
           <p className="muted">{runtime}</p>
           {status ? <p className="muted">{status}</p> : null}
+        </div>
+
+        <div className="settings-section">
+          <h3>Help &amp; resources</h3>
+          <ul className="help-links muted">
+            {HELP_LINKS.map((l) => (
+              <li key={l.url}>
+                <a href={l.url} onClick={(e) => { e.preventDefault(); void openExternal(l.url); }}>{l.label}</a>
+                {l.note ? <span> — {l.note}</span> : null}
+              </li>
+            ))}
+          </ul>
         </div>
 
         <div className="settings-section">

@@ -4,7 +4,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 import { About } from "./About";
 import { Settings } from "./Settings";
+import { initTheme } from "./theme";
 import "./styles.css";
+
+initTheme();
 
 const windowKind = new URLSearchParams(window.location.search).get("window");
 

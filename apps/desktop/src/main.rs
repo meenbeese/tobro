@@ -192,6 +192,36 @@ async fn get_proxy_ports(state: State<'_, AppState>) -> Result<ProxyPorts, Strin
 }
 
 #[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim().to_owned();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs are allowed".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("failed to open URL: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("failed to open URL: {e}"))?;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("failed to open URL: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn save_proxy_ports(
     state: State<'_, AppState>,
     socks_port: u16,
@@ -317,6 +347,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             status,
+            open_external_url,
             daemon_connect,
             daemon_stop,
             daemon_new_identity,

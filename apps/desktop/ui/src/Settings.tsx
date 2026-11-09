@@ -1,7 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
+import { readThemePreference, setThemePreference, type ThemePreference } from "./theme";
 
 const POWER_USER_KEY = "tobro.powerUser.enabled";
+
+const HELP_LINKS = [
+  { label: "Tor Project support & docs", url: "https://support.torproject.org/" },
+  { label: "Arti (Tor in Rust)", url: "https://gitlab.torproject.org/tpo/core/arti" },
+  { label: "Tauri documentation", url: "https://tauri.app/" },
+];
+
+async function openExternal(url: string) {
+  try {
+    await invoke("open_external_url", { url });
+  } catch {
+    // ignore
+  }
+}
 
 function readPowerUser(): boolean {
   try {
@@ -132,11 +147,22 @@ export interface SettingsProps {
 export type AdvancedSettingsProps = SettingsProps;
 
 type SettingsTab = "general" | "node" | "advanced";
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: "general", label: "General" },
+  { id: "node", label: "Node Configuration" },
+  { id: "advanced", label: "Advanced Tor Configuration" },
+];
 
 export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [powerUser, setPowerUser] = useState(readPowerUser);
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<SettingsTab>("general");
+  const [theme, setTheme] = useState<ThemePreference>(readThemePreference);
+  const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
+    general: null,
+    node: null,
+    advanced: null,
+  });
 
   // Listener settings
   const [portInputs, setPortInputs] = useState<Record<PortField, string>>({
@@ -249,6 +275,36 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       void loadConfigState();
     }
   }, [powerUser]);
+
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  function onThemeChange(next: ThemePreference) {
+    setTheme(next);
+    setThemePreference(next);
+    log(`theme set to ${next}`);
+  }
+
+  function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    const order = SETTINGS_TABS.map((t) => t.id);
+    const idx = order.indexOf(tab);
+    if (idx < 0) return;
+    let nextIdx = idx;
+    if (e.key === "ArrowRight") nextIdx = (idx + 1) % order.length;
+    else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + order.length) % order.length;
+    else if (e.key === "Home") nextIdx = 0;
+    else if (e.key === "End") nextIdx = order.length - 1;
+    else return;
+    e.preventDefault();
+    const next = order[nextIdx];
+    setTab(next);
+    tabRefs.current[next]?.focus();
+  }
 
   function enablePowerUser() {
     writePowerUser(true);
@@ -557,17 +613,52 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
         </div>
       ) : (
         <div className="settings-shell">
-          <div className="settings-tabs" role="tablist" aria-label="Settings tabs">
-            <button type="button" role="tab" aria-selected={tab === "general"} className={tab === "general" ? "active" : ""} onClick={() => setTab("general")}>General</button>
-            <button type="button" role="tab" aria-selected={tab === "node"} className={tab === "node" ? "active" : ""} onClick={() => setTab("node")}>Node Configuration</button>
-            <button type="button" role="tab" aria-selected={tab === "advanced"} className={tab === "advanced" ? "active" : ""} onClick={() => setTab("advanced")}>Advanced Tor Configuration</button>
+          <div className="settings-tabs" role="tablist" aria-label="Settings tabs" onKeyDown={onTabKeyDown}>
+            {SETTINGS_TABS.map((t) => (
+              <button
+                key={t.id}
+                ref={(el) => { tabRefs.current[t.id] = el; }}
+                id={`settings-tab-${t.id}`}
+                type="button"
+                role="tab"
+                aria-selected={tab === t.id}
+                aria-controls={`settings-panel-${t.id}`}
+                tabIndex={tab === t.id ? 0 : -1}
+                className={tab === t.id ? "active" : ""}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
           </div>
 
-          {tab === "general" ? (
-            <div className="advanced-sections" role="tabpanel">
+          <div
+            id="settings-panel-general"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-general"
+            hidden={tab !== "general"}
+          >
               <div className="settings-section-head">
                 <p className="muted">General settings, proxy listeners, and configuration management.</p>
                 <button type="button" className="logs-toggle" onClick={disablePowerUser}>Lock settings</button>
+              </div>
+
+              <div className="settings-section">
+                <h3>Appearance</h3>
+                <div className="field-row">
+                  <label htmlFor="settings-theme">Theme</label>
+                  <select
+                    id="settings-theme"
+                    value={theme}
+                    onChange={(e) => onThemeChange(e.target.value as ThemePreference)}
+                  >
+                    <option value="system">System (follow OS)</option>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                  </select>
+                </div>
+                <p className="muted">Theme applies to app windows (main, Settings, About).</p>
               </div>
 
               <form className="settings-section port-editor" onSubmit={onSavePorts}>
@@ -655,11 +746,26 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 ) : null}
                 {configError ? <p className="error">{configError}</p> : null}
               </div>
-            </div>
-          ) : null}
 
-          {tab === "node" ? (
-            <div className="advanced-sections" role="tabpanel">
+              <div className="settings-section">
+                <h3>Help &amp; resources</h3>
+                <ul className="help-links muted">
+                  {HELP_LINKS.map((l) => (
+                    <li key={l.url}>
+                      <a href={l.url} onClick={(e) => { e.preventDefault(); void openExternal(l.url); }}>{l.label}</a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+
+          <div
+            id="settings-panel-node"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-node"
+            hidden={tab !== "node"}
+          >
               <div className="settings-section-head">
                 <p className="muted">Supported node/stream defaults only. Unsupported C Tor-style restrictions stay hidden and are rejected by validation/import.</p>
               </div>
@@ -715,10 +821,14 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </ul>
               </div>
             </div>
-          ) : null}
 
-          {tab === "advanced" ? (
-            <div className="advanced-sections" role="tabpanel">
+          <div
+            id="settings-panel-advanced"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-advanced"
+            hidden={tab !== "advanced"}
+          >
               <div className="settings-section-head">
                 <p className="muted">Advanced Tor behavior. Proxy/listener settings are in General.</p>
               </div>
@@ -760,7 +870,6 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </div>
               </div>
             </div>
-          ) : null}
         </div>
       )}
     </section>
