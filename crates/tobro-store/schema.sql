@@ -1,7 +1,15 @@
--- M5: onion service hosting model and port mappings.
+-- tobro local store schema (pre-1.0, idempotent).
+-- Applied on every open; uses IF NOT EXISTS so schema evolution is additive.
+-- For incompatible changes pre-1.0, reset local state as needed.
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+
+-- Onion service hosting model and port mappings.
 -- Key material lives on disk under the managed onion-services directory (0700),
 -- not in the database. This schema stores metadata and desired state.
-
 CREATE TABLE IF NOT EXISTS onion_service (
     id            TEXT PRIMARY KEY NOT NULL,
     nickname      TEXT NOT NULL UNIQUE,

@@ -317,7 +317,7 @@ pub enum AdapterStatus {
     /// Bootstrapped and local listeners are serving.
     Ready {
         /// Active listener configuration.
-        listeners: ListenerConfig,
+        listeners: Box<ListenerConfig>,
     },
     /// Failed.
     Failed {
@@ -333,7 +333,7 @@ pub enum AdapterEvent {
     /// Bootstrap progress update.
     Bootstrap(BootstrapEvent),
     /// Status changed.
-    Status(AdapterStatus),
+    Status(Box<AdapterStatus>),
 }
 
 /// Control handle for observing a prepared/running service.
@@ -362,7 +362,7 @@ impl ServiceControl {
 
     fn set_status(&self, status: AdapterStatus) {
         let _ = self.status_tx.send(status.clone());
-        let _ = self.events_tx.send(AdapterEvent::Status(status));
+        let _ = self.events_tx.send(AdapterEvent::Status(Box::new(status)));
     }
 }
 
@@ -473,7 +473,7 @@ pub async fn bootstrap_and_prepare(
             };
             let _ = status_for_bootstrap.send(status.clone());
             let _ = events_for_bootstrap.send(AdapterEvent::Bootstrap(event));
-            let _ = events_for_status.send(AdapterEvent::Status(status));
+            let _ = events_for_status.send(AdapterEvent::Status(Box::new(status)));
         })
         .await
         .context("Arti bootstrap failed")?;
@@ -482,7 +482,7 @@ pub async fn bootstrap_and_prepare(
     drop(observer);
 
     control.set_status(AdapterStatus::Ready {
-        listeners: listeners.clone(),
+        listeners: Box::new(listeners.clone()),
     });
 
     Ok(PreparedService {

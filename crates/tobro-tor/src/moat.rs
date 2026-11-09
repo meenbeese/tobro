@@ -179,10 +179,10 @@ impl BuiltinBridgesExt for BuiltinBridgesResponse {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (k, lines) in self {
-            if let Some(ref w) = want {
-                if normalize_transport_key(k) != *w {
-                    continue;
-                }
+            if let Some(ref w) = want
+                && normalize_transport_key(k) != *w
+            {
+                continue;
             }
             for line in import_bridge_lines(&lines.join("\n")) {
                 if seen.insert(line.clone()) {
@@ -283,17 +283,17 @@ impl MoatClient {
             .await
             .map_err(|e| MoatError::Transport(e.to_string()))?;
         // Moat typically returns 200 with either data or {"errors":[...]}.
-        if let Ok(err) = serde_json::from_str::<MoatErrorResponse>(&text) {
-            if let Some(e) = err.errors.first() {
-                return Err(MoatError::Api {
-                    code: if e.code != 0 {
-                        e.code
-                    } else {
-                        status.as_u16() as i64
-                    },
-                    detail: e.detail.clone(),
-                });
-            }
+        if let Ok(err) = serde_json::from_str::<MoatErrorResponse>(&text)
+            && let Some(e) = err.errors.first()
+        {
+            return Err(MoatError::Api {
+                code: if e.code != 0 {
+                    e.code
+                } else {
+                    status.as_u16() as i64
+                },
+                detail: e.detail.clone(),
+            });
         }
         if !status.is_success() {
             return Err(MoatError::Transport(format!("HTTP {}", status)));
@@ -314,17 +314,17 @@ impl MoatClient {
             .text()
             .await
             .map_err(|e| MoatError::Transport(e.to_string()))?;
-        if let Ok(err) = serde_json::from_str::<MoatErrorResponse>(&text) {
-            if let Some(e) = err.errors.first() {
-                return Err(MoatError::Api {
-                    code: if e.code != 0 {
-                        e.code
-                    } else {
-                        status.as_u16() as i64
-                    },
-                    detail: e.detail.clone(),
-                });
-            }
+        if let Ok(err) = serde_json::from_str::<MoatErrorResponse>(&text)
+            && let Some(e) = err.errors.first()
+        {
+            return Err(MoatError::Api {
+                code: if e.code != 0 {
+                    e.code
+                } else {
+                    status.as_u16() as i64
+                },
+                detail: e.detail.clone(),
+            });
         }
         if !status.is_success() {
             return Err(MoatError::Transport(format!("HTTP {}", status)));
@@ -404,10 +404,7 @@ pub async fn fetch_bridges_with_fallback(
     transports: Option<&[String]>,
     builtin: Option<&BridgeDistribution>,
 ) -> ResolvedBridges {
-    let requested_transport = transports
-        .and_then(|t| t.first())
-        .map(|s| s.to_string())
-        .or_else(|| transports.and_then(|t| t.get(0)).cloned());
+    let requested_transport = transports.and_then(|t| t.first()).cloned();
     let country_norm = country
         .map(str::trim)
         .filter(|s| !s.is_empty())

@@ -518,7 +518,7 @@ fn handle_adapter_event(
             );
             let _ = events_tx.send(SupervisorEvent::BootstrapProgress { percent, detail });
         }
-        AdapterEvent::Status(status) => match status {
+        AdapterEvent::Status(status) => match *status {
             AdapterStatus::Ready { .. } => {
                 apply(
                     lifecycle,
@@ -626,9 +626,9 @@ fn start_worker(
                     },
                 )));
                 // Announce ready state.
-                let _ = msg_tx.send(WorkerMsg::Adapter(AdapterEvent::Status(
+                let _ = msg_tx.send(WorkerMsg::Adapter(AdapterEvent::Status(Box::new(
                     prepared.control.status(),
-                )));
+                ))));
 
                 let msg_tx_forward = msg_tx.clone();
                 let forward = tokio::spawn(async move {

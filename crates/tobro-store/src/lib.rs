@@ -17,19 +17,8 @@ pub const DB_FILE_NAME: &str = "tobro.sqlite3";
 /// Keychain service name used for tobro secrets.
 pub const KEYCHAIN_SERVICE: &str = "org.tobro.app";
 
-/// Initial M1 migration (embedded).
-const MIGRATION_M1_INITIAL: &str = include_str!("../migrations/20261108000000_m1_initial.sql");
-/// M5 onion services migration (embedded).
-const MIGRATION_M5_ONION_SERVICES: &str =
-    include_str!("../migrations/20261109000000_m5_onion_services.sql");
-
-const MIGRATIONS: &[(&str, &str)] = &[
-    ("20261108000000_m1_initial", MIGRATION_M1_INITIAL),
-    (
-        "20261109000000_m5_onion_services",
-        MIGRATION_M5_ONION_SERVICES,
-    ),
-];
+/// Consolidated idempotent schema (embedded, pre-1.0).
+const SCHEMA: &str = include_str!("../schema.sql");
 
 /// Errors produced by the store layer.
 #[derive(Debug, thiserror::Error)]
@@ -155,7 +144,8 @@ impl std::fmt::Debug for Db {
 }
 
 impl Db {
-    /// Open (and create if needed) the local libSQL database at `path`, then run migrations.
+    /// Open (and create if needed) the local libSQL database at `path`, then
+    /// apply the idempotent schema.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -178,34 +168,13 @@ impl Db {
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )
         .await?;
-        Self::migrate(&conn).await?;
+        Self::init_schema(&conn).await?;
 
         Ok(Self { _db: db, conn })
     }
 
-    async fn migrate(conn: &Connection) -> Result<(), StoreError> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY NOT NULL);",
-        )
-        .await?;
-
-        for (name, sql) in MIGRATIONS {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM schema_migrations WHERE name = ?1",
-                    params![*name],
-                )
-                .await?;
-            let applied = rows.next().await?.is_some();
-            if !applied {
-                conn.execute_batch(sql).await?;
-                conn.execute(
-                    "INSERT INTO schema_migrations (name) VALUES (?1)",
-                    params![*name],
-                )
-                .await?;
-            }
-        }
+    async fn init_schema(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(SCHEMA).await?;
         Ok(())
     }
 
