@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, oneshot};
 
 use tobro_ipc::{Client, DaemonState, DaemonStatus, Message, methods, socket_path};
@@ -43,10 +44,17 @@ enum IpcCommand {
     },
 }
 
+#[derive(Debug, Default)]
+struct NotificationState {
+    last_sent: Option<Instant>,
+    last_key: Option<String>,
+}
+
 #[derive(Debug)]
 struct AppState {
     latest: Mutex<Option<DaemonStatus>>,
     commands: mpsc::Sender<IpcCommand>,
+    notifications: Mutex<NotificationState>,
 }
 
 impl AppState {
@@ -348,9 +356,11 @@ fn main() {
     let (command_tx, command_rx) = mpsc::channel(32);
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             latest: Mutex::new(None),
             commands: command_tx,
+            notifications: Mutex::new(NotificationState::default()),
         })
         .setup(move |app| {
             // Best-effort default: reduce accidental capture exposure until UI syncs preference.
@@ -420,17 +430,24 @@ fn update_tray_menu(handle: &AppHandle, reachable: bool, status: Option<&DaemonS
     let Some(tray) = handle.try_state::<TrayState>() else {
         return;
     };
-    let _ = tray.status_item.set_text(tray_status_text(reachable, status));
+    let _ = tray
+        .status_item
+        .set_text(tray_status_text(reachable, status));
     let state = status.map(|s| &s.state);
     let active = matches!(
         state,
-        Some(DaemonState::Starting | DaemonState::Bootstrapping | DaemonState::Connected | DaemonState::Serving)
+        Some(
+            DaemonState::Starting
+                | DaemonState::Bootstrapping
+                | DaemonState::Connected
+                | DaemonState::Serving
+        )
     );
     let stopping = matches!(state, Some(DaemonState::Stopping));
     let can_connect = !active && !stopping;
     let can_stop = reachable && active && !stopping;
-    let can_new_identity = reachable
-        && matches!(state, Some(DaemonState::Connected | DaemonState::Serving));
+    let can_new_identity =
+        reachable && matches!(state, Some(DaemonState::Connected | DaemonState::Serving));
     let _ = tray.connect_item.set_enabled(can_connect);
     let _ = tray.stop_item.set_enabled(can_stop);
     let _ = tray.new_identity_item.set_enabled(can_new_identity);
@@ -439,12 +456,141 @@ fn update_tray_menu(handle: &AppHandle, reachable: bool, status: Option<&DaemonS
     }
 }
 
+const NOTIFY_MIN_INTERVAL: Duration = Duration::from_secs(4);
+const NOTIFY_DEDUPE_WINDOW: Duration = Duration::from_secs(30);
+
+fn maybe_notify(handle: &AppHandle, key: impl Into<String>, title: &str, body: &str) {
+    let key = key.into();
+    let state = handle.state::<AppState>();
+    let mut guard = match state.notifications.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let now = Instant::now();
+    if let Some(last) = guard.last_sent
+        && now.duration_since(last) < NOTIFY_MIN_INTERVAL
+    {
+        return;
+    }
+    if guard.last_key.as_deref() == Some(key.as_str())
+        && let Some(last) = guard.last_sent
+        && now.duration_since(last) < NOTIFY_DEDUPE_WINDOW
+    {
+        return;
+    }
+    guard.last_sent = Some(now);
+    guard.last_key = Some(key);
+    drop(guard);
+    let _ = handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+}
+
+fn notify_status_transition(
+    handle: &AppHandle,
+    previous: Option<&DaemonStatus>,
+    current: Option<&DaemonStatus>,
+    unreachable_error: Option<&str>,
+) {
+    if let Some(err) = unreachable_error {
+        let short = if err.len() > 160 {
+            format!("{}…", &err[..160])
+        } else {
+            err.to_owned()
+        };
+        maybe_notify(
+            handle,
+            format!("unreachable:{short}"),
+            "Tobro: Daemon unavailable",
+            &short,
+        );
+        return;
+    }
+    let Some(cur) = current else {
+        return;
+    };
+    let prev_state = previous.map(|s| &s.state);
+    if prev_state == Some(&cur.state) {
+        return;
+    }
+    match cur.state {
+        DaemonState::Connected | DaemonState::Serving => {
+            maybe_notify(
+                handle,
+                "state:connected",
+                "Tobro: Connected",
+                "Tor is connected and proxy services are ready.",
+            );
+        }
+        DaemonState::Bootstrapping => {
+            // Notify when bootstrapping starts from a non-active/error context (not on percent churn).
+            if !matches!(
+                prev_state,
+                Some(DaemonState::Starting | DaemonState::Bootstrapping)
+            ) {
+                maybe_notify(
+                    handle,
+                    "state:bootstrapping",
+                    "Tobro: Connecting to Tor",
+                    "Bootstrapping Tor network connection…",
+                );
+            }
+        }
+        DaemonState::Stopped => {
+            if matches!(
+                prev_state,
+                Some(
+                    DaemonState::Starting
+                        | DaemonState::Bootstrapping
+                        | DaemonState::Connected
+                        | DaemonState::Serving
+                        | DaemonState::Stopping
+                )
+            ) {
+                maybe_notify(
+                    handle,
+                    "state:stopped",
+                    "Tobro: Disconnected",
+                    "Tor connection has stopped.",
+                );
+            }
+        }
+        DaemonState::Error => {
+            let detail = if !cur.bootstrap.detail.trim().is_empty()
+                && cur.bootstrap.detail != "not started"
+            {
+                cur.bootstrap.detail.clone()
+            } else if let Some(b) = &cur.bootstrap.blocked {
+                b.clone()
+            } else {
+                "The Tor daemon reported an error.".to_owned()
+            };
+            let short = if detail.len() > 180 {
+                format!("{}…", &detail[..180])
+            } else {
+                detail
+            };
+            maybe_notify(
+                handle,
+                format!("state:error:{short}"),
+                "Tobro: Connection error",
+                &short,
+            );
+        }
+        DaemonState::Starting | DaemonState::Stopping => {}
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(app, "status", "Status: Starting…", false, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
     let stop_item = MenuItem::with_id(app, "stop", "Stop", false, None::<&str>)?;
-    let new_identity_item = MenuItem::with_id(app, "new_identity", "New identity", false, None::<&str>)?;
+    let new_identity_item =
+        MenuItem::with_id(app, "new_identity", "New identity", false, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let open_item = MenuItem::with_id(app, "open", "Open window", true, None::<&str>)?;
     let sep3 = PredefinedMenuItem::separator(app)?;
@@ -570,25 +716,29 @@ async fn watch_daemon(
                         }
                         Err(spawn_error) => {
                             connect_pending = false;
-                            emit(
-                                &handle,
-                                "unreachable",
-                                json!({
-                                    "error": format!(
-                                        "tobrod is not reachable: {error}. Automatic start failed: {spawn_error}. \
-                                         You can set TOBROD_PATH or run `tobrod run --socket {}`.",
-                                        daemon_socket.display()
-                                    )
-                                }),
+                            let msg = format!(
+                                "tobrod is not reachable: {error}. Automatic start failed: {spawn_error}. \
+                                 You can set TOBROD_PATH or run `tobrod run --socket {}`.",
+                                daemon_socket.display()
                             );
+                            maybe_notify(
+                                &handle,
+                                "unreachable:spawn_failed",
+                                "Tobro: Could not start daemon",
+                                &msg,
+                            );
+                            emit(&handle, "unreachable", json!({ "error": msg }));
                         }
                     }
                 } else {
-                    emit(
+                    let msg = format!("{} ({})", error, daemon_socket.display());
+                    maybe_notify(
                         &handle,
-                        "unreachable",
-                        json!({ "error": format!("{} ({})", error, daemon_socket.display()) }),
+                        format!("unreachable:{msg}"),
+                        "Tobro: Daemon unavailable",
+                        &msg,
                     );
+                    emit(&handle, "unreachable", json!({ "error": msg }));
                 }
             }
         }
@@ -814,9 +964,11 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
 }
 
 async fn refresh_status(handle: &AppHandle, client: &mut Client) {
+    let previous = handle.state::<AppState>().get_status();
     match client.call(methods::STATUS, None).await {
         Ok(value) => {
             let parsed = serde_json::from_value::<DaemonStatus>(value.clone()).ok();
+            notify_status_transition(handle, previous.as_ref(), parsed.as_ref(), None);
             update_tray_menu(handle, true, parsed.as_ref());
             if let Some(status) = parsed {
                 handle.state::<AppState>().set_status(status);
@@ -824,9 +976,11 @@ async fn refresh_status(handle: &AppHandle, client: &mut Client) {
             emit(handle, "status", value);
         }
         Err(error) => {
+            let err = error.to_string();
+            notify_status_transition(handle, previous.as_ref(), None, Some(&err));
             update_tray_menu(handle, false, None);
             emit(handle, "status", Value::Null);
-            emit(handle, "unreachable", json!({ "error": error.to_string() }));
+            emit(handle, "unreachable", json!({ "error": err }));
         }
     }
 }
