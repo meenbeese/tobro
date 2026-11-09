@@ -159,6 +159,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             },
             bridges: bridge_settings,
             outbound_proxy,
+            onion_services: Vec::new(),
         }));
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),

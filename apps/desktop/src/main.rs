@@ -48,6 +48,19 @@ enum IpcCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OnionList(oneshot::Sender<Result<Value, String>>),
+    OnionCreate {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    OnionUpdate {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    OnionDelete {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -189,6 +202,54 @@ async fn daemon_test_bridges(
             params: Value::Object(params),
             reply: tx,
         })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_list(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionList(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_create(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionCreate { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_update(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionUpdate { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_delete(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionDelete { params, reply: tx })
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -450,6 +511,10 @@ fn main() {
             daemon_validate_config,
             daemon_apply_config,
             daemon_test_bridges,
+            daemon_onion_list,
+            daemon_onion_create,
+            daemon_onion_update,
+            daemon_onion_delete,
             get_proxy_ports,
             save_proxy_ports
         ])
@@ -1560,12 +1625,16 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         IpcCommand::Connect(tx)
         | IpcCommand::Stop(tx)
         | IpcCommand::NewIdentity(tx)
-        | IpcCommand::ConfigGet(tx) => {
+        | IpcCommand::ConfigGet(tx)
+        | IpcCommand::OnionList(tx) => {
             let _ = tx.send(err);
         }
         IpcCommand::ConfigValidate { reply, .. }
         | IpcCommand::ConfigApply { reply, .. }
-        | IpcCommand::BridgesTest { reply, .. } => {
+        | IpcCommand::BridgesTest { reply, .. }
+        | IpcCommand::OnionCreate { reply, .. }
+        | IpcCommand::OnionUpdate { reply, .. }
+        | IpcCommand::OnionDelete { reply, .. } => {
             let _ = reply.send(err);
         }
     }
@@ -1680,6 +1749,34 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
         IpcCommand::BridgesTest { params, reply } => {
             let result = client
                 .call(methods::BRIDGES_TEST, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::OnionList(tx) => {
+            let result = client
+                .call(methods::ONION_LIST, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::OnionCreate { params, reply } => {
+            let result = client
+                .call(methods::ONION_CREATE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::OnionUpdate { params, reply } => {
+            let result = client
+                .call(methods::ONION_UPDATE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::OnionDelete { params, reply } => {
+            let result = client
+                .call(methods::ONION_DELETE, Some(params))
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);

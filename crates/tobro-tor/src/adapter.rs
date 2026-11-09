@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tor_chanmgr::ProxyProtocol;
 
-use crate::{BootstrapEvent, BridgeSettings, Tor};
+use crate::{BootstrapEvent, BridgeSettings, HostedOnionService, Tor};
 
 fn encode_userinfo_component(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
@@ -211,6 +211,9 @@ pub struct ListenerConfig {
     /// Runtime-only; not serialized as part of listener config snapshots.
     #[serde(default, skip)]
     pub outbound_proxy: OutboundProxySettings,
+    /// Enabled onion services to host (runtime-only).
+    #[serde(default, skip)]
+    pub onion_services: Vec<HostedOnionService>,
 }
 
 impl Default for ListenerConfig {
@@ -224,15 +227,19 @@ impl Default for ListenerConfig {
             network_prefs: NetworkStreamPrefs::default(),
             bridges: BridgeSettings::default(),
             outbound_proxy: OutboundProxySettings::default(),
+            onion_services: Vec::new(),
         }
     }
 }
 
 impl ListenerConfig {
-    /// True when tobro must run its custom proxy path (isolation frontend or
-    /// non-default network StreamPrefs) instead of `arti::run_proxy`.
+    /// True when tobro must run its custom proxy path (isolation frontend,
+    /// non-default network StreamPrefs, or hosted onion services) instead of
+    /// `arti::run_proxy`.
     pub fn needs_custom_proxy(&self) -> bool {
-        self.stream_isolation.needs_frontend() || self.network_prefs.is_active()
+        self.stream_isolation.needs_frontend()
+            || self.network_prefs.is_active()
+            || !self.onion_services.is_empty()
     }
 }
 
@@ -334,6 +341,13 @@ pub enum AdapterEvent {
     Bootstrap(BootstrapEvent),
     /// Status changed.
     Status(Box<AdapterStatus>),
+    /// Onion service runtime status/error update.
+    OnionServiceStatus {
+        /// Store/service id.
+        id: String,
+        /// Runtime status.
+        status: crate::onion_service::OnionServiceRuntimeStatus,
+    },
 }
 
 /// Control handle for observing a prepared/running service.
@@ -405,6 +419,8 @@ impl PreparedService {
             self.listeners.network_prefs.clone(),
             &self.listeners.bridges,
             &self.listeners.outbound_proxy,
+            &self.listeners.onion_services,
+            Some(control.events_tx.clone()),
         );
         tokio::pin!(serve);
 

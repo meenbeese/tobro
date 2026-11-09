@@ -8,9 +8,11 @@ publish.workspace = true
 
 [dependencies]
 arti = { workspace = true, features = ["dns-proxy", "experimental-api"] }
-arti-client = { workspace = true, features = ["geoip"] }
+arti-client = { workspace = true, features = ["geoip", "onion-service-service"] }
 tor-chanmgr = "=0.48.0"
 tor-config = { workspace = true }
+tor-hsrproxy = "=0.48.0"
+tor-hsservice = "=0.48.0"
 tor-rtcompat = { workspace = true }
 tor-socksproto = { version = "=0.48.0", features = ["proxy-handshake"] }
 hickory-proto = { workspace = true }
@@ -18,6 +20,7 @@ hickory-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 futures = { workspace = true }
+async-stream = "0.3"
 
 percent-encoding = "2"
 reqwest = { workspace = true }
@@ -25,6 +28,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 anyhow = { workspace = true }
+safelog = "0.10"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

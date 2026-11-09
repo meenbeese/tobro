@@ -438,6 +438,7 @@ fn config_apply_patch(
         },
         bridges: crate::resolve_bridge_settings(&next.bridges, None),
         outbound_proxy,
+        onion_services: Vec::new(),
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -714,6 +715,32 @@ impl DaemonControl for SupervisorControl {
         config
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
+
+        // Load enabled onion services for runtime hosting.
+        let store = self.open_store().await?;
+        let all = store
+            .list_onion_services()
+            .await
+            .map_err(|e| format!("failed to load onion services: {e}"))?;
+        listeners.onion_services = all
+            .into_iter()
+            .filter(|svc| svc.enabled)
+            .map(|svc| tobro_tor::HostedOnionService {
+                id: svc.id.to_string(),
+                nickname: svc.nickname.as_str().to_owned(),
+                name: svc.name,
+                ports: svc
+                    .ports
+                    .into_iter()
+                    .map(|p| tobro_tor::HostedOnionPort {
+                        virt_port: p.virt_port,
+                        target_host: p.target_host,
+                        target_port: p.target_port,
+                    })
+                    .collect(),
+            })
+            .collect();
+
         if config.outbound_proxy.needs_sslocal() {
             let sidecar = crate::outbound::start_sslocal_and_resolve(
                 &config.outbound_proxy,
@@ -817,6 +844,7 @@ impl DaemonControl for SupervisorControl {
                 },
                 bridges: crate::resolve_bridge_settings(&config.bridges, None),
                 outbound_proxy,
+                onion_services: Vec::new(),
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
@@ -1427,6 +1455,14 @@ fn supervisor_event_to_notification(event: SupervisorEvent) -> Option<RpcNotific
         SupervisorEvent::Failed { message } => Some(RpcNotification::new(
             notifications::STATE_CHANGED,
             Some(json!({ "state": "error", "message": redact_secrets(&message) })),
+        )),
+        SupervisorEvent::OnionPublished { id, onion_address } => Some(RpcNotification::new(
+            notifications::ONION_PUBLISHED,
+            Some(json!({ "id": id, "onion_address": onion_address })),
+        )),
+        SupervisorEvent::OnionError { id, message } => Some(RpcNotification::new(
+            notifications::ONION_ERROR,
+            Some(json!({ "id": id, "message": redact_secrets(&message) })),
         )),
     }
 }

@@ -158,10 +158,11 @@ export interface SettingsProps {
 
 export type AdvancedSettingsProps = SettingsProps;
 
-type SettingsTab = "general" | "node" | "advanced";
+type SettingsTab = "general" | "node" | "onion" | "advanced";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "general", label: "General" },
   { id: "node", label: "Node Configuration" },
+  { id: "onion", label: "Onion Services" },
   { id: "advanced", label: "Advanced Tor Configuration" },
 ];
 
@@ -199,6 +200,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
     general: null,
     node: null,
+    onion: null,
     advanced: null,
   });
 
@@ -258,6 +260,28 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [bridgeTestBusy, setBridgeTestBusy] = useState(false);
   const [bridgeTestResult, setBridgeTestResult] = useState<unknown>(null);
   const [bridgeTestError, setBridgeTestError] = useState("");
+
+  // Onion services (M5)
+  type OnionPortDraft = { virt_port: string; target_host: string; target_port: string };
+  type OnionServiceView = {
+    id: string;
+    nickname: string;
+    name: string;
+    enabled: boolean;
+    onion_address?: string | null;
+    key_dir: string;
+    ports: Array<{ virt_port: number; target_host: string; target_port: number }>;
+    runtime_status?: string | null;
+    runtime_detail?: string | null;
+  };
+  const emptyOnionPort = (): OnionPortDraft => ({ virt_port: "80", target_host: "127.0.0.1", target_port: "8080" });
+  const [onionServices, setOnionServices] = useState<OnionServiceView[]>([]);
+  const [onionBusy, setOnionBusy] = useState(false);
+  const [onionError, setOnionError] = useState("");
+  const [onionMessage, setOnionMessage] = useState("");
+  const [onionName, setOnionName] = useState("");
+  const [onionPorts, setOnionPorts] = useState<OnionPortDraft[]>([emptyOnionPort()]);
+  const [onionEditingId, setOnionEditingId] = useState<string | null>(null);
 
   function log(text: string, level: "info" | "error" = "info") {
     appendLog?.(text, level, "ui");
@@ -535,8 +559,15 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       void loadConfigState();
       void loadAutostart();
       void loadAppLock();
+      void loadOnionServices();
     }
   }, [powerUser]);
+
+  useEffect(() => {
+    if (powerUser && tab === "onion") {
+      void loadOnionServices();
+    }
+  }, [powerUser, tab]);
 
   useEffect(() => {
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
@@ -938,6 +969,160 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       log(`bridge test failed: ${message}`, "error");
     } finally {
       setBridgeTestBusy(false);
+    }
+  }
+
+  function validateOnionPorts(ports: OnionPortDraft[]): string | null {
+    if (ports.length === 0) return "Add at least one port mapping.";
+    const seen = new Set<number>();
+    for (let i = 0; i < ports.length; i++) {
+      const p = ports[i];
+      const virt = Number(p.virt_port);
+      const target = Number(p.target_port);
+      const host = p.target_host.trim() || "127.0.0.1";
+      if (!Number.isInteger(virt) || virt < 1 || virt > 65535) {
+        return `Port mapping ${i + 1}: virtual port must be 1–65535.`;
+      }
+      if (!Number.isInteger(target) || target < 1 || target > 65535) {
+        return `Port mapping ${i + 1}: target port must be 1–65535.`;
+      }
+      if (!host) return `Port mapping ${i + 1}: target host is required.`;
+      if (/\s/.test(host)) return `Port mapping ${i + 1}: target host must not contain whitespace.`;
+      if (seen.has(virt)) return `Port mapping ${i + 1}: duplicate virtual port ${virt}.`;
+      seen.add(virt);
+    }
+    return null;
+  }
+
+  function onionPortsToParams(ports: OnionPortDraft[]) {
+    return ports.map((p) => ({
+      virt_port: Number(p.virt_port),
+      target_host: p.target_host.trim() || "127.0.0.1",
+      target_port: Number(p.target_port),
+    }));
+  }
+
+  async function loadOnionServices() {
+    setOnionBusy(true);
+    setOnionError("");
+    try {
+      const result = await invoke<{ services?: OnionServiceView[] }>("daemon_onion_list");
+      setOnionServices(Array.isArray(result?.services) ? result.services : []);
+    } catch (e) {
+      setOnionError(String(e));
+      log(`onion services: load failed: ${String(e)}`, "error");
+    } finally {
+      setOnionBusy(false);
+    }
+  }
+
+  function resetOnionForm() {
+    setOnionName("");
+    setOnionPorts([emptyOnionPort()]);
+    setOnionEditingId(null);
+  }
+
+  function startEditOnionService(svc: OnionServiceView) {
+    setOnionEditingId(svc.id);
+    setOnionName(svc.name);
+    setOnionPorts(
+      (svc.ports?.length ? svc.ports : []).map((p) => ({
+        virt_port: String(p.virt_port),
+        target_host: p.target_host || "127.0.0.1",
+        target_port: String(p.target_port),
+      })),
+    );
+    if (!svc.ports?.length) setOnionPorts([emptyOnionPort()]);
+    setOnionError("");
+    setOnionMessage("");
+  }
+
+  async function onSaveOnionService(e?: FormEvent) {
+    e?.preventDefault();
+    const name = onionName.trim();
+    if (!name) {
+      setOnionError("Service name is required.");
+      return;
+    }
+    const portError = validateOnionPorts(onionPorts);
+    if (portError) {
+      setOnionError(portError);
+      return;
+    }
+    setOnionBusy(true);
+    setOnionError("");
+    setOnionMessage("");
+    try {
+      if (onionEditingId) {
+        await invoke("daemon_onion_update", {
+          params: {
+            id: onionEditingId,
+            name,
+            ports: onionPortsToParams(onionPorts),
+          },
+        });
+        setOnionMessage("Onion service updated. Reconnect Tor if it is running to apply runtime changes.");
+        log(`onion service updated: ${onionEditingId}`);
+      } else {
+        await invoke("daemon_onion_create", {
+          params: {
+            name,
+            ports: onionPortsToParams(onionPorts),
+            enabled: true,
+          },
+        });
+        setOnionMessage("Onion service created (enabled). Connect/start Tor to publish it.");
+        log(`onion service created: ${name}`);
+      }
+      resetOnionForm();
+      await loadOnionServices();
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion service save failed: ${msg}`, "error");
+    } finally {
+      setOnionBusy(false);
+    }
+  }
+
+  async function onToggleOnionService(svc: OnionServiceView) {
+    setOnionBusy(true);
+    setOnionError("");
+    setOnionMessage("");
+    try {
+      await invoke("daemon_onion_update", {
+        params: { id: svc.id, enabled: !svc.enabled },
+      });
+      setOnionMessage(svc.enabled ? "Onion service disabled." : "Onion service enabled. Connect/start Tor to publish it.");
+      await loadOnionServices();
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion service toggle failed: ${msg}`, "error");
+    } finally {
+      setOnionBusy(false);
+    }
+  }
+
+  async function onDeleteOnionService(svc: OnionServiceView) {
+    if (!window.confirm(`Delete onion service "${svc.name}"?\n\nThis removes the service and its managed key storage. The .onion identity will be lost unless you have a backup.`)) {
+      return;
+    }
+    setOnionBusy(true);
+    setOnionError("");
+    setOnionMessage("");
+    try {
+      await invoke("daemon_onion_delete", { params: { id: svc.id } });
+      if (onionEditingId === svc.id) resetOnionForm();
+      setOnionMessage("Onion service deleted.");
+      log(`onion service deleted: ${svc.id}`);
+      await loadOnionServices();
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion service delete failed: ${msg}`, "error");
+    } finally {
+      setOnionBusy(false);
     }
   }
 
@@ -1639,13 +1824,165 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 ) : null}
               </details>
 
+
               <details className="settings-section node-restrictions" open>
                 <summary><h3>Unsupported restrictions (hidden)</h3></summary>
                 <ul className="muted">
                   <li><strong>Bridges/circumvention:</strong> supported here in Node Configuration (Transport test &amp; diagnostics) and via config/CLI (<code>bridges.test</code>, bridge config, Moat/builtin helpers). Bridge lines are sensitive; diagnostics avoid leaking bridge material.</li>
                   <li><strong>Entry/exit/exclude/strict node lists:</strong> C Tor-style node restriction lists are not exposed by the pinned Arti APIs used here; these knobs remain hidden and are rejected by config validation/import (never silently ignored).</li>
+                  <li><strong>Onion services:</strong> configured in the <strong>Onion Services</strong> tab (CRUD, enable/disable, port mapping validation, key storage management). Runtime launch/publish/status is integrated through the Tor daemon path; enabled services are loaded on connect.</li>
                   <li><strong>Stream isolation (F-42/F-43):</strong> supported and configurable in Advanced Tor Configuration.</li>
                 </ul>
+              </details>
+            </div>
+
+
+          <div
+            id="settings-panel-onion"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-onion"
+            hidden={tab !== "onion"}
+          >
+              <div className="settings-section-head">
+                <p className="muted">Create and manage v3 onion services with local port mappings. Runtime publishing uses the Arti-backed Tor path; enabled services are loaded when you connect.</p>
+              </div>
+              <details className="settings-section onion-services" open>
+                <summary><h3>Onion services</h3></summary>
+                <p className="muted">
+                  Host v3 onion services with local port mappings (<code>virtual port → target host:port</code>). Services and
+                  desired enable/disable state are saved locally; key material is stored on disk in the managed onion-services
+                  directory (private permissions). Runtime publishing requires the Tor runtime integration to launch enabled
+                  services; status/errors are shown when available.
+                </p>
+                <div className="config-actions">
+                  <button type="button" disabled={onionBusy} onClick={() => void loadOnionServices()}>
+                    {onionBusy ? "Loading…" : "Reload services"}
+                  </button>
+                </div>
+                {onionError ? <p className="error" role="alert">{onionError}</p> : null}
+                {onionMessage ? <p className="muted" aria-live="polite">{onionMessage}</p> : null}
+
+                {onionServices.length ? (
+                  <ul className="onion-service-list" aria-label="Onion services">
+                    {onionServices.map((svc) => (
+                      <li key={svc.id} className="onion-service-item">
+                        <div className="onion-service-header">
+                          <strong>{svc.name}</strong>
+                          <span className={`status-badge ${svc.enabled ? "status-badge-serving" : "status-badge-stopped"}`}>
+                            {svc.enabled ? (svc.runtime_status || "enabled") : "disabled"}
+                          </span>
+                        </div>
+                        {svc.onion_address ? <p className="muted"><code>{svc.onion_address}</code></p> : <p className="muted">Address: not published yet</p>}
+                        {svc.runtime_detail ? <p className="muted">{svc.runtime_detail}</p> : null}
+                        <p className="muted">
+                          Ports: {(svc.ports || []).map((p) => `${p.virt_port} → ${(p.target_host || "127.0.0.1")}:${p.target_port}`).join(", ") || "(none)"}
+                        </p>
+                        <div className="actions">
+                          <button type="button" disabled={onionBusy} onClick={() => startEditOnionService(svc)}>Edit</button>
+                          <button type="button" disabled={onionBusy} onClick={() => void onToggleOnionService(svc)}>
+                            {svc.enabled ? "Disable" : "Enable"}
+                          </button>
+                          <button type="button" className="danger" disabled={onionBusy} onClick={() => void onDeleteOnionService(svc)}>Delete</button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No onion services configured.</p>
+                )}
+
+                <form className="onion-service-form" onSubmit={(e) => void onSaveOnionService(e)}>
+                  <h4>{onionEditingId ? "Edit onion service" : "Create onion service"}</h4>
+                  <label>
+                    Service name
+                    <input
+                      type="text"
+                      value={onionName}
+                      onChange={(e) => { setOnionName(e.target.value); setOnionError(""); }}
+                      placeholder="My service"
+                      disabled={onionBusy}
+                      required
+                    />
+                  </label>
+                  <fieldset className="onion-port-mappings">
+                    <legend>Port mappings</legend>
+                    <p className="muted">Map virtual onion ports to local targets. Validation: ports 1–65535, target host required, no duplicate virtual ports.</p>
+                    {onionPorts.map((p, idx) => (
+                      <div key={idx} className="onion-port-row" aria-label={`Port mapping ${idx + 1}`}>
+                        <label>
+                          Virtual port
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={p.virt_port}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setOnionPorts((prev) => prev.map((row, i) => i === idx ? { ...row, virt_port: v } : row));
+                              setOnionError("");
+                            }}
+                            disabled={onionBusy}
+                            required
+                          />
+                        </label>
+                        <label>
+                          Target host
+                          <input
+                            type="text"
+                            value={p.target_host}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setOnionPorts((prev) => prev.map((row, i) => i === idx ? { ...row, target_host: v } : row));
+                              setOnionError("");
+                            }}
+                            placeholder="127.0.0.1"
+                            disabled={onionBusy}
+                            required
+                          />
+                        </label>
+                        <label>
+                          Target port
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={p.target_port}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setOnionPorts((prev) => prev.map((row, i) => i === idx ? { ...row, target_port: v } : row));
+                              setOnionError("");
+                            }}
+                            disabled={onionBusy}
+                            required
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={onionBusy || onionPorts.length <= 1}
+                          onClick={() => setOnionPorts((prev) => prev.filter((_, i) => i !== idx))}
+                          aria-label={`Remove port mapping ${idx + 1}`}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                    <div className="actions">
+                      <button type="button" disabled={onionBusy} onClick={() => setOnionPorts((prev) => [...prev, emptyOnionPort()])}>
+                        Add port mapping
+                      </button>
+                    </div>
+                  </fieldset>
+                  <div className="actions">
+                    <button className="primary" type="submit" disabled={onionBusy}>
+                      {onionBusy ? "Saving…" : (onionEditingId ? "Save changes" : "Create service")}
+                    </button>
+                    {onionEditingId ? (
+                      <button type="button" disabled={onionBusy} onClick={resetOnionForm}>Cancel edit</button>
+                    ) : null}
+                  </div>
+                </form>
               </details>
             </div>
 

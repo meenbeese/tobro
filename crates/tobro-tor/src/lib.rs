@@ -24,6 +24,7 @@ pub mod adapter;
 pub mod custom_proxy;
 pub mod isolation;
 pub mod moat;
+pub mod onion_service;
 pub mod proxy;
 pub mod pt;
 pub mod smart_connect;
@@ -33,6 +34,7 @@ pub use moat::{
     CircumventionSettingsResponse, DEFAULT_MOAT_BASE_URL, MoatClient, MoatError, ResolvedBridges,
     fetch_bridges_with_fallback,
 };
+pub use onion_service::{HostedOnionPort, HostedOnionService, OnionServiceRuntimeStatus};
 pub use pt::{
     BUILTIN_BRIDGES_JSON, BridgeDistribution, BridgeLineValidation, BridgeSet, BridgeSettings,
     BridgeValidationResult, builtin_bridges, check_bridge_settings, export_bridge_lines_redacted,
@@ -309,11 +311,14 @@ pub async fn serve(
         network_prefs,
         &BridgeSettings::default(),
         &adapter::OutboundProxySettings::default(),
+        &[],
+        None,
     )
     .await
 }
 
-/// Like [`serve`] but applies bridge/PT settings (M3, lyrebird: obfs4/meek_lite/webtunnel).
+/// Like [`serve`] but applies bridge/PT settings (M3, lyrebird: obfs4/meek_lite/webtunnel)
+/// and optionally hosts enabled onion services.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_bridges(
     state_dir: &Path,
@@ -325,9 +330,15 @@ pub async fn serve_with_bridges(
     network_prefs: adapter::NetworkStreamPrefs,
     bridges: &BridgeSettings,
     outbound_proxy: &adapter::OutboundProxySettings,
+    onion_services: &[HostedOnionService],
+    onion_events: Option<tokio::sync::broadcast::Sender<adapter::AdapterEvent>>,
 ) -> anyhow::Result<()> {
     let config = client_config(state_dir, cache_dir, bridges, outbound_proxy)?;
-    let needs_custom = stream_isolation.needs_frontend() || network_prefs.is_active();
+    // Onion services require a tobro-owned TorClient (custom path). custom_proxy
+    // already supports isolation + network prefs, so route there when needed.
+    let needs_custom = !onion_services.is_empty()
+        || stream_isolation.needs_frontend()
+        || network_prefs.is_active();
 
     if needs_custom {
         return serve_custom(
@@ -339,6 +350,8 @@ pub async fn serve_with_bridges(
             bind_all_interfaces,
             stream_isolation,
             network_prefs,
+            onion_services,
+            onion_events,
         )
         .await;
     }
@@ -434,34 +447,21 @@ async fn serve_with_isolation(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // internal orchestration: paths, ports, bind, and stream policy from separate config sources
+#[allow(clippy::too_many_arguments)] // internal orchestration
 async fn serve_custom(
-    state_dir: &Path,
-    cache_dir: &Path,
+    _state_dir: &Path,
+    _cache_dir: &Path,
     config: TorClientConfig,
     socks_port: u16,
     dns_port: u16,
     bind_all_interfaces: bool,
     stream_isolation: adapter::StreamIsolationPolicy,
     network_prefs: adapter::NetworkStreamPrefs,
+    onion_services: &[HostedOnionService],
+    onion_events: Option<tokio::sync::broadcast::Sender<adapter::AdapterEvent>>,
 ) -> anyhow::Result<()> {
-    // If only destination/port isolation is needed and no network StreamPrefs,
-    // preserve the proven forwarding front-end path.
-    if !network_prefs.is_active() && stream_isolation.needs_frontend() {
-        return serve_with_isolation(
-            state_dir,
-            cache_dir,
-            config,
-            socks_port,
-            dns_port,
-            bind_all_interfaces,
-            stream_isolation,
-        )
-        .await;
-    }
-
-    // Custom path: own the TorClient so we can apply default StreamPrefs
-    // (exit country, IPv6, M2) and isolation.
+    // Custom path: own the TorClient so we can apply default StreamPrefs,
+    // isolation, and host onion services.
     let client = Client::builder()
         .config(config)
         .bootstrap_behavior(BootstrapBehavior::OnDemand)
@@ -472,6 +472,49 @@ async fn serve_custom(
         .bootstrap()
         .await
         .context("Arti bootstrap failed for custom proxy")?;
+
+    // Launch enabled onion services and keep handles alive for the proxy lifetime.
+    let mut _running_onion_services = Vec::new();
+    for spec in onion_services {
+        let id = spec.id.clone();
+        match crate::onion_service::launch(&client, spec.clone()) {
+            Ok((running, initial)) => {
+                if let Some(tx) = &onion_events {
+                    let _ = tx.send(adapter::AdapterEvent::OnionServiceStatus {
+                        id: id.clone(),
+                        status: initial,
+                    });
+                }
+                if let Some(tx) = onion_events.clone() {
+                    let svc_for_status = running.clone();
+                    let id_for_status = id.clone();
+                    tokio::spawn(async move {
+                        use futures::StreamExt as _;
+                        let stream = svc_for_status.status_events();
+                        futures::pin_mut!(stream);
+                        while let Some(status) = stream.next().await {
+                            let _ = tx.send(adapter::AdapterEvent::OnionServiceStatus {
+                                id: id_for_status.clone(),
+                                status,
+                            });
+                        }
+                    });
+                }
+                _running_onion_services.push(running);
+            }
+            Err(err) => {
+                tracing::warn!(id = %id, error = %format!("{err:#}"), "failed to launch onion service");
+                if let Some(tx) = &onion_events {
+                    let _ = tx.send(adapter::AdapterEvent::OnionServiceStatus {
+                        id,
+                        status: OnionServiceRuntimeStatus::Error {
+                            message: format!("{err:#}"),
+                        },
+                    });
+                }
+            }
+        }
+    }
 
     custom_proxy::serve(
         client,
