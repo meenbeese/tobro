@@ -73,6 +73,15 @@ pub mod methods {
     /// Test a bridge/pluggable transport line and return diagnostics (no bridge material leaked).
     pub const BRIDGES_TEST: &str = "bridges.test";
 
+    /// List hosted onion services.
+    pub const ONION_LIST: &str = "onion.list";
+    /// Create a hosted onion service.
+    pub const ONION_CREATE: &str = "onion.create";
+    /// Update a hosted onion service (name, ports, enabled).
+    pub const ONION_UPDATE: &str = "onion.update";
+    /// Delete a hosted onion service.
+    pub const ONION_DELETE: &str = "onion.delete";
+
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
 }
@@ -91,6 +100,10 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::CONFIG_VALIDATE
             | methods::CONFIG_APPLY
             | methods::BRIDGES_TEST
+            | methods::ONION_LIST
+            | methods::ONION_CREATE
+            | methods::ONION_UPDATE
+            | methods::ONION_DELETE
     )
 }
 
@@ -103,7 +116,8 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::STOP
         | methods::RELOAD_CONFIG
         | methods::NEW_IDENTITY
-        | methods::CONFIG_GET => validate_no_params(method, params),
+        | methods::CONFIG_GET
+        | methods::ONION_LIST => validate_no_params(method, params),
         methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
             let Some(Value::Object(map)) = params else {
                 return Err(RpcError::invalid_params(
@@ -149,6 +163,57 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
             }
             Ok(())
         }
+        methods::ONION_CREATE => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"name\": \"...\", \"ports\": [{\"virt_port\":80,\"target_port\":8080}]}",
+                ));
+            };
+            if !matches!(map.get("name"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"name\" (string)",
+                ));
+            }
+            if !matches!(map.get("ports"), Some(Value::Array(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"ports\" (array)",
+                ));
+            }
+            Ok(())
+        }
+        methods::ONION_UPDATE => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"id\": \"...\", ...}",
+                ));
+            };
+            if !matches!(map.get("id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"id\" (string)",
+                ));
+            }
+            Ok(())
+        }
+        methods::ONION_DELETE => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"id\": \"...\"}",
+                ));
+            };
+            if !matches!(map.get("id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"id\" (string)",
+                ));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -170,12 +235,16 @@ pub fn validate_no_params(method: &str, params: &Option<Value>) -> Result<(), Rp
     Ok(())
 }
 
-/// Notification names used by the M0 IPC surface.
+/// Notification names used by the IPC surface.
 pub mod notifications {
     /// Bootstrap progress; payload is [`BootstrapProgress`].
     pub const BOOTSTRAP_PROGRESS: &str = "bootstrap.progress";
     /// State transition; payload is `{ "state": DaemonState }`.
     pub const STATE_CHANGED: &str = "daemon.state_changed";
+    /// Onion service published/updated; payload is an onion service object.
+    pub const ONION_PUBLISHED: &str = "onion.published";
+    /// Onion service error; payload contains `id` and a redacted `message`.
+    pub const ONION_ERROR: &str = "onion.error";
 }
 
 /// Name of the IPC socket inside the daemon state directory.
@@ -639,6 +708,52 @@ pub struct Hello {
     pub arti_version: String,
     /// Daemon process id.
     pub pid: u32,
+}
+
+/// Onion service port mapping (`virt_port` -> local target).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnionServicePort {
+    /// Virtual (onion-facing) port.
+    pub virt_port: u16,
+    /// Local target host, typically `127.0.0.1`.
+    #[serde(default = "default_onion_target_host")]
+    pub target_host: String,
+    /// Local target port.
+    pub target_port: u16,
+}
+
+fn default_onion_target_host() -> String {
+    "127.0.0.1".to_owned()
+}
+
+/// Hosted onion service record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnionService {
+    /// Stable service identifier.
+    pub id: String,
+    /// Stable nickname/key identifier.
+    pub nickname: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Desired enabled state.
+    pub enabled: bool,
+    /// Published `.onion` address, once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onion_address: Option<String>,
+    /// Managed key/state directory path.
+    pub key_dir: String,
+    /// Unix timestamp in milliseconds.
+    pub created_at: i64,
+    /// Unix timestamp in milliseconds.
+    pub updated_at: i64,
+    /// Port mappings.
+    pub ports: Vec<OnionServicePort>,
+    /// Best-effort runtime status (`stopped`, `starting`, `published`, `error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_status: Option<String>,
+    /// Runtime error/detail, redacted/safe for UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_detail: Option<String>,
 }
 
 #[cfg(unix)]

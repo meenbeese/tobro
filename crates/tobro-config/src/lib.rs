@@ -66,6 +66,9 @@ pub struct Config {
     pub stream: StreamConfig,
     /// Bridge and pluggable transport settings (M3).
     pub bridges: BridgesConfig,
+    /// Onion service hosting settings (M5). Dynamic services are managed via IPC/DB;
+    /// this section reserves config compatibility.
+    pub onion_services: OnionServicesConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -80,10 +83,20 @@ impl Default for Config {
             network: NetworkConfig::default(),
             stream: StreamConfig::default(),
             bridges: BridgesConfig::default(),
+            onion_services: OnionServicesConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
 }
+
+/// Onion service hosting configuration (M5).
+///
+/// Dynamic onion services are created/edited/deleted/enabled via the daemon IPC
+/// and persisted in the local store. Key material is stored on disk in the
+/// managed onion-services directory (0700), never in config plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OnionServicesConfig {}
 
 /// Bridge and pluggable transport configuration (M3).
 ///
@@ -993,9 +1006,9 @@ pub fn unsupported_knob_error(path: &str) -> Option<String> {
             path,
             "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path/transport_dir for lyrebird, snowflake_path/snowflake_dir for snowflake-client, dnstt_path/dnstt_dir for dnstt-client, lyrebird_transports).",
         ),
-        "onion_services" | "onion_services.client_auth" => (
+        "onion_services.client_auth" => (
             path,
-            "onion service hosting/client authorization is not exposed yet (M5 planned).",
+            "onion service client authorization is not exposed yet (planned). Use `onion.*` IPC methods for hosted service management.",
         ),
         _ => return None,
     };
@@ -1088,7 +1101,7 @@ impl Config {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -1248,6 +1261,7 @@ level = "info"
             "network": patch["network"].clone(),
             "stream": cfg.stream,
             "bridges": cfg.bridges,
+            "onion_services": cfg.onion_services,
             "logging": cfg.logging,
         });
         cfg = serde_json::from_value(merged)?;

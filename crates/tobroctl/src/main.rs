@@ -45,6 +45,11 @@ enum Command {
         #[command(subcommand)]
         command: BridgesCommand,
     },
+    /// Manage hosted v3 onion services (create/edit/delete/enable/disable).
+    Onion {
+        #[command(subcommand)]
+        command: OnionCommand,
+    },
     /// Stream IPC notifications as JSON lines until Ctrl-C.
     Watch,
 }
@@ -128,6 +133,60 @@ enum BridgesCommand {
         /// Output only bridge lines as text (default: JSON summary including source/fallback).
         #[arg(long)]
         lines_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OnionCommand {
+    /// List hosted onion services.
+    List,
+    /// Create a hosted onion service.
+    Create {
+        /// Human-readable service name.
+        #[arg(long)]
+        name: String,
+        /// Port mapping `VIRT[:TARGET_HOST]:TARGET` (repeatable). Example: `--port 80:8080`.
+        #[arg(long = "port", value_name = "VIRT[:HOST]:TARGET", required = true)]
+        ports: Vec<String>,
+        /// Create the service in disabled state.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Update a hosted onion service (name, ports, enable/disable).
+    Update {
+        /// Service id.
+        #[arg(long)]
+        id: String,
+        /// New human-readable name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace port mappings (repeatable). Same format as `onion create --port`.
+        #[arg(long = "port", value_name = "VIRT[:HOST]:TARGET")]
+        ports: Vec<String>,
+        /// Enable the service.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Disable the service.
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// Enable a hosted onion service.
+    Enable {
+        /// Service id.
+        #[arg(long)]
+        id: String,
+    },
+    /// Disable a hosted onion service.
+    Disable {
+        /// Service id.
+        #[arg(long)]
+        id: String,
+    },
+    /// Delete a hosted onion service and its managed key storage.
+    Delete {
+        /// Service id.
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -251,6 +310,75 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             | BridgesCommand::Import { .. }
             | BridgesCommand::Builtin { .. }
             | BridgesCommand::Moat { .. } => unreachable!("handled above"),
+        },
+        Command::Onion { command } => match command {
+            OnionCommand::List => {
+                let result = client.call(tobro_ipc::methods::ONION_LIST, None).await?;
+                print_json(&result)?;
+            }
+            OnionCommand::Create {
+                name,
+                ports,
+                disabled,
+            } => {
+                let ports = parse_onion_ports(&ports)?;
+                let result = client
+                    .call(
+                        tobro_ipc::methods::ONION_CREATE,
+                        Some(json!({ "name": name, "ports": ports, "enabled": !disabled })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            OnionCommand::Update {
+                id,
+                name,
+                ports,
+                enable,
+                disable,
+            } => {
+                let mut patch = serde_json::Map::new();
+                patch.insert("id".to_owned(), Value::String(id));
+                if let Some(name) = name {
+                    patch.insert("name".to_owned(), Value::String(name));
+                }
+                if !ports.is_empty() {
+                    patch.insert("ports".to_owned(), Value::Array(parse_onion_ports(&ports)?));
+                }
+                if enable {
+                    patch.insert("enabled".to_owned(), Value::Bool(true));
+                } else if disable {
+                    patch.insert("enabled".to_owned(), Value::Bool(false));
+                }
+                let result = client
+                    .call(tobro_ipc::methods::ONION_UPDATE, Some(Value::Object(patch)))
+                    .await?;
+                print_json(&result)?;
+            }
+            OnionCommand::Enable { id } => {
+                let result = client
+                    .call(
+                        tobro_ipc::methods::ONION_UPDATE,
+                        Some(json!({ "id": id, "enabled": true })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            OnionCommand::Disable { id } => {
+                let result = client
+                    .call(
+                        tobro_ipc::methods::ONION_UPDATE,
+                        Some(json!({ "id": id, "enabled": false })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            OnionCommand::Delete { id } => {
+                let result = client
+                    .call(tobro_ipc::methods::ONION_DELETE, Some(json!({ "id": id })))
+                    .await?;
+                print_json(&result)?;
+            }
         },
         Command::Watch => watch(&mut client).await?,
     }
@@ -448,6 +576,45 @@ async fn bridges_moat(
         anyhow::bail!("no bridges resolved (Moat unavailable and no matching local built-ins)");
     }
     Ok(())
+}
+
+fn parse_onion_ports(specs: &[String]) -> anyhow::Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let s = spec.trim();
+        // Formats: VIRT:TARGET  |  VIRT:HOST:TARGET
+        let parts: Vec<&str> = s.split(':').collect();
+        let (virt_port, target_host, target_port) = match parts.as_slice() {
+            [virt, target] => (
+                virt.parse::<u16>()
+                    .with_context(|| format!("invalid virtual port in {spec:?}"))?,
+                "127.0.0.1".to_owned(),
+                target
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid target port in {spec:?}"))?,
+            ),
+            [virt, host, target] => (
+                virt.parse::<u16>()
+                    .with_context(|| format!("invalid virtual port in {spec:?}"))?,
+                (*host).to_owned(),
+                target
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid target port in {spec:?}"))?,
+            ),
+            _ => anyhow::bail!(
+                "invalid --port {spec:?}; expected VIRT:TARGET or VIRT:HOST:TARGET (e.g. 80:8080)"
+            ),
+        };
+        if virt_port == 0 || target_port == 0 {
+            anyhow::bail!("ports must be non-zero in {spec:?}");
+        }
+        out.push(json!({
+            "virt_port": virt_port,
+            "target_host": target_host,
+            "target_port": target_port,
+        }));
+    }
+    Ok(out)
 }
 
 fn read_patch(input: &str) -> anyhow::Result<Value> {

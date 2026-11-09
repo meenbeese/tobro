@@ -168,10 +168,10 @@ async fn daemon_test_bridges(
     lines: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let mut params = serde_json::Map::new();
-    if let Some(line) = line {
-        if !line.trim().is_empty() {
-            params.insert("line".to_owned(), Value::String(line));
-        }
+    if let Some(line) = line
+        && !line.trim().is_empty()
+    {
+        params.insert("line".to_owned(), Value::String(line));
     }
     if let Some(lines) = lines {
         params.insert(

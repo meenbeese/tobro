@@ -225,6 +225,23 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// List hosted onion services.
+    fn onion_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Create a hosted onion service.
+    fn onion_create(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Update a hosted onion service.
+    fn onion_update(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Delete a hosted onion service.
+    fn onion_delete(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
 }
@@ -661,6 +678,21 @@ impl SupervisorControl {
             sidecar.stop().await;
         }
     }
+
+    fn db_path(&self) -> std::path::PathBuf {
+        self.state_dir.join(tobro_store::DB_FILE_NAME)
+    }
+
+    fn onion_services_dir(&self) -> std::path::PathBuf {
+        self.state_dir.join("onion-services")
+    }
+
+    async fn open_store(&self) -> Result<tobro_store::Db, String> {
+        let path = self.db_path();
+        tobro_store::Db::open(&path)
+            .await
+            .map_err(|e| format!("failed to open store {}: {e}", path.display()))
+    }
 }
 
 impl DaemonControl for SupervisorControl {
@@ -838,6 +870,30 @@ impl DaemonControl for SupervisorControl {
             .map_err(|e| format!("bridge test task failed: {e}"))?
     }
 
+    async fn onion_list(&self) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let runtime_active = is_runtime_active(&self.snapshot().state);
+        crate::onion::list(&db_path, runtime_active).await
+    }
+
+    async fn onion_create(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let onion_root = self.onion_services_dir();
+        let runtime_active = is_runtime_active(&self.snapshot().state);
+        crate::onion::create(&db_path, &onion_root, params, runtime_active).await
+    }
+
+    async fn onion_update(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let runtime_active = is_runtime_active(&self.snapshot().state);
+        crate::onion::update(&db_path, params, runtime_active).await
+    }
+
+    async fn onion_delete(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::onion::delete(&db_path, params).await
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
         self.handle.subscribe_events()
     }
@@ -892,6 +948,22 @@ impl DaemonControl for SupervisorHandle {
 
     async fn bridges_test(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("bridge testing requires daemon config/state context".to_owned())
+    }
+
+    async fn onion_list(&self) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn onion_create(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn onion_update(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn onion_delete(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -1289,6 +1361,37 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::ONION_LIST => match control.onion_list().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
+        },
+        methods::ONION_CREATE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.onion_create(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::ONION_UPDATE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.onion_update(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::ONION_DELETE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.onion_delete(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
         other => RpcResponse::error(id, RpcError::method_not_found(other)),
     }
 }
@@ -1437,6 +1540,31 @@ mod daemon_tests {
             _params: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "bridges.test", "mock": true, "diagnostics": [] }))
+        }
+
+        async fn onion_list(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.list", "services": [] }))
+        }
+
+        async fn onion_create(
+            &self,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.create", "service": params }))
+        }
+
+        async fn onion_update(
+            &self,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.update", "service": params }))
+        }
+
+        async fn onion_delete(
+            &self,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.delete", "id": params.get("id").cloned() }))
         }
 
         fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
