@@ -70,6 +70,8 @@ pub mod methods {
     pub const CONFIG_VALIDATE: &str = "config.validate";
     /// Validate, persist, and apply a configuration patch.
     pub const CONFIG_APPLY: &str = "config.apply";
+    /// Test a bridge/pluggable transport line and return diagnostics (no bridge material leaked).
+    pub const BRIDGES_TEST: &str = "bridges.test";
 
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
@@ -88,6 +90,7 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::CONFIG_GET
             | methods::CONFIG_VALIDATE
             | methods::CONFIG_APPLY
+            | methods::BRIDGES_TEST
     )
 }
 
@@ -119,6 +122,32 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
                     "missing required \"patch\" object",
                 )),
             }
+        }
+        methods::BRIDGES_TEST => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"line\": \"...\"} (or {\"lines\": [...]})",
+                ));
+            };
+            let has_line = matches!(map.get("line"), Some(Value::String(_)));
+            let has_lines = match map.get("lines") {
+                Some(Value::Array(arr)) => arr.iter().all(|v| v.is_string()),
+                Some(_) => {
+                    return Err(RpcError::invalid_params(
+                        method,
+                        "\"lines\" must be an array of strings",
+                    ));
+                }
+                None => false,
+            };
+            if !has_line && !has_lines {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"line\" (string) or \"lines\" (string array)",
+                ));
+            }
+            Ok(())
         }
         _ => Ok(()),
     }

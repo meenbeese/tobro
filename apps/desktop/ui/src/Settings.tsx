@@ -267,6 +267,12 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [configError, setConfigError] = useState("");
   const fileRef = useRef<HTMLInputElement | null>(null);
 
+  // Bridge/transport test + diagnostics
+  const [bridgeTestLine, setBridgeTestLine] = useState("");
+  const [bridgeTestBusy, setBridgeTestBusy] = useState(false);
+  const [bridgeTestResult, setBridgeTestResult] = useState<unknown>(null);
+  const [bridgeTestError, setBridgeTestError] = useState("");
+
   function log(text: string, level: "info" | "error" = "info") {
     appendLog?.(text, level, "ui");
   }
@@ -922,6 +928,30 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  async function onTestBridge(lineOverride?: string) {
+    const line = (lineOverride ?? bridgeTestLine).trim();
+    if (!line) {
+      setBridgeTestError("Paste a bridge line to test (e.g. obfs4, snowflake, webtunnel).");
+      return;
+    }
+    setBridgeTestBusy(true);
+    setBridgeTestError("");
+    setBridgeTestResult(null);
+    log("testing bridge/transport (local validation + PT/config diagnostics)");
+    try {
+      const result = await invoke<unknown>("daemon_test_bridges", { line });
+      setBridgeTestResult(result);
+      const r = result as { ok?: boolean; summary?: string };
+      log(`bridge test: ${r?.ok ? "ok" : "issues found"}${r?.summary ? ` — ${r.summary}` : ""}`, r?.ok ? "info" : "error");
+    } catch (e) {
+      const message = String(e);
+      setBridgeTestError(message);
+      log(`bridge test failed: ${message}`, "error");
+    } finally {
+      setBridgeTestBusy(false);
+    }
+  }
+
   function onNetworkExitCountryChange(value: string) {
     setNetwork((prev) => ({ ...prev, exit_country: value }));
     setNetworkDirty(true);
@@ -1527,6 +1557,97 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </button>
                   <button type="button" disabled={networkBusy} onClick={() => void loadConfigState()}>Reset</button>
                 </div>
+              </div>
+
+              <div className="settings-section bridge-test">
+                <h3>Transport test &amp; diagnostics</h3>
+                <p className="muted">
+                  Test a bridge/pluggable transport line before connecting. This runs <strong>local validation</strong> and
+                  {" "}<strong>PT/config diagnostics</strong> using the daemon’s configured transport paths (it checks format,
+                  required transports, and whether <code>lyrebird</code>/<code>snowflake-client</code>/<code>dnstt-client</code> can
+                  be resolved). It does not perform a live Tor bootstrap in this request and never returns bridge secrets/material in diagnostics.
+                </p>
+                <div className="config-actions">
+                  <button
+                    type="button"
+                    disabled={busy || !((currentConfig as { bridges?: { lines?: unknown[] } } | null)?.bridges?.lines?.length)}
+                    onClick={() => {
+                      const lines = (currentConfig as { bridges?: { lines?: unknown[] } } | null)?.bridges?.lines;
+                      if (Array.isArray(lines)) {
+                        setBridgeTestLine(lines.filter((v): v is string => typeof v === "string").join("\n"));
+                        setBridgeTestError("");
+                      } else {
+                        void loadConfigState();
+                      }
+                    }}
+                  >
+                    Use configured bridge lines
+                  </button>
+                  <button type="button" disabled={bridgeTestBusy} onClick={() => { setBridgeTestResult(null); setBridgeTestError(""); }}>
+                    Clear result
+                  </button>
+                </div>
+                <label className="sr-only" htmlFor="settings-bridge-test-line">Bridge line to test</label>
+                <textarea
+                  id="settings-bridge-test-line"
+                  className="config-textarea"
+                  value={bridgeTestLine}
+                  onChange={(e) => { setBridgeTestLine(e.target.value); setBridgeTestError(""); }}
+                  placeholder={'obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0\nBridge snowflake 192.0.2.3:80 FINGERPRINT ...\nBridge webtunnel 192.0.2.2:443 FINGERPRINT url=https://example.com/ ver=0.0.1'}
+                  spellCheck={false}
+                  rows={4}
+                />
+                <div className="actions">
+                  <button className="primary" type="button" disabled={bridgeTestBusy || !bridgeTestLine.trim()} onClick={() => void onTestBridge()}>
+                    {bridgeTestBusy ? "Testing…" : "Test this bridge"}
+                  </button>
+                </div>
+                {bridgeTestError ? <p className="error" role="alert">{bridgeTestError}</p> : null}
+                {bridgeTestResult ? (
+                  <div className="bridge-test-result" aria-live="polite">
+                    {(() => {
+                      const r = bridgeTestResult as {
+                        ok?: boolean;
+                        summary?: string;
+                        transport?: string | null;
+                        required_transports?: string[];
+                        diagnostics?: string[];
+                        valid_count?: number;
+                        invalid_count?: number;
+                        pt?: Record<string, { required?: boolean; found?: boolean; path?: string; hint?: string }>;
+                      };
+                      return (
+                        <>
+                          <p className={r.ok ? "muted" : "error"}>
+                            <strong>{r.ok ? "Pass" : "Issues found"}:</strong> {r.summary || (r.ok ? "Diagnostics completed." : "See diagnostics below.")}
+                          </p>
+                          {r.transport ? <p className="muted">Detected transport: <code>{r.transport}</code>{r.required_transports?.length ? ` (required: ${r.required_transports.join(", ")})` : ""}</p> : null}
+                          {typeof r.valid_count === "number" ? <p className="muted">Validation: {r.valid_count} valid, {r.invalid_count ?? 0} invalid.</p> : null}
+                          {r.pt ? (
+                            <ul className="muted">
+                              {Object.entries(r.pt).filter(([, v]) => v?.required).map(([name, v]) => (
+                                <li key={name}>
+                                  <strong>{name}</strong>: {v?.found ? "found" : "missing"}
+                                  {v?.path ? <> — <code>{v.path}</code></> : null}
+                                  {v?.hint ? <span className="error"> — {v.hint}</span> : null}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                          {Array.isArray(r.diagnostics) && r.diagnostics.length ? (
+                            <ul className={r.ok ? "muted" : "config-messages"}>
+                              {r.diagnostics.map((d, i) => <li key={i}>{d}</li>)}
+                            </ul>
+                          ) : null}
+                          <details className="config-preview">
+                            <summary>Raw diagnostics (JSON)</summary>
+                            <pre>{JSON.stringify(bridgeTestResult, null, 2)}</pre>
+                          </details>
+                        </>
+                      );
+                    })()}
+                  </div>
+                ) : null}
               </div>
 
               <div className="settings-section node-restrictions">

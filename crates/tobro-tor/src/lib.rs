@@ -35,7 +35,7 @@ pub use moat::{
 };
 pub use pt::{
     BUILTIN_BRIDGES_JSON, BridgeDistribution, BridgeLineValidation, BridgeSet, BridgeSettings,
-    BridgeValidationResult, builtin_bridges, export_bridge_lines_redacted,
+    BridgeValidationResult, builtin_bridges, check_bridge_settings, export_bridge_lines_redacted,
     export_bridge_lines_text, import_bridge_lines, is_known_protocol, parse_bridge_line,
     validate_bridge_lines,
 };

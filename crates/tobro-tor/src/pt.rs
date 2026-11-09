@@ -454,6 +454,32 @@ pub fn bridge_line_protocol(line: &str) -> Option<String> {
     if proto.is_empty() { None } else { Some(proto) }
 }
 
+/// Check that bridge/PT settings can be applied to an Arti client config.
+///
+/// This performs the same validation as [`apply_to_builder`] (line parsing, PT
+/// path/transport requirements) without starting Tor. Errors are safe to display
+/// (they do not intentionally include bridge material such as certs/fingerprints/addresses).
+pub fn check_bridge_settings(settings: &BridgeSettings) -> Result<(), String> {
+    #[cfg(feature = "pt-client")]
+    {
+        let mut builder = arti_client::config::TorClientConfig::builder();
+        apply_to_builder(&mut builder, settings).map_err(|e| format!("{e:#}"))?;
+        // Building validates consistency in pt-client configurations.
+        builder
+            .build()
+            .map_err(|e| format!("bridge/PT configuration is not usable: {e:#}"))?;
+        Ok(())
+    }
+    #[cfg(not(feature = "pt-client"))]
+    {
+        if settings.is_active() {
+            Err("bridge/PT configuration requires the `pt-client` feature".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Apply bridge/PT settings to an Arti `TorClientConfigBuilder`.
 ///
 /// Requires `arti-client`'s `pt-client` feature (enabled by default in tobro-tor).

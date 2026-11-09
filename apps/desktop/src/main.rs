@@ -44,6 +44,10 @@ enum IpcCommand {
         patch: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    BridgesTest {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +155,40 @@ async fn daemon_apply_config(state: State<'_, AppState>, patch: Value) -> Result
     state
         .commands
         .send(IpcCommand::ConfigApply { patch, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_test_bridges(
+    state: State<'_, AppState>,
+    line: Option<String>,
+    lines: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let mut params = serde_json::Map::new();
+    if let Some(line) = line {
+        if !line.trim().is_empty() {
+            params.insert("line".to_owned(), Value::String(line));
+        }
+    }
+    if let Some(lines) = lines {
+        params.insert(
+            "lines".to_owned(),
+            Value::Array(lines.into_iter().map(Value::String).collect()),
+        );
+    }
+    if params.is_empty() {
+        return Err("provide a bridge line to test".to_owned());
+    }
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::BridgesTest {
+            params: Value::Object(params),
+            reply: tx,
+        })
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -411,6 +449,7 @@ fn main() {
             daemon_get_config,
             daemon_validate_config,
             daemon_apply_config,
+            daemon_test_bridges,
             get_proxy_ports,
             save_proxy_ports
         ])
@@ -1524,7 +1563,9 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::ConfigGet(tx) => {
             let _ = tx.send(err);
         }
-        IpcCommand::ConfigValidate { reply, .. } | IpcCommand::ConfigApply { reply, .. } => {
+        IpcCommand::ConfigValidate { reply, .. }
+        | IpcCommand::ConfigApply { reply, .. }
+        | IpcCommand::BridgesTest { reply, .. } => {
             let _ = reply.send(err);
         }
     }
@@ -1635,6 +1676,13 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);
             refresh_status(handle, client).await;
+        }
+        IpcCommand::BridgesTest { params, reply } => {
+            let result = client
+                .call(methods::BRIDGES_TEST, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
         }
     }
 }

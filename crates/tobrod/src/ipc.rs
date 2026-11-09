@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use tobro_ipc::{
@@ -220,6 +220,11 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Reload and validate configuration. Returns a JSON summary.
     fn reload_config(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Test bridge/pluggable transport line(s) and return safe diagnostics.
+    fn bridges_test(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
 }
@@ -449,6 +454,171 @@ fn config_apply_patch(
     }))
 }
 
+fn bridges_test_at(
+    config_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    runtime_active: bool,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut lines = Vec::new();
+    if let Some(map) = params.as_object() {
+        if let Some(Value::String(line)) = map.get("line") {
+            lines.extend(tobro_tor::import_bridge_lines(line));
+        }
+        if let Some(Value::Array(arr)) = map.get("lines") {
+            let text = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            lines.extend(tobro_tor::import_bridge_lines(&text));
+        }
+    }
+    if lines.is_empty() {
+        return Err("no bridge line(s) to test".to_owned());
+    }
+
+    let validation = tobro_tor::validate_bridge_lines(&lines);
+    let current = load_current_config(config_path).unwrap_or_default();
+    let mut test_cfg = tobro_config::BridgesConfig {
+        enabled: true,
+        lines: lines.clone(),
+        ..tobro_config::BridgesConfig::default()
+    };
+    // Reuse daemon PT path overrides/search hints from current config.
+    test_cfg.transport_path = current.bridges.transport_path.clone();
+    test_cfg.transport_dir = current.bridges.transport_dir.clone();
+    test_cfg.lyrebird_transports = if current.bridges.lyrebird_transports.is_empty() {
+        test_cfg.lyrebird_transports.clone()
+    } else {
+        current.bridges.lyrebird_transports.clone()
+    };
+    test_cfg.snowflake_path = current.bridges.snowflake_path.clone();
+    test_cfg.snowflake_dir = current.bridges.snowflake_dir.clone();
+    test_cfg.dnstt_path = current.bridges.dnstt_path.clone();
+    test_cfg.dnstt_dir = current.bridges.dnstt_dir.clone();
+    test_cfg.country = current.bridges.normalized_country();
+
+    let resolved = crate::resolve_bridge_settings(&test_cfg, Some(state_dir));
+    let required = validation.required_transports.clone();
+
+    let pt_info = |required_name: &str, path: &Option<std::path::PathBuf>, needs: bool| {
+        let found = path.as_ref().is_some_and(|p| p.exists());
+        let mut obj = json!({
+            "required": needs,
+            "found": found,
+        });
+        if let Some(p) = path {
+            obj["path"] = json!(p.display().to_string());
+            obj["exists"] = json!(p.exists());
+        }
+        if needs && !found {
+            obj["hint"] = json!(format!(
+                "Install/configure {required_name} or set the corresponding bridges.*_path/*_dir in config."
+            ));
+        }
+        obj
+    };
+
+    let lyrebird_required = required
+        .iter()
+        .any(|p| matches!(p.as_str(), "obfs4" | "meek_lite" | "webtunnel"));
+    let snowflake_required = required.iter().any(|p| p == "snowflake");
+    let dnstt_required = required.iter().any(|p| p == "dnstt");
+
+    let mut diagnostics: Vec<String> = Vec::new();
+    if runtime_active {
+        diagnostics.push(
+            "Tor runtime is currently active. This test performs local validation and PT/config diagnostics; it does not run an isolated live bootstrap against the active daemon state."
+                .to_owned(),
+        );
+    } else {
+        diagnostics.push(
+            "Local validation and PT/config diagnostics completed. No live Tor bootstrap was performed in this request."
+                .to_owned(),
+        );
+    }
+    if lyrebird_required && !resolved.lyrebird_path.as_ref().is_some_and(|p| p.exists()) {
+        diagnostics.push(
+            "Required lyrebird transport binary was not found for the tested line(s).".to_owned(),
+        );
+    }
+    if snowflake_required && !resolved.snowflake_path.as_ref().is_some_and(|p| p.exists()) {
+        diagnostics.push(
+            "Required snowflake-client binary was not found for the tested line(s).".to_owned(),
+        );
+    }
+    if dnstt_required && !resolved.dnstt_path.as_ref().is_some_and(|p| p.exists()) {
+        diagnostics
+            .push("Required dnstt-client binary was not found for the tested line(s).".to_owned());
+    }
+    if !validation.ok {
+        diagnostics.push(format!(
+            "{} invalid bridge line(s) detected; fix format/transport before connecting.",
+            validation.invalid_count
+        ));
+    }
+    for l in &validation.lines {
+        if l.known_transport == Some(false) {
+            diagnostics.push("A transport is not managed by tobro's built-in PT integration; a matching external PT may be required.".to_owned());
+            break;
+        }
+    }
+
+    let config_build = if validation.valid_count > 0 {
+        match tobro_tor::check_bridge_settings(&resolved) {
+            Ok(()) => json!({ "ok": true }),
+            Err(e) => {
+                let msg = redact_secrets(&e);
+                diagnostics.push(format!("Arti bridge/PT config check failed: {msg}"));
+                json!({ "ok": false, "error": msg })
+            }
+        }
+    } else {
+        json!({ "ok": false, "error": "no valid bridge lines to configure" })
+    };
+
+    let pt_ok = (!lyrebird_required || resolved.lyrebird_path.as_ref().is_some_and(|p| p.exists()))
+        && (!snowflake_required || resolved.snowflake_path.as_ref().is_some_and(|p| p.exists()))
+        && (!dnstt_required || resolved.dnstt_path.as_ref().is_some_and(|p| p.exists()));
+    let build_ok = config_build
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ok = validation.ok && pt_ok && build_ok;
+
+    let primary_transport = required.first().cloned();
+    let summary = if ok {
+        "Bridge line(s) passed local validation and PT/config diagnostics.".to_owned()
+    } else if !validation.ok {
+        "Bridge validation failed.".to_owned()
+    } else if !pt_ok {
+        "Bridge format looks valid, but required pluggable transport binaries are missing or unresolved.".to_owned()
+    } else {
+        "Bridge/PT configuration diagnostics reported issues.".to_owned()
+    };
+
+    Ok(json!({
+        "ok": ok,
+        "action": "bridges.test",
+        "summary": summary,
+        "transport": primary_transport,
+        "required_transports": required,
+        "tested_count": lines.len(),
+        "valid_count": validation.valid_count,
+        "invalid_count": validation.invalid_count,
+        "runtime_active": runtime_active,
+        "validation": validation,
+        "pt": {
+            "lyrebird": pt_info("lyrebird", &resolved.lyrebird_path, lyrebird_required),
+            "snowflake": pt_info("snowflake-client", &resolved.snowflake_path, snowflake_required),
+            "dnstt": pt_info("dnstt-client", &resolved.dnstt_path, dnstt_required),
+        },
+        "config_build": config_build,
+        "diagnostics": diagnostics,
+    }))
+}
+
 /// Supervisor handle paired with config path and live listener settings for IPC.
 #[derive(Clone)]
 pub struct SupervisorControl {
@@ -658,6 +828,16 @@ impl DaemonControl for SupervisorControl {
         .map_err(|e| format!("reload task failed: {e}"))?
     }
 
+    async fn bridges_test(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let state_dir = self.state_dir.clone();
+        let snapshot = self.handle.snapshot();
+        let running = is_runtime_active(&snapshot.state);
+        tokio::task::spawn_blocking(move || bridges_test_at(&path, &state_dir, running, &params))
+            .await
+            .map_err(|e| format!("bridge test task failed: {e}"))?
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
         self.handle.subscribe_events()
     }
@@ -708,6 +888,10 @@ impl DaemonControl for SupervisorHandle {
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
         Err("config reload requires daemon config path context".to_owned())
+    }
+
+    async fn bridges_test(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("bridge testing requires daemon config/state context".to_owned())
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -1096,6 +1280,15 @@ pub async fn dispatch_daemon<C: DaemonControl>(
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(e)),
         },
+        methods::BRIDGES_TEST => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.bridges_test(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
         other => RpcResponse::error(id, RpcError::method_not_found(other)),
     }
 }
@@ -1237,6 +1430,13 @@ mod daemon_tests {
 
         async fn reload_config(&self) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "reload_config", "mock": true }))
+        }
+
+        async fn bridges_test(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "bridges.test", "mock": true, "diagnostics": [] }))
         }
 
         fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {

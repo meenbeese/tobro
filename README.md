@@ -2,7 +2,7 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0-M2, M4 complete; M3 in progress.
+**Status:** M0-M4 complete; M5 in progress.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 

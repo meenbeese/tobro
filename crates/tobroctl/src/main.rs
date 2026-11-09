@@ -106,6 +106,11 @@ enum BridgesCommand {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Test bridge/pluggable transport line(s) via the daemon (validation + PT/config diagnostics).
+    Test {
+        /// Bridge line text, `@path` to read a file, or `-` to read stdin.
+        input: String,
+    },
     /// Fetch bridges via Moat with country/transport selection and fallback (local network call).
     Moat {
         /// Country code (ISO 3166-1 alpha-2), e.g. `de`, `cn`. Optional.
@@ -173,7 +178,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 )
                 .await;
             }
-            BridgesCommand::Export { .. } | BridgesCommand::Apply { .. } => {}
+            BridgesCommand::Export { .. }
+            | BridgesCommand::Apply { .. }
+            | BridgesCommand::Test { .. } => {}
         }
     }
 
@@ -239,6 +246,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             BridgesCommand::Apply { input, enabled } => {
                 bridges_apply(&mut client, &input, enabled).await?;
             }
+            BridgesCommand::Test { input } => bridges_test(&mut client, &input).await?,
             BridgesCommand::Validate { .. }
             | BridgesCommand::Import { .. }
             | BridgesCommand::Builtin { .. }
@@ -377,6 +385,21 @@ async fn bridges_apply(
         )
         .await?;
     print_json(&result)?;
+    Ok(())
+}
+
+async fn bridges_test(client: &mut tobro_ipc::Client, input: &str) -> anyhow::Result<()> {
+    let text = read_text_input(input)?;
+    let result = client
+        .call(
+            tobro_ipc::methods::BRIDGES_TEST,
+            Some(json!({ "line": text })),
+        )
+        .await?;
+    print_json(&result)?;
+    if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        anyhow::bail!("bridge transport test reported issues (see diagnostics)");
+    }
     Ok(())
 }
 
