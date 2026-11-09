@@ -84,23 +84,25 @@ impl Default for Config {
 
 /// Bridge and pluggable transport configuration (M3).
 ///
-/// Supports Tor/Arti bridge lines and external PT clients (lyrebird for
-/// obfs4, meek_lite, webtunnel). Bridge material may be sensitive; avoid
-/// logging full lines.
+/// Supports Tor/Arti bridge lines and external PT clients:
+/// - lyrebird (`obfs4`, `meek_lite`/`meek`, `webtunnel`)
+/// - snowflake-client (`snowflake`, including AMP/front/broker params in bridge lines)
+///
+/// Bridge material may be sensitive; avoid logging full lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BridgesConfig {
     /// Enable bridge/PT usage. When false, `lines` are ignored.
     pub enabled: bool,
     /// Bridge lines in Tor bridge format (e.g. `obfs4 ...`, `webtunnel ...`,
-    /// or `Bridge <transport> ...`).
+    /// `snowflake ...`, or `Bridge <transport> ...`).
     #[serde(default)]
     pub lines: Vec<String>,
-    /// Preferred transport binary name/path override. When unset, tobro searches
-    /// for known PT binaries (lyrebird) in sidecar/app locations.
+    /// Preferred lyrebird binary path override. When unset, tobro searches for
+    /// lyrebird in sidecar/app locations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_path: Option<String>,
-    /// Extra directory to search for PT binaries.
+    /// Extra directory to search for lyrebird/PT binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_dir: Option<String>,
     /// Request lyrebird-managed transports for these protocols when bridge lines
@@ -108,6 +110,13 @@ pub struct BridgesConfig {
     /// protocols supported by this build.
     #[serde(default = "default_lyrebird_transports")]
     pub lyrebird_transports: Vec<String>,
+    /// Preferred `snowflake-client` binary path override. When unset, tobro
+    /// searches for `snowflake-client` in sidecar/app locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snowflake_path: Option<String>,
+    /// Extra directory to search for `snowflake-client`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snowflake_dir: Option<String>,
 }
 
 fn default_lyrebird_transports() -> Vec<String> {
@@ -126,6 +135,8 @@ impl Default for BridgesConfig {
             transport_path: None,
             transport_dir: None,
             lyrebird_transports: default_lyrebird_transports(),
+            snowflake_path: None,
+            snowflake_dir: None,
         }
     }
 }
@@ -437,6 +448,13 @@ impl Config {
                 "bridges.transport_path must not be empty when set".to_owned(),
             ));
         }
+        if let Some(p) = &self.bridges.snowflake_path
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "bridges.snowflake_path must not be empty when set".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -674,7 +692,7 @@ pub fn unsupported_knob_error(path: &str) -> Option<String> {
         }
         "transports" => (
             path,
-            "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path, transport_dir, lyrebird_transports).",
+            "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path/transport_dir for lyrebird, snowflake_path/snowflake_dir for snowflake-client, lyrebird_transports).",
         ),
         "onion_services" | "onion_services.client_auth" => (
             path,

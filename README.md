@@ -11,7 +11,7 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 - **Tor:** Arti 2.8 (embedded) via `tobrod` daemon + Tauri/React desktop app.
 - **Platforms:** macOS, Windows, Linux.
 - **Proxy:** local SOCKS5, HTTP CONNECT, and DNS (configurable).
-- **Bridges (M3):** `[bridges]` config + **lyrebird** for **obfs4**, **meek_lite** (`meek`), and **WebTunnel**. Snowflake/Moat/Smart Connect planned.
+- **Bridges (M3):** `[bridges]` config + **lyrebird** (**obfs4**, **meek_lite**/`meek`, **WebTunnel**) and **snowflake-client** (**snowflake**, AMP/front/broker params supported via bridge lines). Moat/Smart Connect planned.
 - **Desktop:** connect/stop/new identity, bootstrap status, tray, autostart, app lock, settings, floating logs.
 - **CLI:** `tobroctl` — status/connect/stop/new identity/config/watch.
 - **Non-goals:** mobile, relay/exit, `torrc` compatibility, bundled browser.
@@ -68,9 +68,12 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Bridges (lyrebird / M3)
+## Bridges (lyrebird / snowflake, M3)
 
-Enable bridges in `config.toml` and provide bridge lines. For obfs4, meek_lite, or WebTunnel, tobro resolves `lyrebird` (or use `bridges.transport_path` / `transport_dir`) and configures Arti’s PT transport:
+Enable bridges in `config.toml` and provide bridge lines. tobro resolves PT binaries and configures Arti transports:
+
+- **lyrebird**: `obfs4`, `meek_lite` (`meek` alias), `webtunnel` (`transport_path` / `transport_dir`)
+- **snowflake-client**: `snowflake` (`snowflake_path` / `snowflake_dir`); AMP/front/broker/STUN/UTLS settings are passed via bridge-line parameters (including AMP cache rendezvous where supported by the client)
 
 ```toml
 [bridges]
@@ -78,13 +81,11 @@ enabled = true
 lines = [
   "obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0",
   "Bridge webtunnel 192.0.2.2:443 FINGERPRINT url=https://example.com/ ver=0.0.1",
-  "Bridge meek_lite 192.0.2.3:443 FINGERPRINT url=https://meek.example/ front=cdn.example",
+  "Bridge snowflake 192.0.2.3:80 FINGERPRINT fingerprint=FINGERPRINT url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net ampcache=https://cdn.ampproject.org/ utls-imitate=hellorandomizedalpn",
 ]
-# transport_path = "/path/to/lyrebird"   # optional
-# transport_dir = "/path/to/sidecars"    # optional
+# transport_path = "/path/to/lyrebird"           # optional (lyrebird)
+# snowflake_path = "/path/to/snowflake-client"   # optional
 ```
-
-`meek` is accepted as an alias for `meek_lite` in tobro’s normalization where applicable.
 
 ## CLI commands
 

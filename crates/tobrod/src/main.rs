@@ -226,6 +226,61 @@ fn absolute(path: PathBuf, cwd: &Path) -> PathBuf {
     }
 }
 
+fn resolve_pt_binary(
+    explicit_path: Option<&str>,
+    extra_dir: Option<&str>,
+    state_dir: Option<&Path>,
+    names: &[std::ffi::OsString],
+    label: &str,
+    config_hint: &str,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit_path {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+        tracing::warn!(
+            path = %p.display(),
+            transport = label,
+            "configured PT transport path does not exist; connect will fail until fixed"
+        );
+        return None;
+    }
+    let mut search_dirs = Vec::new();
+    if let Some(d) = extra_dir {
+        search_dirs.push(PathBuf::from(d));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+            search_dirs.push(dir.join("binaries"));
+            search_dirs.push(dir.join("../Resources"));
+            search_dirs.push(dir.join("../Resources/binaries"));
+        }
+    }
+    if let Some(sd) = state_dir {
+        search_dirs.push(sd.join("pt"));
+        search_dirs.push(sd.join("sidecars"));
+    }
+    let opts = crate::pt_supervisor::LocateOptions {
+        explicit_path: None,
+        search_dirs,
+        names: names.to_vec(),
+    };
+    match crate::pt_supervisor::locate(&opts) {
+        Ok(found) => Some(found.path),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                transport = label,
+                hint = config_hint,
+                "bridges enabled but PT client was not found"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn resolve_bridge_settings(
     cfg: &tobro_config::BridgesConfig,
     state_dir: Option<&Path>,
@@ -239,6 +294,7 @@ pub(crate) fn resolve_bridge_settings(
             lines: cfg.lines.clone(),
             lyrebird_protocols: cfg.lyrebird_transports.clone(),
             lyrebird_path: None,
+            snowflake_path: None,
         };
     }
 
@@ -259,46 +315,34 @@ pub(crate) fn resolve_bridge_settings(
         })
         .collect();
     let needs_lyrebird = protocols.iter().any(|p| lyrebird_protos.contains(p));
+    let needs_snowflake = protocols
+        .iter()
+        .any(|p| p == tobro_tor::pt::SNOWFLAKE_PROTOCOL);
 
     let lyrebird_path = if needs_lyrebird {
-        if let Some(p) = &cfg.transport_path {
-            let p = PathBuf::from(p);
-            if p.exists() {
-                Some(p)
-            } else {
-                tracing::warn!(path = %p.display(), "bridges.transport_path does not exist; connect will fail until fixed");
-                None
-            }
-        } else {
-            let mut search_dirs = Vec::new();
-            if let Some(d) = &cfg.transport_dir {
-                search_dirs.push(PathBuf::from(d));
-            }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    search_dirs.push(dir.to_path_buf());
-                    search_dirs.push(dir.join("binaries"));
-                    search_dirs.push(dir.join("../Resources"));
-                    search_dirs.push(dir.join("../Resources/binaries"));
-                }
-            }
-            if let Some(sd) = state_dir {
-                search_dirs.push(sd.join("pt"));
-                search_dirs.push(sd.join("sidecars"));
-            }
-            let opts = crate::pt_supervisor::LocateOptions {
-                explicit_path: None,
-                search_dirs,
-                names: vec![OsString::from("lyrebird"), OsString::from("lyrebird.exe")],
-            };
-            match crate::pt_supervisor::locate(&opts) {
-                Ok(found) => Some(found.path),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), protocols = ?protocols, "bridges enabled but lyrebird was not found; install lyrebird or set bridges.transport_path/transport_dir");
-                    None
-                }
-            }
-        }
+        resolve_pt_binary(
+            cfg.transport_path.as_deref(),
+            cfg.transport_dir.as_deref(),
+            state_dir,
+            &[OsString::from("lyrebird"), OsString::from("lyrebird.exe")],
+            "lyrebird",
+            "bridges.transport_path/transport_dir",
+        )
+    } else {
+        None
+    };
+    let snowflake_path = if needs_snowflake {
+        resolve_pt_binary(
+            cfg.snowflake_path.as_deref(),
+            cfg.snowflake_dir.as_deref(),
+            state_dir,
+            &[
+                OsString::from("snowflake-client"),
+                OsString::from("snowflake-client.exe"),
+            ],
+            "snowflake-client",
+            "bridges.snowflake_path/snowflake_dir",
+        )
     } else {
         None
     };
@@ -308,5 +352,6 @@ pub(crate) fn resolve_bridge_settings(
         lines: cfg.lines.clone(),
         lyrebird_path,
         lyrebird_protocols: cfg.lyrebird_transports.clone(),
+        snowflake_path,
     }
 }
