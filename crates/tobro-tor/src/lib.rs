@@ -26,7 +26,12 @@ pub mod isolation;
 pub mod proxy;
 pub mod pt;
 
-pub use pt::BridgeSettings;
+pub use pt::{
+    BUILTIN_BRIDGES_JSON, BridgeDistribution, BridgeLineValidation, BridgeSet, BridgeSettings,
+    BridgeValidationResult, builtin_bridges, export_bridge_lines_redacted,
+    export_bridge_lines_text, import_bridge_lines, is_known_protocol, parse_bridge_line,
+    validate_bridge_lines,
+};
 
 use std::path::Path;
 use std::sync::Arc;

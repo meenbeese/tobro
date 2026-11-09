@@ -7285,6 +7285,7 @@ dependencies = [
  "directories",
  "serde_json",
  "tobro-ipc",
+ "tobro-tor",
  "tokio",
 ]
 

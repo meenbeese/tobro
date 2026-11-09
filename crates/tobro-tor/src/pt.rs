@@ -17,6 +17,370 @@ pub const SNOWFLAKE_PROTOCOL: &str = "snowflake";
 /// DNSTT protocol name.
 pub const DNSTT_PROTOCOL: &str = "dnstt";
 
+/// All PT protocols recognized by this build (not all require the same binary).
+pub const KNOWN_PT_PROTOCOLS: &[&str] = &["obfs4", "meek_lite", "webtunnel", "snowflake", "dnstt"];
+
+/// Safe, structured result of validating a single bridge line.
+///
+/// Does not contain the original bridge line or raw parse errors, to avoid
+/// leaking bridge fingerprints, addresses, or parameters (certs, fronts, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeLineValidation {
+    /// 1-based line/index in the input (when validating a set).
+    pub index: usize,
+    /// Detected/normalized transport protocol, if one could be inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Whether the line is syntactically valid for Arti's bridge parser.
+    pub valid: bool,
+    /// Whether the transport is recognized by this tobro build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_transport: Option<bool>,
+    /// Safe, user-facing error/warning message. Never includes bridge material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of validating a collection of bridge lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BridgeValidationResult {
+    /// Per-line results (in input order; comments/blank lines may be skipped or marked).
+    pub lines: Vec<BridgeLineValidation>,
+    /// Number of valid, non-empty bridge lines.
+    pub valid_count: usize,
+    /// Number of invalid bridge lines.
+    pub invalid_count: usize,
+    /// Transports required by valid lines (normalized).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_transports: Vec<String>,
+    /// True if all non-empty, non-comment lines are valid.
+    pub ok: bool,
+}
+
+impl BridgeValidationResult {
+    /// Collect safe error messages.
+    pub fn errors(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter_map(|l| {
+                l.error.as_ref().map(|e| match &l.transport {
+                    Some(t) => format!("line {} ({t}): {e}", l.index),
+                    None => format!("line {}: {e}", l.index),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Returns true if `transport` is recognized by this build.
+pub fn is_known_protocol(transport: &str) -> bool {
+    let n = normalize_protocol(transport);
+    KNOWN_PT_PROTOCOLS.contains(&n.as_str())
+}
+
+/// Parse and validate a single bridge line using Arti's bridge parser.
+///
+/// Returns the detected transport on success. Errors are sanitized and never
+/// include the bridge line contents (addresses, fingerprints, certs, params).
+#[cfg(feature = "pt-client")]
+pub fn parse_bridge_line(line: &str) -> Result<String, String> {
+    parse_bridge_builder(line).map(|(t, _)| t)
+}
+
+#[cfg(feature = "pt-client")]
+fn parse_bridge_builder(
+    line: &str,
+) -> Result<(String, arti_client::config::BridgeConfigBuilder), String> {
+    use arti_client::config::BridgeConfigBuilder;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err("bridge line is empty".to_owned());
+    }
+    let transport = bridge_line_protocol(trimmed);
+    // Parse for structural validity without leaking the Arti parse error (it may echo input).
+    let parsed: Result<BridgeConfigBuilder, _> = trimmed.parse();
+    match parsed {
+        Ok(builder) => {
+            let t = transport.ok_or_else(|| "could not determine bridge transport".to_owned())?;
+            Ok((t, builder))
+        }
+        Err(_) => Err(match transport {
+            Some(t) => format!("invalid {t} bridge line format"),
+            None => "invalid bridge line format (expected e.g. 'obfs4 <addr:port> <fingerprint> <params>')".to_owned(),
+        }),
+    }
+}
+
+#[cfg(not(feature = "pt-client"))]
+pub fn parse_bridge_line(line: &str) -> Result<String, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err("bridge line is empty".to_owned());
+    }
+    bridge_line_protocol(trimmed).ok_or_else(|| {
+        "could not determine bridge transport (pt-client validation unavailable)".to_owned()
+    })
+}
+
+/// Validate a set of bridge lines.
+///
+/// Comments (`#`, `//`) and blank lines are ignored. Results are safe to display/log
+/// (no bridge material). `1`-based indexes refer to positions in `lines`.
+pub fn validate_bridge_lines(lines: &[impl AsRef<str>]) -> BridgeValidationResult {
+    let mut result = BridgeValidationResult::default();
+    let mut required: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let idx = i + 1;
+        let trimmed = line.as_ref().trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        match parse_bridge_line(trimmed) {
+            Ok(transport) => {
+                let known = is_known_protocol(&transport);
+                required.insert(transport.clone());
+                result.valid_count += 1;
+                result.lines.push(BridgeLineValidation {
+                    index: idx,
+                    transport: Some(transport),
+                    valid: true,
+                    known_transport: Some(known),
+                    error: if known {
+                        None
+                    } else {
+                        Some("transport is not managed by tobro's built-in PT integration; a matching PT may be required".to_owned())
+                    },
+                });
+            }
+            Err(error) => {
+                let transport = bridge_line_protocol(trimmed);
+                result.invalid_count += 1;
+                result.lines.push(BridgeLineValidation {
+                    index: idx,
+                    transport,
+                    valid: false,
+                    known_transport: None,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+    result.required_transports = required.into_iter().collect();
+    result.ok = result.invalid_count == 0;
+    result
+}
+
+/// Import bridge lines from freeform text.
+///
+/// Splits on newlines, trims, removes comments/blank lines, normalizes an
+/// optional leading `Bridge` prefix as-is (Arti accepts both forms), and
+/// deduplicates exact normalized lines while preserving order.
+pub fn import_bridge_lines(input: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for raw in input.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        // Normalize internal whitespace for dedup comparison, but keep a stable form.
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+/// Export bridge lines as newline-delimited text.
+pub fn export_bridge_lines_text(lines: &[impl AsRef<str>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let t = line.as_ref().trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            continue;
+        }
+        out.push_str(t);
+        out.push('\n');
+    }
+    out
+}
+
+/// Export bridge lines with sensitive material redacted (safe for sharing/diagnostics).
+///
+/// Keeps the transport and a placeholder; does not include addresses, fingerprints, or params.
+pub fn export_bridge_lines_redacted(lines: &[impl AsRef<str>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let t = line.as_ref().trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            continue;
+        }
+        if let Some(proto) = bridge_line_protocol(t) {
+            out.push_str(&proto);
+            out.push_str(" [REDACTED]\n");
+        } else {
+            out.push_str("[REDACTED]\n");
+        }
+    }
+    out
+}
+
+/// A named set of bridges (for built-in sets, import/export, and selection).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BridgeSet {
+    /// Stable identifier (e.g. `obfs4`, `snowflake`, `custom`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Human-readable name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Primary transport/type hint (e.g. `obfs4`, `snowflake`, `webtunnel`).
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub transport_type: Option<String>,
+    /// Bridge lines (full material; treat as sensitive).
+    #[serde(default)]
+    pub bridges: Vec<String>,
+    /// Optional country codes this set is relevant to (ISO 3166-1 alpha-2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub countries: Vec<String>,
+    /// Optional source/provenance label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Optional last-updated timestamp or version string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+impl BridgeSet {
+    /// Validate the bridge lines in this set.
+    pub fn validate(&self) -> BridgeValidationResult {
+        validate_bridge_lines(&self.bridges)
+    }
+
+    /// Normalized, non-empty, deduplicated bridge lines.
+    pub fn normalized_bridges(&self) -> Vec<String> {
+        import_bridge_lines(&self.bridges.join("\n"))
+    }
+}
+
+/// Built-in/importable bridge distribution JSON format (F-30).
+///
+/// The file may be bundled with the app or loaded from disk. `signature` is
+/// reserved for signed distribution verification (verification is applied when
+/// configured; unsigned/local files may be accepted in development contexts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeDistribution {
+    /// Format version.
+    #[serde(default = "bridge_distribution_version")]
+    pub version: u32,
+    /// When this distribution was generated/updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+    /// Optional signature material (format defined by the update channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Bridge sets.
+    #[serde(default)]
+    pub sets: Vec<BridgeSet>,
+}
+
+fn bridge_distribution_version() -> u32 {
+    1
+}
+
+impl Default for BridgeDistribution {
+    fn default() -> Self {
+        Self {
+            version: bridge_distribution_version(),
+            updated: None,
+            signature: None,
+            sets: Vec::new(),
+        }
+    }
+}
+
+impl BridgeDistribution {
+    /// Parse a bridge distribution from JSON.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        serde_json::from_str(json).map_err(|e| format!("invalid bridge JSON: {e}"))
+    }
+
+    /// Serialize to pretty JSON.
+    pub fn to_json_pretty(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize bridge JSON: {e}"))
+    }
+
+    /// Load from a file.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        Self::from_json(&text)
+    }
+
+    /// Find sets matching `transport_type` (case-insensitive) and/or `country`.
+    pub fn matching_sets<'a>(
+        &'a self,
+        transport_type: Option<&str>,
+        country: Option<&str>,
+    ) -> Vec<&'a BridgeSet> {
+        let t = transport_type.map(|s| normalize_protocol(s));
+        let c = country.map(|s| s.trim().to_ascii_lowercase());
+        self.sets
+            .iter()
+            .filter(|s| {
+                let type_ok = t.as_ref().is_none_or(|want| {
+                    s.transport_type
+                        .as_ref()
+                        .is_some_and(|have| normalize_protocol(have) == *want)
+                        || s.id
+                            .as_ref()
+                            .is_some_and(|have| normalize_protocol(have) == *want)
+                });
+                let country_ok = c.as_ref().is_none_or(|want| {
+                    s.countries.is_empty()
+                        || s.countries
+                            .iter()
+                            .any(|have| have.trim().eq_ignore_ascii_case(want))
+                });
+                type_ok && country_ok
+            })
+            .collect()
+    }
+
+    /// Collect normalized bridge lines from matching sets.
+    pub fn lines_for(&self, transport_type: Option<&str>, country: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for set in self.matching_sets(transport_type, country) {
+            for line in set.normalized_bridges() {
+                if seen.insert(line.clone()) {
+                    out.push(line);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Minimal embedded built-in bridge distribution.
+///
+/// Real deployments should ship a signed, updatable `bridges.json` (F-30/F-35).
+/// This default is intentionally empty to avoid bundling stale/region-specific
+/// bridge material in source; load a distribution file or use Moat/custom bridges.
+pub const BUILTIN_BRIDGES_JSON: &str = r#"{
+  "version": 1,
+  "updated": null,
+  "sets": []
+}
+"#;
+
+/// Load the embedded built-in bridge distribution.
+pub fn builtin_bridges() -> Result<BridgeDistribution, String> {
+    BridgeDistribution::from_json(BUILTIN_BRIDGES_JSON)
+}
+
 /// Bridge/pluggable transport settings applied to an Arti client config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -98,8 +462,8 @@ pub fn apply_to_builder(
     builder: &mut arti_client::config::TorClientConfigBuilder,
     settings: &BridgeSettings,
 ) -> anyhow::Result<()> {
+    use arti_client::config::CfgPath;
     use arti_client::config::pt::TransportConfigBuilder;
-    use arti_client::config::{BridgeConfigBuilder, CfgPath};
 
     if !settings.is_active() {
         return Ok(());
@@ -115,23 +479,15 @@ pub fn apply_to_builder(
     let mut needed_dnstt = false;
     let mut unknown: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in settings.normalized_lines() {
-        let parsed: BridgeConfigBuilder = line.parse().with_context(|| {
-            // Do not include the full bridge line in errors (may be sensitive).
-            format!(
-                "invalid bridge line (protocol {:?})",
-                bridge_line_protocol(line)
-            )
-        })?;
-        if let Some(proto) = bridge_line_protocol(line) {
-            if lyrebird_set.contains(&proto) {
-                needed_lyrebird.insert(proto);
-            } else if proto == SNOWFLAKE_PROTOCOL {
-                needed_snowflake = true;
-            } else if proto == DNSTT_PROTOCOL {
-                needed_dnstt = true;
-            } else {
-                unknown.insert(proto);
-            }
+        let (proto, parsed) = parse_bridge_builder(line).map_err(|e| anyhow!(e))?;
+        if lyrebird_set.contains(&proto) {
+            needed_lyrebird.insert(proto);
+        } else if proto == SNOWFLAKE_PROTOCOL {
+            needed_snowflake = true;
+        } else if proto == DNSTT_PROTOCOL {
+            needed_dnstt = true;
+        } else {
+            unknown.insert(proto);
         }
         builder.bridges().bridges().push(parsed);
     }
@@ -405,4 +761,91 @@ fn applies_mixed_lyrebird_and_snowflake_transports() {
     let mut builder = arti_client::config::TorClientConfig::builder();
     apply_to_builder(&mut builder, &settings).expect("apply");
     let _cfg = builder.build().expect("config should build");
+}
+
+#[test]
+fn validates_valid_bridge_lines() {
+    let lines = vec![
+        "obfs4 192.0.2.1:1 316E643333645F6D79216558614D3931657A5F5F cert=abcd iat-mode=0".to_owned(),
+        "# comment".to_owned(),
+        "".to_owned(),
+        "Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=cdn.sstatic.net utls-imitate=hellorandomizedalpn".to_owned(),
+    ];
+    let result = validate_bridge_lines(&lines);
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.valid_count, 2);
+    assert_eq!(result.invalid_count, 0);
+    assert!(result.required_transports.contains(&"obfs4".to_owned()));
+    assert!(result.required_transports.contains(&"snowflake".to_owned()));
+}
+
+#[test]
+fn validates_invalid_bridge_lines_without_leaking_material() {
+    let lines = vec!["obfs4 not-a-valid-bridge-line cert=SECRET123".to_owned()];
+    let result = validate_bridge_lines(&lines);
+    assert!(!result.ok);
+    assert_eq!(result.invalid_count, 1);
+    let msg = result.errors().join("\n");
+    assert!(!msg.contains("SECRET123"), "{msg}");
+    assert!(!msg.contains("192.0.2"), "{msg}");
+}
+
+#[test]
+fn imports_and_dedupes_bridge_lines() {
+    let input = "\n# a comment\nobfs4 1.2.3.4:1 AAAA cert=x\nobfs4  1.2.3.4:1  AAAA  cert=x\n  \nBridge snowflake 1.2.3.4:80 BBBB url=https://x/\n";
+    let lines = import_bridge_lines(input);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("obfs4 "));
+    assert!(lines[1].starts_with("Bridge snowflake "));
+}
+
+#[test]
+fn exports_redacted_bridge_lines() {
+    let lines = vec!["obfs4 192.0.2.1:1 AAAA cert=SECRET".to_owned()];
+    let redacted = export_bridge_lines_redacted(&lines);
+    assert!(!redacted.contains("SECRET"), "{redacted}");
+    assert!(!redacted.contains("192.0.2.1"), "{redacted}");
+    assert!(redacted.contains("obfs4 [REDACTED]"), "{redacted}");
+}
+
+#[test]
+fn bridge_distribution_json_round_trip_and_match() {
+    let dist = BridgeDistribution {
+        version: 1,
+        updated: Some("2026-01-01".to_owned()),
+        signature: None,
+        sets: vec![
+            BridgeSet {
+                id: Some("obfs4".to_owned()),
+                name: Some("obfs4".to_owned()),
+                transport_type: Some("obfs4".to_owned()),
+                bridges: vec!["obfs4 1.2.3.4:1 AAAA cert=x".to_owned()],
+                countries: vec!["us".to_owned()],
+                source: Some("builtin".to_owned()),
+                updated: None,
+            },
+            BridgeSet {
+                id: Some("snowflake".to_owned()),
+                name: Some("Snowflake".to_owned()),
+                transport_type: Some("snowflake".to_owned()),
+                bridges: vec!["Bridge snowflake 1.2.3.4:80 BBBB url=https://x/".to_owned()],
+                countries: vec![],
+                source: None,
+                updated: None,
+            },
+        ],
+    };
+    let json = dist.to_json_pretty().expect("serialize");
+    let parsed = BridgeDistribution::from_json(&json).expect("parse");
+    assert_eq!(parsed, dist);
+    assert_eq!(parsed.matching_sets(Some("obfs4"), None).len(), 1);
+    assert_eq!(parsed.matching_sets(Some("obfs4"), Some("de")).len(), 0);
+    assert_eq!(parsed.matching_sets(Some("obfs4"), Some("us")).len(), 1);
+    assert_eq!(parsed.lines_for(Some("snowflake"), None).len(), 1);
+}
+
+#[test]
+fn builtin_bridges_loads() {
+    let b = builtin_bridges().expect("builtin");
+    assert_eq!(b.version, 1);
 }

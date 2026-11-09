@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 tobro-ipc = { path = "../tobro-ipc" }
+tobro-tor = { path = "../tobro-tor" }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

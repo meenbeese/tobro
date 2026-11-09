@@ -320,9 +320,7 @@ pub(crate) fn resolve_bridge_settings(
     let needs_snowflake = protocols
         .iter()
         .any(|p| p == tobro_tor::pt::SNOWFLAKE_PROTOCOL);
-    let needs_dnstt = protocols
-        .iter()
-        .any(|p| p == tobro_tor::pt::DNSTT_PROTOCOL);
+    let needs_dnstt = protocols.iter().any(|p| p == tobro_tor::pt::DNSTT_PROTOCOL);
 
     let lyrebird_path = if needs_lyrebird {
         resolve_pt_binary(
