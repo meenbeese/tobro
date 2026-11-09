@@ -93,7 +93,20 @@ impl Default for Config {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BridgesConfig {
-    /// Enable bridge/PT usage. When false, `lines` are ignored.
+    /// Preferred circumvention transport/mode (`auto`, `obfs4`, `snowflake`,
+    /// `webtunnel`, `meek`/`meek_lite`, `dnstt`, or `custom`). `auto` enables
+    /// Smart Connect when `smart_connect` is true.
+    #[serde(default)]
+    pub transport: BridgeTransport,
+    /// Enable Smart Connect fallback when `transport` is `auto` (or as a
+    /// resilience policy). When false, use the configured transport/bridges directly.
+    #[serde(default = "default_smart_connect")]
+    pub smart_connect: bool,
+    /// Total Smart Connect budget in seconds, divided across attempts.
+    #[serde(default = "default_smart_connect_timeout_secs")]
+    pub smart_connect_timeout_secs: u64,
+    /// Enable bridge/PT usage. When false, `lines` are ignored for direct PT
+    /// configuration (Smart Connect/Moat may still resolve bridges when active).
     pub enabled: bool,
     /// Bridge lines in Tor bridge format (e.g. `obfs4 ...`, `webtunnel ...`,
     /// `snowflake ...`, `dnstt ...`, or `Bridge <transport> ...`).
@@ -126,9 +139,38 @@ pub struct BridgesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnstt_dir: Option<String>,
     /// Preferred country for bridge selection (ISO 3166-1 alpha-2), used for
-    /// built-in/Moat bridge filtering when available.
+    /// built-in/Moat bridge filtering when available. `"auto"`/empty means unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+}
+
+/// Selected bridge/circumvention transport mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeTransport {
+    /// Automatically select (Smart Connect / direct+fallback as configured).
+    #[default]
+    Auto,
+    /// Use obfs4 bridges (lyrebird).
+    Obfs4,
+    /// Use Snowflake.
+    Snowflake,
+    /// Use WebTunnel (lyrebird).
+    Webtunnel,
+    /// Use meek/meek_lite (lyrebird).
+    Meek,
+    /// Use dnstt.
+    Dnstt,
+    /// Use user-provided custom bridge lines.
+    Custom,
+}
+
+fn default_smart_connect() -> bool {
+    true
+}
+
+fn default_smart_connect_timeout_secs() -> u64 {
+    30
 }
 
 fn default_lyrebird_transports() -> Vec<String> {
@@ -142,6 +184,9 @@ fn default_lyrebird_transports() -> Vec<String> {
 impl Default for BridgesConfig {
     fn default() -> Self {
         Self {
+            transport: BridgeTransport::Auto,
+            smart_connect: default_smart_connect(),
+            smart_connect_timeout_secs: default_smart_connect_timeout_secs(),
             enabled: false,
             lines: Vec::new(),
             transport_path: None,
@@ -170,6 +215,20 @@ impl BridgesConfig {
     /// True when bridges are enabled and at least one usable line is present.
     pub fn is_active(&self) -> bool {
         self.enabled && !self.normalized_lines().is_empty()
+    }
+
+    /// Normalized country code (`"auto"`/empty -> `None`).
+    pub fn normalized_country(&self) -> Option<String> {
+        self.country
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+            .map(|s| s.to_ascii_lowercase())
+    }
+
+    /// True when Smart Connect should orchestrate fallback attempts.
+    pub fn smart_connect_active(&self) -> bool {
+        self.smart_connect && self.transport == BridgeTransport::Auto
     }
 }
 

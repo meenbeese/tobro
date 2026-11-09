@@ -26,6 +26,7 @@ pub mod isolation;
 pub mod moat;
 pub mod proxy;
 pub mod pt;
+pub mod smart_connect;
 
 pub use moat::{
     BridgeSource, BuiltinBridgesExt, CircumventionBridges, CircumventionSetting,
@@ -37,6 +38,11 @@ pub use pt::{
     BridgeValidationResult, builtin_bridges, export_bridge_lines_redacted,
     export_bridge_lines_text, import_bridge_lines, is_known_protocol, parse_bridge_line,
     validate_bridge_lines,
+};
+pub use smart_connect::{
+    AttemptKind, AttemptResult, DEFAULT_TOTAL_BUDGET, PlannedAttempt, SmartConnectConfig,
+    SmartConnectEvent, SmartConnectOutcome, SmartConnectPlan, allocate_budgets,
+    run as run_smart_connect,
 };
 
 use std::path::Path;
