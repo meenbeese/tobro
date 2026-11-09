@@ -8,6 +8,7 @@
     "core:window:allow-close",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "notification:default"
+    "notification:default",
+    "global-shortcut:default"
   ]
 }

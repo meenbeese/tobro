@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, oneshot};
 
@@ -357,6 +358,15 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        toggle_connect_stop(app);
+                    }
+                })
+                .build(),
+        )
         .manage(AppState {
             latest: Mutex::new(None),
             commands: command_tx,
@@ -382,6 +392,7 @@ fn main() {
             status,
             open_external_url,
             set_capture_protection,
+            set_global_shortcut,
             daemon_connect,
             daemon_stop,
             daemon_new_identity,
@@ -678,6 +689,43 @@ fn dispatch_tray_command(app: &AppHandle, kind: IpcCommandKind) {
             let _ = rx.await;
         }
     });
+}
+
+fn toggle_connect_stop(app: &AppHandle) {
+    let status = app.state::<AppState>().get_status();
+    let active = matches!(
+        status.as_ref().map(|s| &s.state),
+        Some(
+            DaemonState::Starting
+                | DaemonState::Bootstrapping
+                | DaemonState::Connected
+                | DaemonState::Serving
+        )
+    );
+    if active {
+        dispatch_tray_command(app, IpcCommandKind::Stop);
+    } else {
+        dispatch_tray_command(app, IpcCommandKind::Connect);
+    }
+}
+
+#[tauri::command]
+fn set_global_shortcut(app: AppHandle, shortcut: Option<String>) -> Result<(), String> {
+    let manager = app.global_shortcut();
+    manager.unregister_all().map_err(|e| e.to_string())?;
+    let Some(shortcut) = shortcut
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let parsed: Shortcut = shortcut
+        .parse()
+        .map_err(|e| format!("Invalid shortcut: {e}"))?;
+    manager
+        .register(parsed)
+        .map_err(|e| format!("Could not register shortcut (it may be in use): {e}"))?;
+    Ok(())
 }
 
 async fn watch_daemon(

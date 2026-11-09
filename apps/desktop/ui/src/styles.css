@@ -395,12 +395,14 @@ input, select, textarea { font: inherit; }
   max-width: 320px;
 }
 .field-row label { font-size: 0.9rem; color: var(--muted); }
-.field-row select {
+.field-row select,
+.field-row input {
   color: var(--fg);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 10px;
+  font: inherit;
 }
 .settings-section .port-grid label,
 .settings-section > label {

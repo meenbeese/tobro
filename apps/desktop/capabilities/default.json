@@ -11,6 +11,7 @@
     "core:window:allow-set-focus",
     "core:tray:default",
     "core:menu:default",
-    "notification:default"
+    "notification:default",
+    "global-shortcut:default"
   ]
 }

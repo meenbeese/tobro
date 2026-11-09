@@ -6,10 +6,12 @@ import { About } from "./About";
 import { Settings } from "./Settings";
 import { initTheme } from "./theme";
 import { initCaptureProtection } from "./captureProtection";
+import { initGlobalShortcut } from "./globalShortcut";
 import "./styles.css";
 
 initTheme();
 initCaptureProtection();
+initGlobalShortcut();
 
 const windowKind = new URLSearchParams(window.location.search).get("window");
 

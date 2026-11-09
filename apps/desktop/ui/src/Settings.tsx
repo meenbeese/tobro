@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
 import { readThemePreference, setThemePreference, type ThemePreference } from "./theme";
 import { readCaptureProtectionEnabled, setCaptureProtectionEnabled } from "./captureProtection";
+import { readGlobalShortcut, applyGlobalShortcut } from "./globalShortcut";
 
 const POWER_USER_KEY = "tobro.powerUser.enabled";
 
@@ -160,6 +161,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [tab, setTab] = useState<SettingsTab>("general");
   const [theme, setTheme] = useState<ThemePreference>(readThemePreference);
   const [captureProtection, setCaptureProtection] = useState(readCaptureProtectionEnabled);
+  const [globalShortcut, setGlobalShortcut] = useState(readGlobalShortcut);
+  const [globalShortcutBusy, setGlobalShortcutBusy] = useState(false);
+  const [globalShortcutMessage, setGlobalShortcutMessage] = useState<string>("");
+  const [globalShortcutError, setGlobalShortcutError] = useState<string>("");
   const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
     general: null,
     node: null,
@@ -296,6 +301,25 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     setCaptureProtection(enabled);
     await setCaptureProtectionEnabled(enabled);
     log(`window capture protection ${enabled ? "enabled (best-effort)" : "disabled"}`);
+  }
+
+  async function onSaveGlobalShortcut(e?: FormEvent) {
+    e?.preventDefault();
+    setGlobalShortcutBusy(true);
+    setGlobalShortcutError("");
+    setGlobalShortcutMessage("");
+    try {
+      await applyGlobalShortcut(globalShortcut);
+      const v = globalShortcut.trim();
+      setGlobalShortcutMessage(v ? `Global shortcut set to ${v}.` : "Global shortcut disabled (default).");
+      log(v ? `global shortcut set: ${v}` : "global shortcut disabled");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setGlobalShortcutError(msg);
+      log(`global shortcut: ${msg}`, "error");
+    } finally {
+      setGlobalShortcutBusy(false);
+    }
   }
 
   function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>) {
@@ -690,6 +714,50 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   or out-of-band recording). Turning it off makes window contents easier to capture.
                 </p>
               </div>
+
+              <form className="settings-section" onSubmit={(e) => void onSaveGlobalShortcut(e)}>
+                <h3>Global shortcut</h3>
+                <p className="muted">
+                  Configurable system-wide shortcut to <strong>toggle the Tor connection</strong> (connect/stop).{" "}
+                  <strong>Default: off</strong>. Leave empty and save to disable. Example:{" "}
+                  <code>CommandOrControl+Shift+T</code> (macOS/Windows/Linux) or <code>Cmd+Shift+T</code> on macOS.
+                  Registration can fail if the shortcut is invalid or already used by another app.
+                </p>
+                <div className="field-row">
+                  <label htmlFor="settings-global-shortcut">Shortcut</label>
+                  <input
+                    id="settings-global-shortcut"
+                    type="text"
+                    value={globalShortcut}
+                    onChange={(e) => {
+                      setGlobalShortcut(e.target.value);
+                      setGlobalShortcutMessage("");
+                      setGlobalShortcutError("");
+                    }}
+                    placeholder="Disabled (e.g. CommandOrControl+Shift+T)"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+                {globalShortcutError ? <p className="error">{globalShortcutError}</p> : null}
+                {globalShortcutMessage ? <p className="muted">{globalShortcutMessage}</p> : null}
+                <div className="actions">
+                  <button className="primary" type="submit" disabled={globalShortcutBusy}>
+                    {globalShortcutBusy ? "Saving…" : "Save shortcut"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={globalShortcutBusy}
+                    onClick={() => {
+                      setGlobalShortcut("");
+                      setGlobalShortcutMessage("");
+                      setGlobalShortcutError("");
+                    }}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </form>
 
               <form className="settings-section port-editor" onSubmit={onSavePorts}>
                 <h3>Proxy / listener settings</h3>
