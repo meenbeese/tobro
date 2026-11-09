@@ -23,9 +23,15 @@
 pub mod adapter;
 pub mod custom_proxy;
 pub mod isolation;
+pub mod moat;
 pub mod proxy;
 pub mod pt;
 
+pub use moat::{
+    BridgeSource, BuiltinBridgesExt, CircumventionBridges, CircumventionSetting,
+    CircumventionSettingsResponse, DEFAULT_MOAT_BASE_URL, MoatClient, MoatError, ResolvedBridges,
+    fetch_bridges_with_fallback,
+};
 pub use pt::{
     BUILTIN_BRIDGES_JSON, BridgeDistribution, BridgeLineValidation, BridgeSet, BridgeSettings,
     BridgeValidationResult, builtin_bridges, export_bridge_lines_redacted,

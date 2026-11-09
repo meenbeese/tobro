@@ -106,6 +106,24 @@ enum BridgesCommand {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Fetch bridges via Moat with country/transport selection and fallback (local network call).
+    Moat {
+        /// Country code (ISO 3166-1 alpha-2), e.g. `de`, `cn`. Optional.
+        #[arg(long)]
+        country: Option<String>,
+        /// Preferred transport/type filter (e.g. obfs4, snowflake, webtunnel).
+        #[arg(long)]
+        transport: Option<String>,
+        /// Moat base URL (defaults to Tor Project Moat). Useful for testing/mirrors.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// Local built-in bridge distribution JSON file for fallback.
+        #[arg(long, value_name = "PATH")]
+        builtin: Option<PathBuf>,
+        /// Output only bridge lines as text (default: JSON summary including source/fallback).
+        #[arg(long)]
+        lines_only: bool,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +156,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 country,
             } => {
                 return bridges_builtin(file.as_deref(), transport.as_deref(), country.as_deref());
+            }
+            BridgesCommand::Moat {
+                country,
+                transport,
+                endpoint,
+                builtin,
+                lines_only,
+            } => {
+                return bridges_moat(
+                    country.as_deref(),
+                    transport.as_deref(),
+                    endpoint.as_deref(),
+                    builtin.as_deref(),
+                    *lines_only,
+                )
+                .await;
             }
             BridgesCommand::Export { .. } | BridgesCommand::Apply { .. } => {}
         }
@@ -207,7 +241,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             BridgesCommand::Validate { .. }
             | BridgesCommand::Import { .. }
-            | BridgesCommand::Builtin { .. } => unreachable!("handled above"),
+            | BridgesCommand::Builtin { .. }
+            | BridgesCommand::Moat { .. } => unreachable!("handled above"),
         },
         Command::Watch => watch(&mut client).await?,
     }
@@ -342,6 +377,53 @@ async fn bridges_apply(
         )
         .await?;
     print_json(&result)?;
+    Ok(())
+}
+
+async fn bridges_moat(
+    country: Option<&str>,
+    transport: Option<&str>,
+    endpoint: Option<&str>,
+    builtin: Option<&std::path::Path>,
+    lines_only: bool,
+) -> anyhow::Result<()> {
+    use tobro_tor::moat::{self, MoatClient};
+
+    let client = match endpoint {
+        Some(url) => MoatClient::with_base_url(url).map_err(|e| anyhow::anyhow!(e))?,
+        None => MoatClient::new().map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let local_builtin = if let Some(path) = builtin {
+        Some(tobro_tor::BridgeDistribution::load(path).map_err(|e| anyhow::anyhow!(e))?)
+    } else {
+        tobro_tor::builtin_bridges().ok()
+    };
+    let transports = transport.map(|t| vec![t.to_owned()]);
+    let resolved = moat::fetch_bridges_with_fallback(
+        &client,
+        country,
+        transports.as_deref(),
+        local_builtin.as_ref(),
+    )
+    .await;
+
+    if lines_only {
+        print!("{}", tobro_tor::export_bridge_lines_text(&resolved.lines));
+        return Ok(());
+    }
+    let out = json!({
+        "ok": !resolved.lines.is_empty(),
+        "source": resolved.source,
+        "country": resolved.country,
+        "transport": resolved.transport,
+        "count": resolved.lines.len(),
+        "note": resolved.note,
+        "lines": resolved.lines,
+    });
+    print_json(&out)?;
+    if resolved.lines.is_empty() {
+        anyhow::bail!("no bridges resolved (Moat unavailable and no matching local built-ins)");
+    }
     Ok(())
 }
 
