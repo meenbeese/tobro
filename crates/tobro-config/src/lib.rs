@@ -62,6 +62,8 @@ pub struct Config {
     pub network: NetworkConfig,
     /// Stream isolation and behavior settings (F-42/F-43).
     pub stream: StreamConfig,
+    /// Bridge and pluggable transport settings (M3).
+    pub bridges: BridgesConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -74,8 +76,74 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             network: NetworkConfig::default(),
             stream: StreamConfig::default(),
+            bridges: BridgesConfig::default(),
             logging: LoggingConfig::default(),
         }
+    }
+}
+
+/// Bridge and pluggable transport configuration (M3).
+///
+/// Supports Tor/Arti bridge lines and external PT clients (lyrebird for
+/// obfs4, meek_lite, webtunnel). Bridge material may be sensitive; avoid
+/// logging full lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BridgesConfig {
+    /// Enable bridge/PT usage. When false, `lines` are ignored.
+    pub enabled: bool,
+    /// Bridge lines in Tor bridge format (e.g. `obfs4 ...`, `webtunnel ...`,
+    /// or `Bridge <transport> ...`).
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// Preferred transport binary name/path override. When unset, tobro searches
+    /// for known PT binaries (lyrebird) in sidecar/app locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_path: Option<String>,
+    /// Extra directory to search for PT binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_dir: Option<String>,
+    /// Request lyrebird-managed transports for these protocols when bridge lines
+    /// use them and no explicit transport config is provided. Defaults to lyrebird
+    /// protocols supported by this build.
+    #[serde(default = "default_lyrebird_transports")]
+    pub lyrebird_transports: Vec<String>,
+}
+
+fn default_lyrebird_transports() -> Vec<String> {
+    vec![
+        "obfs4".to_owned(),
+        "meek_lite".to_owned(),
+        "webtunnel".to_owned(),
+    ]
+}
+
+impl Default for BridgesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lines: Vec::new(),
+            transport_path: None,
+            transport_dir: None,
+            lyrebird_transports: default_lyrebird_transports(),
+        }
+    }
+}
+
+impl BridgesConfig {
+    /// Normalized, non-empty bridge lines. Comments/blank lines removed.
+    pub fn normalized_lines(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// True when bridges are enabled and at least one usable line is present.
+    pub fn is_active(&self) -> bool {
+        self.enabled && !self.normalized_lines().is_empty()
     }
 }
 
@@ -350,6 +418,25 @@ impl Config {
                 self.network.exit_country.as_deref().unwrap_or("")
             )));
         }
+        if self.bridges.enabled && self.bridges.normalized_lines().is_empty() {
+            return Err(ConfigError::Invalid(
+                "bridges.enabled is true but bridges.lines has no usable bridge lines (add bridge lines or disable bridges)".to_owned(),
+            ));
+        }
+        for (i, line) in self.bridges.lines.iter().enumerate() {
+            if line.contains('\0') || line.contains('\n') || line.contains('\r') {
+                return Err(ConfigError::Invalid(format!(
+                    "bridges.lines[{i}] must be a single line"
+                )));
+            }
+        }
+        if let Some(p) = &self.bridges.transport_path
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "bridges.transport_path must not be empty when set".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -585,9 +672,9 @@ pub fn unsupported_knob_error(path: &str) -> Option<String> {
                 "C Tor-style node restriction lists (entry/exit/exclude/strict nodes) are not exposed by the pinned Arti 2.8/arti-client 0.48 APIs used by tobro. The supported subset is currently none for these knobs; unsupported options remain hidden.",
             )
         }
-        "bridges" | "bridges.enabled" | "bridges.lines" | "transports" => (
+        "transports" => (
             path,
-            "bridge/pluggable-transport configuration is not exposed yet (M3 planned).",
+            "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path, transport_dir, lyrebird_transports).",
         ),
         "onion_services" | "onion_services.client_auth" => (
             path,
@@ -843,6 +930,7 @@ level = "info"
             "proxy": cfg.proxy,
             "network": patch["network"].clone(),
             "stream": cfg.stream,
+            "bridges": cfg.bridges,
             "logging": cfg.logging,
         });
         cfg = serde_json::from_value(merged)?;
@@ -969,6 +1057,60 @@ level = "info"
         config.save(&path)?;
         let loaded = Config::load(&path)?;
         assert_eq!(loaded.stream, config.stream);
+        Ok(())
+    }
+
+    #[test]
+    fn bridges_config_defaults_and_validation() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = Config::default();
+        assert!(!cfg.bridges.enabled);
+        assert!(!cfg.bridges.is_active());
+        assert!(cfg.bridges.lyrebird_transports.iter().any(|t| t == "obfs4"));
+        assert!(
+            cfg.bridges
+                .lyrebird_transports
+                .iter()
+                .any(|t| t == "webtunnel")
+        );
+        assert!(
+            cfg.bridges
+                .lyrebird_transports
+                .iter()
+                .any(|t| t == "meek_lite")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridges_enabled_requires_lines() {
+        let mut cfg = Config::default();
+        cfg.bridges.enabled = true;
+        let err = cfg.validate().expect_err("must reject");
+        match err {
+            ConfigError::Invalid(msg) => assert!(msg.contains("bridges.enabled"), "{msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridges_round_trip_in_toml() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.bridges.enabled = true;
+        config.bridges.lines = vec![
+            "obfs4 192.0.2.1:443 316E643333645F6D79216558614D3931657A5F5F cert=abcd iat-mode=0".to_owned(),
+            "Bridge webtunnel 192.0.2.2:443 316E643333645F6D79216558614D3931657A5F5F url=https://example.com/ ver=0.0.1".to_owned(),
+        ];
+        config.bridges.transport_path = Some("/usr/bin/lyrebird".to_owned());
+        config.save(&path)?;
+        let loaded = Config::load(&path)?;
+        assert!(loaded.bridges.enabled);
+        assert_eq!(loaded.bridges.normalized_lines().len(), 2);
+        assert_eq!(
+            loaded.bridges.transport_path.as_deref(),
+            Some("/usr/bin/lyrebird")
+        );
         Ok(())
     }
 }

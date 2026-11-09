@@ -123,6 +123,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         .await
         .with_context(|| format!("failed to bind IPC at {}", socket_path.display()))?;
 
+    let bridge_settings = resolve_bridge_settings(&config.bridges, Some(&state_dir));
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
@@ -152,6 +153,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
                     }
                 },
             },
+            bridges: bridge_settings,
         }));
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),
@@ -221,5 +223,90 @@ fn absolute(path: PathBuf, cwd: &Path) -> PathBuf {
         path
     } else {
         cwd.join(path)
+    }
+}
+
+pub(crate) fn resolve_bridge_settings(
+    cfg: &tobro_config::BridgesConfig,
+    state_dir: Option<&Path>,
+) -> tobro_tor::BridgeSettings {
+    use std::ffi::OsString;
+
+    let normalized_lines = cfg.normalized_lines();
+    if !cfg.enabled || normalized_lines.is_empty() {
+        return tobro_tor::BridgeSettings {
+            enabled: cfg.enabled,
+            lines: cfg.lines.clone(),
+            lyrebird_protocols: cfg.lyrebird_transports.clone(),
+            lyrebird_path: None,
+        };
+    }
+
+    let protocols: std::collections::HashSet<String> = normalized_lines
+        .iter()
+        .filter_map(|l| tobro_tor::pt::bridge_line_protocol(l))
+        .collect();
+    let lyrebird_protos: std::collections::HashSet<String> = cfg
+        .lyrebird_transports
+        .iter()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            if s == "meek" {
+                "meek_lite".to_owned()
+            } else {
+                s
+            }
+        })
+        .collect();
+    let needs_lyrebird = protocols.iter().any(|p| lyrebird_protos.contains(p));
+
+    let lyrebird_path = if needs_lyrebird {
+        if let Some(p) = &cfg.transport_path {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                Some(p)
+            } else {
+                tracing::warn!(path = %p.display(), "bridges.transport_path does not exist; connect will fail until fixed");
+                None
+            }
+        } else {
+            let mut search_dirs = Vec::new();
+            if let Some(d) = &cfg.transport_dir {
+                search_dirs.push(PathBuf::from(d));
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    search_dirs.push(dir.to_path_buf());
+                    search_dirs.push(dir.join("binaries"));
+                    search_dirs.push(dir.join("../Resources"));
+                    search_dirs.push(dir.join("../Resources/binaries"));
+                }
+            }
+            if let Some(sd) = state_dir {
+                search_dirs.push(sd.join("pt"));
+                search_dirs.push(sd.join("sidecars"));
+            }
+            let opts = crate::pt_supervisor::LocateOptions {
+                explicit_path: None,
+                search_dirs,
+                names: vec![OsString::from("lyrebird"), OsString::from("lyrebird.exe")],
+            };
+            match crate::pt_supervisor::locate(&opts) {
+                Ok(found) => Some(found.path),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), protocols = ?protocols, "bridges enabled but lyrebird was not found; install lyrebird or set bridges.transport_path/transport_dir");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    tobro_tor::BridgeSettings {
+        enabled: true,
+        lines: cfg.lines.clone(),
+        lyrebird_path,
+        lyrebird_protocols: cfg.lyrebird_transports.clone(),
     }
 }

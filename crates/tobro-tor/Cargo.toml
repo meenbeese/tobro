@@ -24,10 +24,13 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
+default = ["pt-client"]
 # Enables the pluggable-transport API surface
-# (`config::pt::TransportConfig`, `BridgesConfig::transports`). Off by
-# default; the `pt_api_probe` example exercises it.
+# (`config::pt::TransportConfig`, `BridgesConfig::transports`).
 pt-client = ["arti-client/pt-client"]
 
 [lints]

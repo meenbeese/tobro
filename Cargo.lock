@@ -7267,6 +7267,7 @@ dependencies = [
  "hickory-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tor-config",

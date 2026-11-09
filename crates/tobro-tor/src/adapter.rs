@@ -17,7 +17,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 
-use crate::{BootstrapEvent, Tor};
+use crate::{BootstrapEvent, BridgeSettings, Tor};
 
 /// Stream isolation policy (F-42/F-43).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -96,6 +96,9 @@ pub struct ListenerConfig {
     /// Default network stream preferences (M2: exit country, IPv6).
     #[serde(default)]
     pub network_prefs: NetworkStreamPrefs,
+    /// Bridge/pluggable transport settings (M3: lyrebird obfs4/meek_lite/webtunnel).
+    #[serde(default)]
+    pub bridges: BridgeSettings,
 }
 
 impl Default for ListenerConfig {
@@ -107,6 +110,7 @@ impl Default for ListenerConfig {
             bind_all_interfaces: false,
             stream_isolation: StreamIsolationPolicy::default(),
             network_prefs: NetworkStreamPrefs::default(),
+            bridges: BridgeSettings::default(),
         }
     }
 }
@@ -278,7 +282,7 @@ impl PreparedService {
         mut shutdown: tokio::sync::oneshot::Receiver<()>,
     ) -> anyhow::Result<()> {
         let control = self.control.clone();
-        let serve = crate::serve(
+        let serve = crate::serve_with_bridges(
             &self.state_dir,
             &self.cache_dir,
             self.listeners.socks_port,
@@ -286,6 +290,7 @@ impl PreparedService {
             self.listeners.bind_all_interfaces,
             self.listeners.stream_isolation,
             self.listeners.network_prefs.clone(),
+            &self.listeners.bridges,
         );
         tokio::pin!(serve);
 
@@ -334,7 +339,7 @@ pub async fn bootstrap_and_prepare(
         detail: "starting".to_owned(),
     });
 
-    let observer = Tor::create(&state_dir, &cache_dir)
+    let observer = Tor::create_with_bridges(&state_dir, &cache_dir, &listeners.bridges)
         .await
         .context("could not create the Arti client")?;
 

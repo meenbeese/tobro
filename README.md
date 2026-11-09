@@ -14,7 +14,25 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 - **Scope:** connect/disconnect, bridges and pluggable transports, proxy services, onion services, Kindness Mode, tray/autostart, CLI.
 - **Non-goals:** mobile, Tor relay/exit mode, raw `torrc` compatibility, bundled browser.
 
-### System overview
+## Core state machine
+
+```text
+        ┌──────────┐   start   ┌───────────┐  bootstrap  ┌───────────────┐
+        │ Stopped  ├──────────►│ Starting  ├────────────►│ Bootstrapping │
+        └────▲─────┘           └─────┬─────┘             └──────┬────────┘
+             │                       │ error                    │ 100%
+             │ stop                  ▼                          ▼
+        ┌────┴─────┐           ┌───────────┐             ┌────────────┐
+        │ Stopping │◄──────────┤  Error    │             │  Connected │
+        └──────────┘   stop    └───────────┘             └─────┬──────┘
+                                                               │ network loss
+                                                               ▼
+                                                        ┌─────────────┐
+                                                        │ Reconnecting│
+                                                        └─────────────┘
+```
+
+## System overview
 
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
@@ -48,7 +66,7 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## CLI
+## CLI commands
 
 ```sh
 # terminal 1: start the control plane (loads config/store, idle until connect)

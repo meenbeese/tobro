@@ -24,6 +24,9 @@ pub mod adapter;
 pub mod custom_proxy;
 pub mod isolation;
 pub mod proxy;
+pub mod pt;
+
+pub use pt::BridgeSettings;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -114,7 +117,16 @@ impl std::fmt::Debug for Tor {
 impl Tor {
     /// Create an unbootstrapped client with tobro-controlled state directories.
     pub async fn create(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<Self> {
-        let config = client_config(state_dir, cache_dir)?;
+        Self::create_with_bridges(state_dir, cache_dir, &BridgeSettings::default()).await
+    }
+
+    /// Create an unbootstrapped client with bridge/PT settings (M3).
+    pub async fn create_with_bridges(
+        state_dir: &Path,
+        cache_dir: &Path,
+        bridges: &BridgeSettings,
+    ) -> anyhow::Result<Self> {
+        let config = client_config(state_dir, cache_dir, bridges)?;
         let client = Client::builder()
             .config(config)
             .bootstrap_behavior(BootstrapBehavior::Manual)
@@ -248,7 +260,32 @@ pub async fn serve(
     stream_isolation: adapter::StreamIsolationPolicy,
     network_prefs: adapter::NetworkStreamPrefs,
 ) -> anyhow::Result<()> {
-    let config = client_config(state_dir, cache_dir)?;
+    serve_with_bridges(
+        state_dir,
+        cache_dir,
+        socks_port,
+        dns_port,
+        bind_all_interfaces,
+        stream_isolation,
+        network_prefs,
+        &BridgeSettings::default(),
+    )
+    .await
+}
+
+/// Like [`serve`] but applies bridge/PT settings (M3, lyrebird: obfs4/meek_lite/webtunnel).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_bridges(
+    state_dir: &Path,
+    cache_dir: &Path,
+    socks_port: u16,
+    dns_port: u16,
+    bind_all_interfaces: bool,
+    stream_isolation: adapter::StreamIsolationPolicy,
+    network_prefs: adapter::NetworkStreamPrefs,
+    bridges: &BridgeSettings,
+) -> anyhow::Result<()> {
+    let config = client_config(state_dir, cache_dir, bridges)?;
     let needs_custom = stream_isolation.needs_frontend() || network_prefs.is_active();
 
     if needs_custom {
@@ -419,13 +456,20 @@ fn listen_for_port(port: u16, bind_all_interfaces: bool) -> anyhow::Result<Liste
     Ok(listen)
 }
 
-fn client_config(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<TorClientConfig> {
+fn client_config(
+    state_dir: &Path,
+    cache_dir: &Path,
+    bridges: &BridgeSettings,
+) -> anyhow::Result<TorClientConfig> {
     // Ensure private permissions before Arti/mistrust checks. This also repairs
     // existing directories created with overly permissive modes (e.g. 0755).
     ensure_private_dir(state_dir)?;
     ensure_private_dir(cache_dir)?;
 
-    let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir).build()?;
+    let mut builder = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+    pt::apply_to_builder(&mut builder, bridges)
+        .context("invalid bridge/pluggable transport configuration")?;
+    let config = builder.build()?;
 
     // Arti refuses state/cache directories that are accessible to other users.
     // `make_directory` creates them with 0700 (Unix) and verifies the result.

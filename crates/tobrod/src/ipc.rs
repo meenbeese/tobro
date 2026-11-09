@@ -385,6 +385,7 @@ fn config_apply_patch(
                 }
             },
         },
+        bridges: crate::resolve_bridge_settings(&next.bridges, None),
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -527,6 +528,7 @@ impl DaemonControl for SupervisorControl {
                         tobro_config::IpVersionPreference::Ipv6Only => tobro_tor::adapter::IpVersionPref::Ipv6Only,
                     },
                 },
+                bridges: crate::resolve_bridge_settings(&config.bridges, None),
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
