@@ -17,7 +17,15 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::{mpsc, oneshot};
 
-use tobro_ipc::{Client, DaemonStatus, Message, methods, socket_path};
+use tobro_ipc::{Client, DaemonState, DaemonStatus, Message, methods, socket_path};
+
+#[derive(Clone)]
+struct TrayState {
+    status_item: MenuItem<tauri::Wry>,
+    connect_item: MenuItem<tauri::Wry>,
+    stop_item: MenuItem<tauri::Wry>,
+    new_identity_item: MenuItem<tauri::Wry>,
+}
 
 #[derive(Debug)]
 enum IpcCommand {
@@ -384,28 +392,87 @@ fn main() {
     }
 }
 
+fn tray_status_text(reachable: bool, status: Option<&DaemonStatus>) -> String {
+    if !reachable {
+        return "Status: Daemon unavailable".to_owned();
+    }
+    let Some(status) = status else {
+        return "Status: Waiting…".to_owned();
+    };
+    let pct = if status.bootstrap.percent > 0 {
+        format!(" ({}%)", status.bootstrap.percent)
+    } else {
+        String::new()
+    };
+    let label = match status.state {
+        DaemonState::Starting => "Starting",
+        DaemonState::Bootstrapping => "Bootstrapping",
+        DaemonState::Connected => "Connected",
+        DaemonState::Serving => "Serving",
+        DaemonState::Stopping => "Stopping",
+        DaemonState::Stopped => "Stopped",
+        DaemonState::Error => "Error",
+    };
+    format!("Status: {label}{pct}")
+}
+
+fn update_tray_menu(handle: &AppHandle, reachable: bool, status: Option<&DaemonStatus>) {
+    let Some(tray) = handle.try_state::<TrayState>() else {
+        return;
+    };
+    let _ = tray.status_item.set_text(tray_status_text(reachable, status));
+    let state = status.map(|s| &s.state);
+    let active = matches!(
+        state,
+        Some(DaemonState::Starting | DaemonState::Bootstrapping | DaemonState::Connected | DaemonState::Serving)
+    );
+    let stopping = matches!(state, Some(DaemonState::Stopping));
+    let can_connect = !active && !stopping;
+    let can_stop = reachable && active && !stopping;
+    let can_new_identity = reachable
+        && matches!(state, Some(DaemonState::Connected | DaemonState::Serving));
+    let _ = tray.connect_item.set_enabled(can_connect);
+    let _ = tray.stop_item.set_enabled(can_stop);
+    let _ = tray.new_identity_item.set_enabled(can_new_identity);
+    if let Some(t) = handle.tray_by_id("main-tray") {
+        let _ = t.set_tooltip(Some(&tray_status_text(reachable, status)));
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show tobro", true, None::<&str>)?;
-    let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
-    let connect = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &hide, &connect, &stop, &sep, &quit])?;
+    let status_item = MenuItem::with_id(app, "status", "Status: Starting…", false, None::<&str>)?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let connect_item = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+    let stop_item = MenuItem::with_id(app, "stop", "Stop", false, None::<&str>)?;
+    let new_identity_item = MenuItem::with_id(app, "new_identity", "New identity", false, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let open_item = MenuItem::with_id(app, "open", "Open window", true, None::<&str>)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &status_item,
+            &sep1,
+            &connect_item,
+            &stop_item,
+            &new_identity_item,
+            &sep2,
+            &open_item,
+            &sep3,
+            &quit_item,
+        ],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
         .tooltip("tobro")
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main_window(app),
-            "hide" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
-            }
+            "open" => show_main_window(app),
             "connect" => dispatch_tray_command(app, IpcCommandKind::Connect),
             "stop" => dispatch_tray_command(app, IpcCommandKind::Stop),
+            "new_identity" => dispatch_tray_command(app, IpcCommandKind::NewIdentity),
             "quit" => {
                 app.exit(0);
             }
@@ -427,6 +494,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     }
 
     builder.build(app)?;
+    app.manage(TrayState {
+        status_item,
+        connect_item,
+        stop_item,
+        new_identity_item,
+    });
+    update_tray_menu(app, false, None);
     Ok(())
 }
 
@@ -442,6 +516,7 @@ fn show_main_window(app: &AppHandle) {
 enum IpcCommandKind {
     Connect,
     Stop,
+    NewIdentity,
 }
 
 fn dispatch_tray_command(app: &AppHandle, kind: IpcCommandKind) {
@@ -451,6 +526,7 @@ fn dispatch_tray_command(app: &AppHandle, kind: IpcCommandKind) {
         let cmd = match kind {
             IpcCommandKind::Connect => IpcCommand::Connect(tx),
             IpcCommandKind::Stop => IpcCommand::Stop(tx),
+            IpcCommandKind::NewIdentity => IpcCommand::NewIdentity(tx),
         };
         if sender.send(cmd).await.is_ok() {
             let _ = rx.await;
@@ -740,12 +816,15 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
 async fn refresh_status(handle: &AppHandle, client: &mut Client) {
     match client.call(methods::STATUS, None).await {
         Ok(value) => {
-            if let Ok(status) = serde_json::from_value::<DaemonStatus>(value.clone()) {
+            let parsed = serde_json::from_value::<DaemonStatus>(value.clone()).ok();
+            update_tray_menu(handle, true, parsed.as_ref());
+            if let Some(status) = parsed {
                 handle.state::<AppState>().set_status(status);
             }
             emit(handle, "status", value);
         }
         Err(error) => {
+            update_tray_menu(handle, false, None);
             emit(handle, "status", Value::Null);
             emit(handle, "unreachable", json!({ "error": error.to_string() }));
         }
