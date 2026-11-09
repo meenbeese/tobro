@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { GearSix, Info } from "@phosphor-icons/react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import appIconUrl from "./assets/icon.svg";
@@ -441,11 +442,35 @@ export default function App() {
       ) : null}
       <main className={`app${locked ? " app-locked" : ""}`} aria-hidden={locked || undefined}>
       <header className="hero">
-        <div className="brand">
-          <img src={appIconUrl} alt="" className="app-icon" width={44} height={44} />
-          <div>
-            <h1>Tobro</h1>
-            <p className="muted">{daemonInfo || "Connecting to local daemon…"}</p>
+        <div className="hero-top">
+          <div className="brand">
+            <img src={appIconUrl} alt="" className="app-icon" width={44} height={44} />
+            <div>
+              <h1>Tobro</h1>
+              <p className="muted">{daemonInfo || "Connecting to local daemon…"}</p>
+            </div>
+          </div>
+          <div className="hero-utilities" aria-label="Settings and about">
+            <button
+              type="button"
+              className="toolbar-icon-button"
+              onClick={() => void openSettings()}
+              aria-haspopup="dialog"
+              aria-label="Settings"
+              title="Settings"
+            >
+              <GearSix size={20} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="toolbar-icon-button"
+              onClick={() => void openAbout()}
+              aria-haspopup="dialog"
+              aria-label="About"
+              title="About"
+            >
+              <Info size={20} aria-hidden="true" />
+            </button>
           </div>
         </div>
         <nav className="toolbar" aria-label="App actions">
@@ -457,12 +482,6 @@ export default function App() {
           </button>
           <button type="button" onClick={() => void openLogs()} aria-haspopup="dialog" title="Logs">
             Logs
-          </button>
-          <button type="button" onClick={() => void openSettings()} aria-haspopup="dialog" title="Settings">
-            Settings
-          </button>
-          <button type="button" onClick={() => void openAbout()} aria-haspopup="dialog" title="About">
-            About
           </button>
         </nav>
       </header>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { redactLogText } from "./logRedaction";
 
 const PREF_REDACT = "tobro.logViewer.redact";
@@ -88,6 +88,12 @@ export function LogViewer({
   const [wrapLines, setWrapLines] = useState(() => readBoolPref(PREF_WRAP, true));
   const [message, setMessage] = useState<string>("");
   const [error, setError] = useState<string>("");
+  const [pinnedToBottom, setPinnedToBottom] = useState(true);
+  const [hasNewWhilePaused, setHasNewWhilePaused] = useState(false);
+  const logListRef = useRef<HTMLOListElement | null>(null);
+  const lastSeenCountRef = useRef(0);
+  const programmaticScrollRef = useRef(false);
+  const isOpen = collapsible ? open : true;
 
   useEffect(() => {
     try {
@@ -123,6 +129,58 @@ export function LogViewer({
     [filtered, applyRedaction],
   );
 
+  function isNearBottom(el: HTMLElement, threshold = 32): boolean {
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+  }
+
+  function scrollToLatest(behavior: ScrollBehavior = "auto") {
+    const el = logListRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    setPinnedToBottom(true);
+    setHasNewWhilePaused(false);
+    lastSeenCountRef.current = displayEntries.length;
+    window.requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }
+
+  function onLogScroll() {
+    const el = logListRef.current;
+    if (!el || programmaticScrollRef.current) return;
+    const near = isNearBottom(el);
+    setPinnedToBottom(near);
+    if (near) {
+      setHasNewWhilePaused(false);
+      lastSeenCountRef.current = displayEntries.length;
+    }
+  }
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const el = logListRef.current;
+    if (!el) return;
+    const count = displayEntries.length;
+    if (pinnedToBottom) {
+      if (count !== lastSeenCountRef.current || el.scrollHeight > el.clientHeight) {
+        scrollToLatest("auto");
+      } else {
+        lastSeenCountRef.current = count;
+      }
+      return;
+    }
+    if (count > lastSeenCountRef.current) {
+      setHasNewWhilePaused(true);
+    }
+  }, [displayEntries.length, isOpen, pinnedToBottom]);
+
+  useEffect(() => {
+    if (isOpen && pinnedToBottom) {
+      scrollToLatest("auto");
+    }
+  }, [isOpen]);
+
   async function onCopy() {
     setError("");
     setMessage("");
@@ -152,8 +210,6 @@ export function LogViewer({
     setError("");
     onClear?.();
   }
-
-  const isOpen = collapsible ? open : true;
 
   return (
     <section className={`card logs ${isOpen ? "open" : "collapsed"} ${className ?? ""}`.trim()}>
@@ -239,7 +295,20 @@ export function LogViewer({
           {message ? <p className="muted log-message">{message}</p> : null}
           {error ? <p className="error log-message">{error}</p> : null}
 
-          <ol className={`log-list ${wrapLines ? "wrap" : "nowrap"}`} aria-label="Event log">
+          {!pinnedToBottom && displayEntries.length > 0 ? (
+            <div className="log-jump">
+              <button type="button" onClick={() => scrollToLatest("smooth")}>
+                {hasNewWhilePaused ? "Jump to latest (new)" : "Jump to latest"}
+              </button>
+            </div>
+          ) : null}
+
+          <ol
+            ref={logListRef}
+            onScroll={onLogScroll}
+            className={`log-list ${wrapLines ? "wrap" : "nowrap"}`}
+            aria-label="Event log"
+          >
             {displayEntries.length === 0 ? (
               <li className="muted log-empty">
                 {entries.length === 0
@@ -249,8 +318,8 @@ export function LogViewer({
             ) : null}
             {displayEntries.map((entry) => (
               <li key={entry.id} className={`log-line ${entry.level === "error" ? "error" : ""}`}>
-                <span className="log-ts">{formatStamp(entry.ts)}</span>
-                <span className="log-level">[{entry.level}]</span>
+                <span className="log-ts" title={entry.ts}>{formatStamp(entry.ts)}</span>
+                <span className={`log-level ${entry.level === "error" ? "error" : "info"}`}>[{entry.level}]</span>
                 <span className={`log-source ${entry.source ? "" : "empty"}`}>{entry.source ?? ""}</span>
                 <span className="log-text">{entry.displayText}</span>
               </li>

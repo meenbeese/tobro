@@ -6,20 +6,6 @@ import { readGlobalShortcut, applyGlobalShortcut } from "./globalShortcut";
 
 const POWER_USER_KEY = "tobro.powerUser.enabled";
 
-const HELP_LINKS = [
-  { label: "Tor Project support & docs", url: "https://support.torproject.org/" },
-  { label: "Arti (Tor in Rust)", url: "https://gitlab.torproject.org/tpo/core/arti" },
-  { label: "Tauri documentation", url: "https://tauri.app/" },
-];
-
-async function openExternal(url: string) {
-  try {
-    await invoke("open_external_url", { url });
-  } catch {
-    // ignore
-  }
-}
-
 function readPowerUser(): boolean {
   try {
     return localStorage.getItem(POWER_USER_KEY) === "true";
@@ -348,16 +334,19 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
-  async function loadConfigState() {
+  async function loadConfigState(): Promise<unknown | null> {
     try {
       const result = await invoke<ConfigResponse>("daemon_get_config");
-      setCurrentConfig(result.config ?? null);
+      const cfg = result.config ?? null;
+      setCurrentConfig(cfg);
       if (typeof result.path === "string") setConfigPath(result.path);
-      applyStreamFromConfig(result.config ?? null);
-      applyNetworkFromConfig(result.config ?? null);
-      applyOutboundFromConfig(result.config ?? null);
+      applyStreamFromConfig(cfg);
+      applyNetworkFromConfig(cfg);
+      applyOutboundFromConfig(cfg);
+      return cfg;
     } catch {
       // best-effort; listener loading may still work from local config
+      return null;
     }
   }
 
@@ -971,14 +960,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       <div className="panel-header">
         <div>
           <h2>Settings</h2>
-          <p className="muted">Configure tobro. Sensitive controls are power-user gated and never silently ignore unsupported options.</p>
         </div>
         <button type="button" className="logs-toggle" onClick={onClose}>Close</button>
       </div>
 
       {!powerUser ? (
-        <div className="power-user-gate" role="alert">
-          <h3>Power-user gate</h3>
+        <div className="power-user-gate" role="region" aria-labelledby="power-user-gate-title">
+          <h3 id="power-user-gate-title">Power-user gate</h3>
           <p>
             Some settings can affect connectivity, expose local services if misconfigured, or require a restart of Tor listeners.
             Only change them if you understand the impact.
@@ -1026,8 +1014,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <button type="button" className="logs-toggle" onClick={disablePowerUser}>Lock settings</button>
               </div>
 
-              <div className="settings-section">
-                <h3>Appearance</h3>
+              <details className="settings-section" open>
+                <summary><h3>Appearance</h3></summary>
                 <div className="field-row">
                   <label htmlFor="settings-theme">Theme</label>
                   <select
@@ -1041,10 +1029,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </select>
                 </div>
                 <p className="muted">Theme applies to app windows (main, Settings, About).</p>
-              </div>
+              </details>
 
-              <div className="settings-section">
-                <h3>Privacy</h3>
+              <details className="settings-section" open>
+                <summary><h3>Privacy</h3></summary>
                 <label className="checkbox-label" htmlFor="settings-capture-protection">
                   <input
                     id="settings-capture-protection"
@@ -1063,10 +1051,11 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   privileged software. It may not prevent all forms of capture (for example some system-level, hardware,
                   or out-of-band recording). Turning it off makes window contents easier to capture.
                 </p>
-              </div>
+              </details>
 
               <form className="settings-section" onSubmit={(e) => void onSaveGlobalShortcut(e)}>
-                <h3>Global shortcut</h3>
+                <details open>
+                  <summary><h3>Global shortcut</h3></summary>
                 <p className="muted">
                   Configurable system-wide shortcut to <strong>toggle the Tor connection</strong> (connect/stop).{" "}
                   <strong>Default: off</strong>. Leave empty and save to disable. Example:{" "}
@@ -1107,10 +1096,12 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                     Clear
                   </button>
                 </div>
+                </details>
               </form>
 
               <form className="settings-section" onSubmit={(e) => void onSaveAutostart(e)}>
-                <h3>Startup</h3>
+                <details open>
+                  <summary><h3>Startup</h3></summary>
                 <p className="muted">
                   Start Tobro automatically when you sign in (platform-specific): <strong>LaunchAgent</strong> on macOS,{" "}
                   <strong>Run key</strong> (HKCU) on Windows, <strong>systemd user unit</strong> on Linux. Changes apply to
@@ -1163,15 +1154,16 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         {autostartBusy ? "Applying…" : "Apply startup settings"}
                       </button>
                       <button type="button" disabled={autostartBusy} onClick={() => void loadAutostart()}>
-                        Refresh
+                        Reload
                       </button>
                     </div>
                   </>
                 )}
+                </details>
               </form>
 
-              <div className="settings-section">
-                <h3>App lock</h3>
+              <details className="settings-section" open>
+                <summary><h3>App lock</h3></summary>
                 <p className="muted">
                   Lock Tobro to prevent casual access to the UI. Unlock with <strong>OS authentication</strong> (when
                   supported/integrated) or a <strong>password fallback</strong>. Lock can trigger on{" "}
@@ -1235,7 +1227,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                       </p>
                       <div className="actions">
                         <button className="primary" type="submit" disabled={appLockBusy}>Save app lock settings</button>
-                        <button type="button" disabled={appLockBusy} onClick={() => void loadAppLock()}>Refresh</button>
+                        <button type="button" disabled={appLockBusy} onClick={() => void loadAppLock()}>Reload</button>
                       </div>
                     </form>
 
@@ -1270,10 +1262,11 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 ) : (
                   <p className="muted">Loading app lock settings…</p>
                 )}
-              </div>
+              </details>
 
               <form className="settings-section port-editor" onSubmit={onSavePorts}>
-                <h3>Proxy / listener settings</h3>
+                <details open>
+                  <summary><h3>Proxy / listener settings</h3></summary>
                 <p className="muted">
                   Configure local SOCKS/HTTP and DNS ports. With the current Arti backend, SOCKS and HTTP share one listener, so HTTP should match SOCKS (use <code>0</code> to follow SOCKS). By default listeners bind to loopback only. Active listener changes require stop/connect.
                 </p>
@@ -1316,12 +1309,14 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 {portsMessage ? <p className="muted">{portsMessage}</p> : null}
                 <div className="actions">
                   <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save proxy settings"}</button>
-                  <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reset</button>
+                  <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reload</button>
                 </div>
+                </details>
               </form>
 
               <form className="settings-section outbound-proxy" onSubmit={(e) => void onSaveOutbound(e)}>
-                <h3>Outbound proxy (upstream)</h3>
+                <details open>
+                  <summary><h3>Outbound proxy (upstream)</h3></summary>
                 <p className="muted">
                   Route Tor’s network connections through an upstream proxy. <strong>HTTP</strong> (CONNECT) and{" "}
                   <strong>SOCKS4/SOCKS5</strong> are applied directly to Arti channels (host must be an IP address with the
@@ -1451,12 +1446,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   <button className="primary" type="submit" disabled={outboundBusy || !outboundDirty}>
                     {outboundBusy ? "Saving…" : "Save outbound proxy"}
                   </button>
-                  <button type="button" disabled={outboundBusy} onClick={() => void loadConfigState()}>Reset</button>
+                  <button type="button" disabled={outboundBusy} onClick={() => void loadConfigState()}>Reload</button>
                 </div>
+                </details>
               </form>
 
-              <div className="settings-section config-import">
-                <h3>Config import/export (no secrets)</h3>
+              <details className="settings-section config-import" open>
+                <summary><h3>Config import/export (no secrets)</h3></summary>
                 <p className="muted">
                   Uses the daemon config API. Exports are <strong>redacted</strong> and contain <strong>no secrets</strong>. Import accepts a JSON object/patch; it is merged, validated (<code>deny_unknown_fields</code>), and only saved/applied if valid.
                 </p>
@@ -1491,18 +1487,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </ul>
                 ) : null}
                 {configError ? <p className="error">{configError}</p> : null}
-              </div>
+              </details>
 
-              <div className="settings-section">
-                <h3>Help &amp; resources</h3>
-                <ul className="help-links muted">
-                  {HELP_LINKS.map((l) => (
-                    <li key={l.url}>
-                      <a href={l.url} onClick={(e) => { e.preventDefault(); void openExternal(l.url); }}>{l.label}</a>
-                    </li>
-                  ))}
-                </ul>
-              </div>
             </div>
 
           <div
@@ -1516,8 +1502,9 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <p className="muted">Supported node/stream defaults only. Unsupported C Tor-style restrictions stay hidden and are rejected by validation/import.</p>
               </div>
 
-              <div className="settings-section network-prefs">
-                <h3>Exit country / IP version (M2)</h3>
+              <details className="settings-section network-prefs" open>
+                <summary><h3>Exit country / IP version (M2)</h3></summary>
+                <form onSubmit={(e) => { e.preventDefault(); void onSaveNetwork(); }}>
                 <p className="muted">
                   Default <code>StreamPrefs</code> applied by tobro’s proxy path when custom network prefs are active (exit country and/or non-default IP version).
                   Exit-country selection uses Arti geoip data and may reduce path diversity or fail to find exits. Changes require Stop/Connect while Tor is running.
@@ -1552,15 +1539,16 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 {networkError ? <p className="error">{networkError}</p> : null}
                 {networkMessage ? <p className="muted">{networkMessage}</p> : null}
                 <div className="actions">
-                  <button className="primary" type="button" disabled={networkBusy || !networkDirty} onClick={() => void onSaveNetwork()}>
+                  <button className="primary" type="submit" disabled={networkBusy || !networkDirty}>
                     {networkBusy ? "Saving…" : "Save network prefs"}
                   </button>
-                  <button type="button" disabled={networkBusy} onClick={() => void loadConfigState()}>Reset</button>
+                  <button type="button" disabled={networkBusy} onClick={() => void loadConfigState()}>Reload</button>
                 </div>
-              </div>
+                </form>
+              </details>
 
-              <div className="settings-section bridge-test">
-                <h3>Transport test &amp; diagnostics</h3>
+              <details className="settings-section bridge-test" open>
+                <summary><h3>Transport test &amp; diagnostics</h3></summary>
                 <p className="muted">
                   Test a bridge/pluggable transport line before connecting. This runs <strong>local validation</strong> and
                   {" "}<strong>PT/config diagnostics</strong> using the daemon’s configured transport paths (it checks format,
@@ -1570,20 +1558,21 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <div className="config-actions">
                   <button
                     type="button"
-                    disabled={busy || !((currentConfig as { bridges?: { lines?: unknown[] } } | null)?.bridges?.lines?.length)}
-                    onClick={() => {
-                      const lines = (currentConfig as { bridges?: { lines?: unknown[] } } | null)?.bridges?.lines;
-                      if (Array.isArray(lines)) {
+                    disabled={busy || bridgeTestBusy}
+                    onClick={async () => {
+                      const cfg = (currentConfig ?? (await loadConfigState())) as { bridges?: { lines?: unknown[] } } | null;
+                      const lines = cfg?.bridges?.lines;
+                      if (Array.isArray(lines) && lines.length > 0) {
                         setBridgeTestLine(lines.filter((v): v is string => typeof v === "string").join("\n"));
                         setBridgeTestError("");
                       } else {
-                        void loadConfigState();
+                        setBridgeTestError("No bridge lines found in current config.");
                       }
                     }}
                   >
-                    Use configured bridge lines
+                    Load configured bridges
                   </button>
-                  <button type="button" disabled={bridgeTestBusy} onClick={() => { setBridgeTestResult(null); setBridgeTestError(""); }}>
+                  <button type="button" disabled={bridgeTestBusy || (!bridgeTestResult && !bridgeTestError)} onClick={() => { setBridgeTestResult(null); setBridgeTestError(""); }}>
                     Clear result
                   </button>
                 </div>
@@ -1648,15 +1637,16 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                     })()}
                   </div>
                 ) : null}
-              </div>
+              </details>
 
-              <div className="settings-section node-restrictions">
-                <h3>Unsupported restrictions (hidden)</h3>
+              <details className="settings-section node-restrictions" open>
+                <summary><h3>Unsupported restrictions (hidden)</h3></summary>
                 <ul className="muted">
+                  <li><strong>Bridges/circumvention:</strong> supported here in Node Configuration (Transport test &amp; diagnostics) and via config/CLI (<code>bridges.test</code>, bridge config, Moat/builtin helpers). Bridge lines are sensitive; diagnostics avoid leaking bridge material.</li>
                   <li><strong>Entry/exit/exclude/strict node lists:</strong> C Tor-style node restriction lists are not exposed by the pinned Arti APIs used here; these knobs remain hidden and are rejected by config validation/import (never silently ignored).</li>
                   <li><strong>Stream isolation (F-42/F-43):</strong> supported and configurable in Advanced Tor Configuration.</li>
                 </ul>
-              </div>
+              </details>
             </div>
 
           <div
@@ -1670,8 +1660,9 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <p className="muted">Advanced Tor behavior. Proxy/listener settings are in General.</p>
               </div>
 
-              <div className="settings-section stream-isolation">
-                <h3>Stream isolation (F-42/F-43)</h3>
+              <details className="settings-section stream-isolation" open>
+                <summary><h3>Stream isolation (F-42/F-43)</h3></summary>
+                <form onSubmit={(e) => { e.preventDefault(); void onSaveStream(); }}>
                 <p className="muted">
                   Controls how proxy streams are isolated onto Tor circuits. Defaults are off. SOCKS auth isolation is
                   native to Arti when credentials are provided; destination/port isolation is applied by tobro’s isolation
@@ -1700,12 +1691,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 {streamError ? <p className="error">{streamError}</p> : null}
                 {streamMessage ? <p className="muted">{streamMessage}</p> : null}
                 <div className="actions">
-                  <button className="primary" type="button" disabled={streamBusy || !streamDirty} onClick={() => void onSaveStream()}>
+                  <button className="primary" type="submit" disabled={streamBusy || !streamDirty}>
                     {streamBusy ? "Saving…" : "Save stream isolation"}
                   </button>
-                  <button type="button" disabled={streamBusy} onClick={() => void loadConfigState()}>Reset</button>
+                  <button type="button" disabled={streamBusy} onClick={() => void loadConfigState()}>Reload</button>
                 </div>
-              </div>
+                </form>
+              </details>
             </div>
         </div>
       )}
