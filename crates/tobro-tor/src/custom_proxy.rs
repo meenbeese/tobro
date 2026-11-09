@@ -129,7 +129,7 @@ enum DnsQType {
     A,
     Aaaa,
     Ptr,
-    Other(u16),
+    Other,
 }
 
 fn parse_dns_query_minimal(packet: &[u8]) -> Result<(u16, String, DnsQType, Vec<u8>)> {
@@ -160,7 +160,7 @@ fn parse_dns_query_minimal(packet: &[u8]) -> Result<(u16, String, DnsQType, Vec<
         1 => DnsQType::A,
         28 => DnsQType::Aaaa,
         12 => DnsQType::Ptr,
-        other => DnsQType::Other(other),
+        _ => DnsQType::Other,
     };
     let name = labels.join(".");
     // keep original question bytes for response
@@ -274,7 +274,7 @@ async fn handle_dns(
                 out.extend_from_slice(&question);
             }
         }
-        DnsQType::Other(_) => {
+        DnsQType::Other => {
             out.extend_from_slice(&dns_response_header(id, 1, 0, 4)); // NOTIMP
             out.extend_from_slice(&question);
         }
@@ -374,6 +374,7 @@ async fn handle_socks(
             anyhow::bail!("client closed during SOCKS handshake");
         }
         filled += n;
+        #[allow(deprecated)] // tor-socksproto 0.48: migrate to Handshake::step when ready
         let action = match hs.handshake(&buf[..filled]) {
             Ok(Ok(a)) => a,
             Ok(Err(e)) => return Err(anyhow::Error::new(e)).context("SOCKS handshake"),

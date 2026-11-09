@@ -10,14 +10,14 @@
 //! state-management model while adding configurable destination/port/protocol
 //! isolation.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use anyhow::Context as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tor_socksproto::{
-    Handshake, SocksAuth, SocksCmd, SocksProxyHandshake, SocksRequest, SocksStatus, SocksVersion,
+    Handshake, SocksAuth, SocksCmd, SocksProxyHandshake, SocksRequest, SocksStatus,
 };
 use tracing::{debug, warn};
 
@@ -94,6 +94,7 @@ async fn handle_socks(
             anyhow::bail!("client closed during SOCKS handshake");
         }
         filled += n;
+        #[allow(deprecated)] // tor-socksproto 0.48: migrate to Handshake::step when ready
         let action = match hs.handshake(&buf[..filled]) {
             Ok(Ok(a)) => a,
             Ok(Err(e)) => return Err(anyhow::Error::new(e)).context("SOCKS handshake"),

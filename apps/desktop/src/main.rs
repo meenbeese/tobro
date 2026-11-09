@@ -33,7 +33,6 @@ enum IpcCommand {
         patch: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    ReloadConfig(oneshot::Sender<Result<Value, String>>),
 }
 
 #[derive(Debug)]
@@ -191,6 +190,20 @@ async fn get_proxy_ports(state: State<'_, AppState>) -> Result<ProxyPorts, Strin
     })
 }
 
+fn apply_window_capture_protection(handle: &AppHandle, enabled: bool) {
+    for (_label, window) in handle.webview_windows() {
+        let _ = window.set_content_protected(enabled);
+    }
+}
+
+/// Best-effort window capture/screen-recording protection toggle.
+/// Applied to all app windows; support and behavior vary by OS/windowing system.
+#[tauri::command]
+fn set_capture_protection(app: AppHandle, enabled: bool) -> Result<(), String> {
+    apply_window_capture_protection(&app, enabled);
+    Ok(())
+}
+
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     let url = url.trim().to_owned();
@@ -332,6 +345,8 @@ fn main() {
             commands: command_tx,
         })
         .setup(move |app| {
+            // Best-effort default: reduce accidental capture exposure until UI syncs preference.
+            apply_window_capture_protection(app.handle(), true);
             setup_tray(app.handle())?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(watch_daemon(handle, daemon_socket, command_rx));
@@ -348,6 +363,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             status,
             open_external_url,
+            set_capture_protection,
             daemon_connect,
             daemon_stop,
             daemon_new_identity,
@@ -603,8 +619,7 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         IpcCommand::Connect(tx)
         | IpcCommand::Stop(tx)
         | IpcCommand::NewIdentity(tx)
-        | IpcCommand::ConfigGet(tx)
-        | IpcCommand::ReloadConfig(tx) => {
+        | IpcCommand::ConfigGet(tx) => {
             let _ = tx.send(err);
         }
         IpcCommand::ConfigValidate { reply, .. } | IpcCommand::ConfigApply { reply, .. } => {
@@ -717,14 +732,6 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);
-            refresh_status(handle, client).await;
-        }
-        IpcCommand::ReloadConfig(tx) => {
-            let result = client
-                .call(methods::RELOAD_CONFIG, None)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(result);
             refresh_status(handle, client).await;
         }
     }

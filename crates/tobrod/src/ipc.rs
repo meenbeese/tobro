@@ -1355,6 +1355,7 @@ mod daemon_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod config_tests {
     use super::*;
     use tempfile::TempDir;
@@ -1371,7 +1372,7 @@ mod config_tests {
             false,
             &listeners,
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
         assert_eq!(result["config"]["proxy"]["socks_port"], 19050);
         assert_eq!(result["config"]["proxy"]["dns_port"], 19053);
@@ -1406,7 +1407,7 @@ mod config_tests {
             true,
             &listeners,
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
         assert_eq!(result["effects"]["stream_changed"], true);
         assert_eq!(result["effects"]["restart_required"], true);
@@ -1431,7 +1432,7 @@ mod config_tests {
             true,
             &listeners,
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
         assert_eq!(result["effects"]["network_changed"], true);
         assert_eq!(result["effects"]["restart_required"], true);
@@ -1477,7 +1478,7 @@ mod config_tests {
             &json!({ "network": { "exit_country": "de", "ip_version": "ipv4_preferred" } }),
             false,
         )
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| e.to_string())?;
         assert_eq!(result["valid"], true);
         assert_eq!(result["effects"]["network_changed"], true);
         assert_eq!(result["effects"]["restart_required"], true);

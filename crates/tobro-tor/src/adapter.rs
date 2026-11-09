@@ -126,14 +126,20 @@ mod tests {
     #[test]
     fn network_stream_prefs_active_only_for_non_default() {
         assert!(!NetworkStreamPrefs::default().is_active());
-        let mut prefs = NetworkStreamPrefs::default();
-        prefs.exit_country = Some("us".to_owned());
+        let prefs = NetworkStreamPrefs {
+            exit_country: Some("us".to_owned()),
+            ..Default::default()
+        };
         assert!(prefs.is_active());
-        let mut prefs = NetworkStreamPrefs::default();
-        prefs.ip_version = IpVersionPref::Ipv6Only;
+        let prefs = NetworkStreamPrefs {
+            ip_version: IpVersionPref::Ipv6Only,
+            ..Default::default()
+        };
         assert!(prefs.is_active());
-        let mut prefs = NetworkStreamPrefs::default();
-        prefs.exit_country = Some("   ".to_owned());
+        let prefs = NetworkStreamPrefs {
+            exit_country: Some("   ".to_owned()),
+            ..Default::default()
+        };
         assert!(!prefs.is_active());
     }
 

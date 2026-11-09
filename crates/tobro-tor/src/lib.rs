@@ -356,6 +356,7 @@ async fn serve_with_isolation(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal orchestration: paths, ports, bind, and stream policy from separate config sources
 async fn serve_custom(
     state_dir: &Path,
     cache_dir: &Path,

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
 import { readThemePreference, setThemePreference, type ThemePreference } from "./theme";
+import { readCaptureProtectionEnabled, setCaptureProtectionEnabled } from "./captureProtection";
 
 const POWER_USER_KEY = "tobro.powerUser.enabled";
 
@@ -158,6 +159,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<SettingsTab>("general");
   const [theme, setTheme] = useState<ThemePreference>(readThemePreference);
+  const [captureProtection, setCaptureProtection] = useState(readCaptureProtectionEnabled);
   const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
     general: null,
     node: null,
@@ -288,6 +290,12 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     setTheme(next);
     setThemePreference(next);
     log(`theme set to ${next}`);
+  }
+
+  async function onCaptureProtectionChange(enabled: boolean) {
+    setCaptureProtection(enabled);
+    await setCaptureProtectionEnabled(enabled);
+    log(`window capture protection ${enabled ? "enabled (best-effort)" : "disabled"}`);
   }
 
   function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>) {
@@ -659,6 +667,28 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </select>
                 </div>
                 <p className="muted">Theme applies to app windows (main, Settings, About).</p>
+              </div>
+
+              <div className="settings-section">
+                <h3>Privacy</h3>
+                <label className="checkbox-label" htmlFor="settings-capture-protection">
+                  <input
+                    id="settings-capture-protection"
+                    type="checkbox"
+                    checked={captureProtection}
+                    onChange={(e) => void onCaptureProtectionChange(e.target.checked)}
+                  />
+                  <span>
+                    <strong>Best-effort window capture protection</strong> (default on)
+                  </span>
+                </label>
+                <p className="muted bind-all-guidance">
+                  When enabled, Tobro asks the operating system to hide or exclude app windows from screenshots and screen
+                  recordings where supported. This is <strong>best-effort</strong>, not a guarantee: behavior varies by OS
+                  version, window manager, display server, remote desktop, capture method, accessibility tooling, and
+                  privileged software. It may not prevent all forms of capture (for example some system-level, hardware,
+                  or out-of-band recording). Turning it off makes window contents easier to capture.
+                </p>
               </div>
 
               <form className="settings-section port-editor" onSubmit={onSavePorts}>

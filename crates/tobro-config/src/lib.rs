@@ -342,13 +342,13 @@ impl Config {
                 "logging.level must not be empty".to_owned(),
             ));
         }
-        if let Some(country) = self.network.normalized_exit_country() {
-            if country.len() != 2 || !country.chars().all(|c| c.is_ascii_alphabetic()) {
-                return Err(ConfigError::Invalid(format!(
-                    "network.exit_country must be an ISO 3166-1 alpha-2 code (two letters), got {:?}",
-                    self.network.exit_country.as_deref().unwrap_or("")
-                )));
-            }
+        if let Some(country) = self.network.normalized_exit_country()
+            && (country.len() != 2 || !country.chars().all(|c| c.is_ascii_alphabetic()))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "network.exit_country must be an ISO 3166-1 alpha-2 code (two letters), got {:?}",
+                self.network.exit_country.as_deref().unwrap_or("")
+            )));
         }
         Ok(())
     }
@@ -684,6 +684,7 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

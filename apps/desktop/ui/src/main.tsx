@@ -5,9 +5,11 @@ import App from "./App";
 import { About } from "./About";
 import { Settings } from "./Settings";
 import { initTheme } from "./theme";
+import { initCaptureProtection } from "./captureProtection";
 import "./styles.css";
 
 initTheme();
+initCaptureProtection();
 
 const windowKind = new URLSearchParams(window.location.search).get("window");
 
