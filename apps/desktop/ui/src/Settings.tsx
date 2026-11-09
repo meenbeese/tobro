@@ -23,6 +23,7 @@ interface ConfigEffects {
   restart_required?: boolean;
   listeners_changed?: boolean;
   stream_changed?: boolean;
+  network_changed?: boolean;
   runtime_active?: boolean;
   warnings?: string[];
 }
@@ -32,6 +33,13 @@ interface StreamSettings {
   isolate_port: boolean;
   isolate_protocol: boolean;
   keep_alive_isolation: boolean;
+}
+
+type IpVersion = "ipv4_preferred" | "ipv6_preferred" | "ipv4_only" | "ipv6_only";
+
+interface NetworkSettings {
+  exit_country: string;
+  ip_version: IpVersion;
 }
 
 interface ConfigResponse {
@@ -99,13 +107,14 @@ function summarizeEffects(effects?: ConfigEffects): string[] {
   const lines: string[] = [];
   if (effects.listeners_changed) lines.push("Listener settings changed.");
   if (effects.stream_changed) lines.push("Stream isolation settings changed.");
+  if (effects.network_changed) lines.push("Network/StreamPrefs defaults changed.");
   if (effects.restart_required) {
     lines.push(
       effects.runtime_active
         ? "Restart required for active runtime: use Stop then Connect after applying."
         : "Changes apply on the next connection/start.",
     );
-  } else if (!effects.listeners_changed && !effects.stream_changed) {
+  } else if (!effects.listeners_changed && !effects.stream_changed && !effects.network_changed) {
     lines.push("No restart flagged by validation.");
   }
   if (effects.warnings?.length) {
@@ -153,6 +162,16 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [streamMessage, setStreamMessage] = useState("");
   const [streamError, setStreamError] = useState("");
 
+  // Network/StreamPrefs defaults (M2)
+  const [network, setNetwork] = useState<NetworkSettings>({
+    exit_country: "",
+    ip_version: "ipv4_preferred",
+  });
+  const [networkDirty, setNetworkDirty] = useState(false);
+  const [networkBusy, setNetworkBusy] = useState(false);
+  const [networkMessage, setNetworkMessage] = useState("");
+  const [networkError, setNetworkError] = useState("");
+
   // Config import/export
   const [configPath, setConfigPath] = useState("");
   const [currentConfig, setCurrentConfig] = useState<unknown>(null);
@@ -179,6 +198,22 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  function applyNetworkFromConfig(config: unknown) {
+    const n = (config as { network?: Partial<NetworkSettings> & { exit_country?: string | null } } | null)?.network;
+    if (n && typeof n === "object") {
+      const ip = n.ip_version;
+      const ip_version: IpVersion =
+        ip === "ipv6_preferred" || ip === "ipv4_only" || ip === "ipv6_only" ? ip : "ipv4_preferred";
+      setNetwork({
+        exit_country: typeof n.exit_country === "string" ? n.exit_country : "",
+        ip_version,
+      });
+      setNetworkDirty(false);
+      setNetworkError("");
+      setNetworkMessage("");
+    }
+  }
+
   async function loadPorts() {
     try {
       const loaded = await invoke<ProxyPorts>("get_proxy_ports");
@@ -202,6 +237,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       setCurrentConfig(result.config ?? null);
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
+      applyNetworkFromConfig(result.config ?? null);
     } catch {
       // best-effort; listener loading may still work from local config
     }
@@ -313,6 +349,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       setCurrentConfig(result.config ?? null);
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
+      applyNetworkFromConfig(result.config ?? null);
       setConfigMessages(["Loaded current daemon config (redacted; no secrets)."]);
       log("config: loaded current config");
     } catch (e) {
@@ -394,6 +431,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       if (result.config) setCurrentConfig(result.config);
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
+      applyNetworkFromConfig(result.config ?? null);
       const lines = ["Config validated and saved (daemon config API)."];
       lines.push(...summarizeEffects(result.effects));
       lines.push("Redacted config contains no secrets; secrets remain in the OS keychain/store when used.");
@@ -439,6 +477,55 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     setStreamDirty(true);
     setStreamError("");
     setStreamMessage("");
+  }
+
+  async function onSaveNetwork() {
+    const exitCountry = network.exit_country.trim();
+    if (exitCountry && !/^[A-Za-z]{2}$/.test(exitCountry)) {
+      setNetworkError("Exit country must be an ISO 3166-1 alpha-2 code (two letters), or empty for any country.");
+      return;
+    }
+    setNetworkBusy(true);
+    setNetworkError("");
+    setNetworkMessage("");
+    try {
+      const result = await invoke<ConfigResponse>("daemon_apply_config", {
+        patch: {
+          network: {
+            exit_country: exitCountry ? exitCountry.toLowerCase() : null,
+            ip_version: network.ip_version,
+          },
+        },
+      });
+      if (result.config) setCurrentConfig(result.config);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyNetworkFromConfig(result.config ?? null);
+      const warnings = result.effects?.warnings ?? [];
+      const msg = summarizeEffects(result.effects).join(" ");
+      setNetworkMessage(warnings.length ? `${msg} Warnings: ${warnings.join(" | ")}` : msg || "Saved.");
+      log(`network prefs saved (exit_country=${exitCountry || "any"}, ip_version=${network.ip_version})`);
+      onApplied?.();
+    } catch (e) {
+      const message = String(e);
+      setNetworkError(message);
+      log(`network prefs save failed: ${message}`, "error");
+    } finally {
+      setNetworkBusy(false);
+    }
+  }
+
+  function onNetworkExitCountryChange(value: string) {
+    setNetwork((prev) => ({ ...prev, exit_country: value }));
+    setNetworkDirty(true);
+    setNetworkError("");
+    setNetworkMessage("");
+  }
+
+  function onNetworkIpVersionChange(value: IpVersion) {
+    setNetwork((prev) => ({ ...prev, ip_version: value }));
+    setNetworkDirty(true);
+    setNetworkError("");
+    setNetworkMessage("");
   }
 
   return (
@@ -557,7 +644,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   className="config-textarea"
                   value={importText}
                   onChange={(e) => setImportText(e.target.value)}
-                  placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053, "bind_all_interfaces": false },\n  "stream": { "isolate_destination": false, "isolate_port": false }\n}'}
+                  placeholder={'{\n  "proxy": { "socks_port": 9050, "http_port": 9050, "dns_port": 9053, "bind_all_interfaces": false },\n  "network": { "exit_country": "us", "ip_version": "ipv4_preferred" },\n  "stream": { "isolate_destination": false, "isolate_port": false }\n}'}
                   spellCheck={false}
                   rows={10}
                 />
@@ -573,15 +660,57 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
 
           {tab === "node" ? (
             <div className="advanced-sections" role="tabpanel">
-              <div className="settings-section node-restrictions">
-                <h3>Node configuration (supported subset)</h3>
+              <div className="settings-section-head">
+                <p className="muted">Supported node/stream defaults only. Unsupported C Tor-style restrictions stay hidden and are rejected by validation/import.</p>
+              </div>
+
+              <div className="settings-section network-prefs">
+                <h3>Exit country / IP version (M2)</h3>
                 <p className="muted">
-                  Node restrictions and exit selection are exposed only when supported by the pinned Arti backend.
-                  Unsupported knobs remain hidden in the UI and are rejected if supplied in config import/patches (never silently ignored).
+                  Default <code>StreamPrefs</code> applied by tobro’s proxy path when custom network prefs are active (exit country and/or non-default IP version).
+                  Exit-country selection uses Arti geoip data and may reduce path diversity or fail to find exits. Changes require Stop/Connect while Tor is running.
                 </p>
+                <label>
+                  Exit country (ISO 3166-1 alpha-2)
+                  <input
+                    type="text"
+                    value={network.exit_country}
+                    onChange={(e) => onNetworkExitCountryChange(e.target.value)}
+                    placeholder="Any (e.g. us, de, nl)"
+                    maxLength={2}
+                    spellCheck={false}
+                    autoCapitalize="characters"
+                    disabled={networkBusy}
+                  />
+                </label>
+                <p className="muted">Leave empty for any exit country. Use a two-letter country code only.</p>
+                <label>
+                  IP version preference
+                  <select
+                    value={network.ip_version}
+                    onChange={(e) => onNetworkIpVersionChange(e.target.value as IpVersion)}
+                    disabled={networkBusy}
+                  >
+                    <option value="ipv4_preferred">Prefer IPv4, allow IPv6 (default)</option>
+                    <option value="ipv6_preferred">Prefer IPv6, allow IPv4</option>
+                    <option value="ipv4_only">IPv4 only</option>
+                    <option value="ipv6_only">IPv6 only</option>
+                  </select>
+                </label>
+                {networkError ? <p className="error">{networkError}</p> : null}
+                {networkMessage ? <p className="muted">{networkMessage}</p> : null}
+                <div className="actions">
+                  <button className="primary" type="button" disabled={networkBusy || !networkDirty} onClick={() => void onSaveNetwork()}>
+                    {networkBusy ? "Saving…" : "Save network prefs"}
+                  </button>
+                  <button type="button" disabled={networkBusy} onClick={() => void loadConfigState()}>Reset</button>
+                </div>
+              </div>
+
+              <div className="settings-section node-restrictions">
+                <h3>Unsupported restrictions (hidden)</h3>
                 <ul className="muted">
-                  <li><strong>Exit country / IPv6 / StreamPrefs defaults:</strong> planned (M2 open) — not yet wired or applied.</li>
-                  <li><strong>Entry/exit/exclude/strict node lists:</strong> not supported by current Arti APIs used here; hidden.</li>
+                  <li><strong>Entry/exit/exclude/strict node lists:</strong> C Tor-style node restriction lists are not exposed by the pinned Arti APIs used here; these knobs remain hidden and are rejected by config validation/import (never silently ignored).</li>
                   <li><strong>Stream isolation (F-42/F-43):</strong> supported and configurable in Advanced Tor Configuration.</li>
                 </ul>
               </div>

@@ -35,6 +35,41 @@ pub struct StreamIsolationPolicy {
     pub keep_alive_isolation: bool,
 }
 
+/// Default network stream preferences (M2: exit country, IPv6/IP version).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkStreamPrefs {
+    /// Preferred exit country (ISO 3166-1 alpha-2, lowercase), or `None` for any.
+    pub exit_country: Option<String>,
+    /// IP version preference for streams (F-44).
+    pub ip_version: IpVersionPref,
+}
+
+/// IP version preference (mirrors config; serde-compatible string form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpVersionPref {
+    /// Prefer IPv4, allow IPv6.
+    #[default]
+    Ipv4Preferred,
+    /// Prefer IPv6, allow IPv4.
+    Ipv6Preferred,
+    /// Only IPv4.
+    Ipv4Only,
+    /// Only IPv6.
+    Ipv6Only,
+}
+
+impl NetworkStreamPrefs {
+    /// True when non-default prefs require custom StreamPrefs application.
+    pub fn is_active(&self) -> bool {
+        self.exit_country
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self.ip_version != IpVersionPref::Ipv4Preferred
+    }
+}
+
 impl StreamIsolationPolicy {
     /// True when destination/port isolation requires tobro's thin proxy
     /// front-end behavior beyond Arti's built-in auth/header isolation.
@@ -58,6 +93,9 @@ pub struct ListenerConfig {
     /// Stream isolation policy (F-42/F-43).
     #[serde(default)]
     pub stream_isolation: StreamIsolationPolicy,
+    /// Default network stream preferences (M2: exit country, IPv6).
+    #[serde(default)]
+    pub network_prefs: NetworkStreamPrefs,
 }
 
 impl Default for ListenerConfig {
@@ -68,7 +106,16 @@ impl Default for ListenerConfig {
             dns_port: crate::DEFAULT_DNS_PORT,
             bind_all_interfaces: false,
             stream_isolation: StreamIsolationPolicy::default(),
+            network_prefs: NetworkStreamPrefs::default(),
         }
+    }
+}
+
+impl ListenerConfig {
+    /// True when tobro must run its custom proxy path (isolation frontend or
+    /// non-default network StreamPrefs) instead of `arti::run_proxy`.
+    pub fn needs_custom_proxy(&self) -> bool {
+        self.stream_isolation.needs_frontend() || self.network_prefs.is_active()
     }
 }
 
@@ -184,6 +231,7 @@ impl PreparedService {
             self.listeners.dns_port,
             self.listeners.bind_all_interfaces,
             self.listeners.stream_isolation,
+            self.listeners.network_prefs.clone(),
         );
         tokio::pin!(serve);
 

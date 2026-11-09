@@ -16,7 +16,9 @@ use anyhow::Context as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tor_socksproto::{Handshake, SocksAuth, SocksCmd, SocksProxyHandshake, SocksRequest, SocksStatus, SocksVersion};
+use tor_socksproto::{
+    Handshake, SocksAuth, SocksCmd, SocksProxyHandshake, SocksRequest, SocksStatus, SocksVersion,
+};
 use tracing::{debug, warn};
 
 use crate::adapter::StreamIsolationPolicy;
@@ -80,7 +82,9 @@ async fn handle_socks(
     let mut filled = 0usize;
     let request = loop {
         if hs.finished() {
-            break hs.into_request().context("SOCKS finished without request")?;
+            break hs
+                .into_request()
+                .context("SOCKS finished without request")?;
         }
         if filled == buf.len() {
             buf.resize(buf.len() * 2, 0);
@@ -105,7 +109,9 @@ async fn handle_socks(
             client.flush().await?;
         }
         if action.finished {
-            break hs.into_request().context("SOCKS finished without request")?;
+            break hs
+                .into_request()
+                .context("SOCKS finished without request")?;
         }
     };
 
@@ -160,7 +166,10 @@ async fn socks5_backend_connect(
     backend.write_all(&[0x05, 0x01, 0x02]).await?;
     let mut method = [0u8; 2];
     backend.read_exact(&mut method).await?;
-    anyhow::ensure!(method == [0x05, 0x02], "backend did not accept SOCKS5 username auth: {method:?}");
+    anyhow::ensure!(
+        method == [0x05, 0x02],
+        "backend did not accept SOCKS5 username auth: {method:?}"
+    );
     // RFC 1929 username/password: ver=1, ulen, uname, plen, passwd.
     let uname = isolation_token.as_bytes();
     let uname = &uname[..uname.len().min(255)];
@@ -174,7 +183,10 @@ async fn socks5_backend_connect(
     backend.write_all(&auth).await?;
     let mut auth_rep = [0u8; 2];
     backend.read_exact(&mut auth_rep).await?;
-    anyhow::ensure!(auth_rep[1] == 0x00, "backend SOCKS auth rejected: {auth_rep:?}");
+    anyhow::ensure!(
+        auth_rep[1] == 0x00,
+        "backend SOCKS auth rejected: {auth_rep:?}"
+    );
 
     // CONNECT request
     let dest_bytes = dest.as_bytes();
@@ -190,7 +202,11 @@ async fn socks5_backend_connect(
     let mut rep = [0u8; 4];
     backend.read_exact(&mut rep).await?;
     anyhow::ensure!(rep[0] == 0x05, "unexpected backend SOCKS version");
-    anyhow::ensure!(rep[1] == 0x00, "backend SOCKS connect failed with status {}", rep[1]);
+    anyhow::ensure!(
+        rep[1] == 0x00,
+        "backend SOCKS connect failed with status {}",
+        rep[1]
+    );
     drain_socks_addr(backend, rep[3]).await?;
     let mut bnd_port = [0u8; 2];
     backend.read_exact(&mut bnd_port).await?;
@@ -199,9 +215,20 @@ async fn socks5_backend_connect(
 
 async fn drain_socks_addr(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<()> {
     match atyp {
-        0x01 => { let mut a = [0u8; 4]; stream.read_exact(&mut a).await?; }
-        0x03 => { let mut l = [0u8; 1]; stream.read_exact(&mut l).await?; let mut a = vec![0u8; l[0] as usize]; stream.read_exact(&mut a).await?; }
-        0x04 => { let mut a = [0u8; 16]; stream.read_exact(&mut a).await?; }
+        0x01 => {
+            let mut a = [0u8; 4];
+            stream.read_exact(&mut a).await?;
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).await?;
+            let mut a = vec![0u8; l[0] as usize];
+            stream.read_exact(&mut a).await?;
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            stream.read_exact(&mut a).await?;
+        }
         _ => anyhow::bail!("unsupported backend SOCKS ATYP {atyp}"),
     }
     Ok(())
@@ -222,7 +249,12 @@ fn auth_bytes(auth: &SocksAuth) -> Vec<u8> {
     match auth {
         SocksAuth::NoAuth => Vec::new(),
         SocksAuth::Socks4(id) => id.clone(),
-        SocksAuth::Username(u, p) => { let mut v = u.clone(); v.push(0); v.extend_from_slice(p); v }
+        SocksAuth::Username(u, p) => {
+            let mut v = u.clone();
+            v.push(0);
+            v.extend_from_slice(p);
+            v
+        }
         _ => Vec::new(),
     }
 }
@@ -235,9 +267,13 @@ async fn handle_http(
     let mut buf = vec![0u8; 16384];
     let mut filled = 0usize;
     let end = loop {
-        if filled == buf.len() { anyhow::bail!("HTTP headers too large"); }
+        if filled == buf.len() {
+            anyhow::bail!("HTTP headers too large");
+        }
         let n = client.read(&mut buf[filled..]).await?;
-        if n == 0 { anyhow::bail!("client closed"); }
+        if n == 0 {
+            anyhow::bail!("client closed");
+        }
         filled += n;
         if let Some(p) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
             break p + 4;
@@ -261,9 +297,13 @@ async fn handle_http(
     let existing_iso = lines.clone().find_map(|line| {
         let (k, v) = line.split_once(':')?;
         let k = k.trim();
-        if k.eq_ignore_ascii_case("Tor-Stream-Isolation") || k.eq_ignore_ascii_case("X-Tor-Stream-Isolation") {
+        if k.eq_ignore_ascii_case("Tor-Stream-Isolation")
+            || k.eq_ignore_ascii_case("X-Tor-Stream-Isolation")
+        {
             Some(v.trim().to_string())
-        } else { None }
+        } else {
+            None
+        }
     });
     let token = TobroIsolationKey::from_input(&StreamIsolationInput {
         policy,
@@ -271,16 +311,21 @@ async fn handle_http(
         destination: host.clone(),
         port,
         socks_auth: existing_iso.unwrap_or_default().into_bytes(),
-    }).to_token();
+    })
+    .to_token();
 
     // Rebuild request with Tor-Stream-Isolation header injected.
     let mut out = format!("{method} {authority} {version}\r\n");
     let mut wrote_iso = false;
     for line in head.lines().skip(1) {
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if let Some((k, _)) = line.split_once(':') {
             let kt = k.trim();
-            if kt.eq_ignore_ascii_case("Tor-Stream-Isolation") || kt.eq_ignore_ascii_case("X-Tor-Stream-Isolation") {
+            if kt.eq_ignore_ascii_case("Tor-Stream-Isolation")
+                || kt.eq_ignore_ascii_case("X-Tor-Stream-Isolation")
+            {
                 if !wrote_iso {
                     out.push_str(&format!("Tor-Stream-Isolation: {token}\r\n"));
                     wrote_iso = true;
@@ -296,7 +341,9 @@ async fn handle_http(
     }
     out.push_str("\r\n");
 
-    let mut backend_stream = TcpStream::connect(backend).await.context("connect backend")?;
+    let mut backend_stream = TcpStream::connect(backend)
+        .await
+        .context("connect backend")?;
     backend_stream.write_all(out.as_bytes()).await?;
     // Forward any extra bytes read past headers
     if filled > end {
@@ -312,7 +359,9 @@ fn parse_authority(authority: &str) -> anyhow::Result<(String, u16)> {
         let (h, p) = rest.split_once("]:").context("bad IPv6 authority")?;
         return Ok((h.to_string(), p.parse()?));
     }
-    let (h, p) = authority.rsplit_once(':').context("authority missing port")?;
+    let (h, p) = authority
+        .rsplit_once(':')
+        .context("authority missing port")?;
     Ok((h.to_string(), p.parse()?))
 }
 
@@ -322,7 +371,10 @@ mod tests {
 
     #[test]
     fn parse_host_port() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(parse_authority("example.com:443")?, ("example.com".into(), 443));
+        assert_eq!(
+            parse_authority("example.com:443")?,
+            ("example.com".into(), 443)
+        );
         assert_eq!(parse_authority("[::1]:9050")?, ("::1".into(), 9050));
         Ok(())
     }
@@ -352,13 +404,17 @@ mod tests {
             socks_auth: vec![],
         })
         .to_token();
-        assert_eq!(a, TobroIsolationKey::from_input(&StreamIsolationInput {
-            policy,
-            protocol: ClientProtocol::Socks,
-            destination: "a.example".into(),
-            port: 80,
-            socks_auth: vec![],
-        }).to_token());
+        assert_eq!(
+            a,
+            TobroIsolationKey::from_input(&StreamIsolationInput {
+                policy,
+                protocol: ClientProtocol::Socks,
+                destination: "a.example".into(),
+                port: 80,
+                socks_auth: vec![],
+            })
+            .to_token()
+        );
         assert_ne!(a, b);
         assert!(a.starts_with("tobro-iso1:"));
     }

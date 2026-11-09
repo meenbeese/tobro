@@ -58,6 +58,8 @@ pub struct Config {
     pub general: GeneralConfig,
     /// Local proxy listener settings.
     pub proxy: ProxyConfig,
+    /// Network/stream defaults (M2): exit country, IPv6/StreamPrefs.
+    pub network: NetworkConfig,
     /// Stream isolation and behavior settings (F-42/F-43).
     pub stream: StreamConfig,
     /// Logging settings.
@@ -70,10 +72,62 @@ impl Default for Config {
             version: 1,
             general: GeneralConfig::default(),
             proxy: ProxyConfig::default(),
+            network: NetworkConfig::default(),
             stream: StreamConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
+}
+
+/// Network and default `StreamPrefs` settings (M2).
+///
+/// Controls exit-country selection, IPv6 preference, and default stream
+/// behavior applied to proxied connections where supported by the Arti backend.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkConfig {
+    /// Preferred exit country as an ISO 3166-1 alpha-2 code (e.g. `"us"`, `"de"`).
+    /// Empty/omitted means any exit country. Requires Arti geoip support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_country: Option<String>,
+    /// Default IPv6/IP version preference for streams (F-44).
+    #[serde(default)]
+    pub ip_version: IpVersionPreference,
+}
+
+impl NetworkConfig {
+    /// True when any non-default network StreamPrefs are configured, requiring
+    /// tobro's proxy path to apply them via `arti-client` StreamPrefs.
+    pub fn has_stream_prefs(&self) -> bool {
+        self.exit_country
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+            || self.ip_version != IpVersionPreference::default()
+    }
+
+    /// Normalized exit country code, or `None` for "any".
+    pub fn normalized_exit_country(&self) -> Option<String> {
+        self.exit_country
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+    }
+}
+
+/// Default IP version preference for proxied streams (M2/F-44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpVersionPreference {
+    /// Prefer IPv4, allow IPv6 (Arti/Orbot-like default behavior).
+    #[default]
+    Ipv4Preferred,
+    /// Prefer IPv6, allow IPv4.
+    Ipv6Preferred,
+    /// Only use IPv4.
+    Ipv4Only,
+    /// Only use IPv6.
+    Ipv6Only,
 }
 
 /// Stream isolation and behavior settings.
@@ -287,6 +341,14 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "logging.level must not be empty".to_owned(),
             ));
+        }
+        if let Some(country) = self.network.normalized_exit_country() {
+            if country.len() != 2 || !country.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err(ConfigError::Invalid(format!(
+                    "network.exit_country must be an ISO 3166-1 alpha-2 code (two letters), got {:?}",
+                    self.network.exit_country.as_deref().unwrap_or("")
+                )));
+            }
         }
         Ok(())
     }
@@ -513,9 +575,9 @@ pub fn proxy_warnings(proxy: &ProxyConfig) -> Vec<String> {
 /// fields are still rejected by `deny_unknown_fields` during deserialization.
 pub fn unsupported_knob_error(path: &str) -> Option<String> {
     let (knob, explanation) = match path {
-        "network" | "network.exit_country" | "network.ipv6" | "network.geoip" => (
+        "network.geoip" | "network.stream_prefs" => (
             path,
-            "exit country/IPv6/StreamPrefs defaults are not wired yet (M2 open). Arti 0.48 supports StreamPrefs/geoip-gated exit country APIs, but tobro does not expose or apply this setting in the current build.",
+            "this specific network sub-knob is not exposed; use supported [network] fields (exit_country, ip_version).",
         ),
         "tor" | "tor.entry_nodes" | "tor.exit_nodes" | "tor.exclude_nodes" | "tor.strict_nodes" => {
             (
@@ -581,7 +643,7 @@ pub fn check_unsupported_knobs(patch: &serde_json::Value) -> Result<(), String> 
 
 /// Human-readable summary of node restriction and stream/network support (for UI/diagnostics).
 pub fn node_restrictions_support_summary() -> &'static str {
-    "Supported network controls (current build): stream isolation (F-42: destination/port/protocol flags) and SOCKS auth keep-alive isolation behavior (F-43) are configurable in [stream]. SOCKS auth isolation is native to Arti's proxy when credentials are provided; destination/port isolation is applied by tobro's proxy isolation policy/front-end when enabled. C Tor-style entry/exit/exclude/strict node lists are not exposed by Arti 2.8/arti-client 0.48 APIs used by tobro. Exit country and IPv6/StreamPrefs defaults are planned (M2 open) and are not yet wired/applied. Unsupported knobs are hidden in the UI and rejected by config validation/import (never silently ignored)."
+    "Supported network controls (current build): stream isolation (F-42/F-43) in [stream]; exit country (ISO 3166-1 alpha-2, requires Arti geoip) and IPv6/IP version preference (F-44) as default StreamPrefs in [network]. C Tor-style entry/exit/exclude/strict node lists are not exposed by the pinned Arti APIs. Unsupported knobs are hidden in the UI and rejected by config validation/import (never silently ignored)."
 }
 
 impl Config {
@@ -766,10 +828,36 @@ level = "info"
         assert!(err.contains("unsupported config knob"));
         assert!(err.contains("tor"));
         assert!(err.contains("never silently ignored"));
+    }
 
-        let patch = serde_json::json!({ "network": { "exit_country": "US" } });
-        let err = check_unsupported_knobs(&patch).expect_err("must reject unsupported knob");
-        assert!(err.contains("network.exit_country"));
+    #[test]
+    fn accepts_supported_network_patch() -> Result<(), Box<dyn std::error::Error>> {
+        let patch = serde_json::json!({ "network": { "exit_country": "US", "ip_version": "ipv6_preferred" } });
+        check_unsupported_knobs(&patch)
+            .map_err(|e| format!("supported network patch rejected: {e}"))?;
+        let mut cfg = Config::default();
+        let merged = serde_json::json!({
+            "version": cfg.version,
+            "general": cfg.general,
+            "proxy": cfg.proxy,
+            "network": patch["network"].clone(),
+            "stream": cfg.stream,
+            "logging": cfg.logging,
+        });
+        cfg = serde_json::from_value(merged)?;
+        cfg.validate()?;
+        assert_eq!(cfg.network.normalized_exit_country().as_deref(), Some("us"));
+        assert_eq!(cfg.network.ip_version, IpVersionPreference::Ipv6Preferred);
+        assert!(cfg.network.has_stream_prefs());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_exit_country() {
+        let mut cfg = Config::default();
+        cfg.network.exit_country = Some("USA".to_owned());
+        let err = cfg.validate();
+        assert!(matches!(err, Err(ConfigError::Invalid(_))));
     }
 
     #[test]

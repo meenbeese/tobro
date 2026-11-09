@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod custom_proxy;
 pub mod isolation;
 pub mod proxy;
 
@@ -235,9 +236,9 @@ impl Tor {
 ///
 /// When `bind_all_interfaces` is true, listeners bind to `0.0.0.0` (opt-in).
 ///
-/// If `stream_isolation` requires destination/port isolation (F-42), a thin
-/// proxy front-end applies isolation keys per stream and DNS is served via
-/// `arti::dns`. Otherwise, Arti's built-in `run_proxy` path is used.
+/// Uses Arti's built-in `run_proxy` when no custom isolation/frontend or
+/// network StreamPrefs are required. Otherwise uses tobro's custom proxy path
+/// to apply isolation and/or default StreamPrefs (M2).
 pub async fn serve(
     state_dir: &Path,
     cache_dir: &Path,
@@ -245,11 +246,13 @@ pub async fn serve(
     dns_port: u16,
     bind_all_interfaces: bool,
     stream_isolation: adapter::StreamIsolationPolicy,
+    network_prefs: adapter::NetworkStreamPrefs,
 ) -> anyhow::Result<()> {
     let config = client_config(state_dir, cache_dir)?;
+    let needs_custom = stream_isolation.needs_frontend() || network_prefs.is_active();
 
-    if stream_isolation.needs_frontend() {
-        return serve_with_isolation(
+    if needs_custom {
+        return serve_custom(
             state_dir,
             cache_dir,
             config,
@@ -257,6 +260,7 @@ pub async fn serve(
             dns_port,
             bind_all_interfaces,
             stream_isolation,
+            network_prefs,
         )
         .await;
     }
@@ -331,7 +335,10 @@ async fn serve_with_isolation(
     let frontend = proxy::run_isolation_frontend(
         stream_isolation,
         std::net::SocketAddr::new(bind_ip, socks_port),
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), backend_socks_port),
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            backend_socks_port,
+        ),
         shutdown_rx,
     );
     tokio::pin!(frontend);
@@ -347,6 +354,55 @@ async fn serve_with_isolation(
             res.context("backend Tor proxy failed")
         }
     }
+}
+
+async fn serve_custom(
+    state_dir: &Path,
+    cache_dir: &Path,
+    config: TorClientConfig,
+    socks_port: u16,
+    dns_port: u16,
+    bind_all_interfaces: bool,
+    stream_isolation: adapter::StreamIsolationPolicy,
+    network_prefs: adapter::NetworkStreamPrefs,
+) -> anyhow::Result<()> {
+    // If only destination/port isolation is needed and no network StreamPrefs,
+    // preserve the proven forwarding front-end path.
+    if !network_prefs.is_active() && stream_isolation.needs_frontend() {
+        return serve_with_isolation(
+            state_dir,
+            cache_dir,
+            config,
+            socks_port,
+            dns_port,
+            bind_all_interfaces,
+            stream_isolation,
+        )
+        .await;
+    }
+
+    // Custom path: own the TorClient so we can apply default StreamPrefs
+    // (exit country, IPv6, M2) and isolation.
+    let client = Client::builder()
+        .config(config)
+        .bootstrap_behavior(BootstrapBehavior::OnDemand)
+        .create_unbootstrapped_async()
+        .await
+        .context("could not create the serving Arti client")?;
+    client
+        .bootstrap()
+        .await
+        .context("Arti bootstrap failed for custom proxy")?;
+
+    custom_proxy::serve(
+        client,
+        socks_port,
+        dns_port,
+        bind_all_interfaces,
+        stream_isolation,
+        network_prefs,
+    )
+    .await
 }
 
 fn listen_for_port(port: u16, bind_all_interfaces: bool) -> anyhow::Result<Listen> {

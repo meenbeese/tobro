@@ -195,41 +195,77 @@ mod tests {
     #[test]
     fn no_policy_ignores_dest_port_protocol() {
         let p = policy(false, false, false, false);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::HttpConnect, "b.example", 443, &[]));
+        let a =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
+        let b = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::HttpConnect,
+            "b.example",
+            443,
+            &[],
+        ));
         assert!(a.compatible_same_type(&b));
     }
 
     #[test]
     fn isolate_destination_separates_hosts() {
         let p = policy(true, false, false, false);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "b.example", 80, &[]));
+        let a =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
+        let b =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "b.example", 80, &[]));
         assert!(!a.compatible_same_type(&b));
     }
 
     #[test]
     fn isolate_port_separates_ports() {
         let p = policy(false, true, false, false);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 443, &[]));
+        let a =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
+        let b =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 443, &[]));
         assert!(!a.compatible_same_type(&b));
     }
 
     #[test]
     fn isolate_protocol_separates_protocols() {
         let p = policy(false, false, true, false);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::HttpConnect, "a.example", 80, &[]));
+        let a =
+            TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, &[]));
+        let b = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::HttpConnect,
+            "a.example",
+            80,
+            &[],
+        ));
         assert!(!a.compatible_same_type(&b));
     }
 
     #[test]
     fn socks_auth_isolates_when_present() {
         let p = policy(false, false, false, true);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, b"user1"));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, b"user2"));
-        let c = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "a.example", 80, b"user1"));
+        let a = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::Socks,
+            "a.example",
+            80,
+            b"user1",
+        ));
+        let b = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::Socks,
+            "a.example",
+            80,
+            b"user2",
+        ));
+        let c = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::Socks,
+            "a.example",
+            80,
+            b"user1",
+        ));
         assert!(!a.compatible_same_type(&b));
         assert!(a.compatible_same_type(&c));
         assert!(a.enables_long_lived_circuits());
@@ -238,8 +274,20 @@ mod tests {
     #[test]
     fn destination_normalization_is_case_insensitive() {
         let p = policy(true, false, false, false);
-        let a = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "EXAMPLE.ONION.", 80, &[]));
-        let b = TobroIsolationKey::from_input(&input(p, ClientProtocol::Socks, "example.onion", 80, &[]));
+        let a = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::Socks,
+            "EXAMPLE.ONION.",
+            80,
+            &[],
+        ));
+        let b = TobroIsolationKey::from_input(&input(
+            p,
+            ClientProtocol::Socks,
+            "example.onion",
+            80,
+            &[],
+        ));
         assert!(a.compatible_same_type(&b));
     }
 }

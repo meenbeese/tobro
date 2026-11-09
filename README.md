@@ -29,15 +29,22 @@ destination/port/protocol isolation and SOCKS auth keep-alive isolation;
 destination/port isolation is applied by a thin isolation pre-proxy that
 injects Arti-compatible SOCKS auth / HTTP `Tor-Stream-Isolation` tokens, while
 SOCKS auth isolation remains native to Arti,
-desktop Advanced Settings behind a power-user gate with listener/bind-all
-editing and config import/export (no secrets), and a standalone log viewer
-(filters, copy/save, wrap, persisted redaction preference) plus daemon/UI
+exit country / IPv6 / `StreamPrefs` defaults (M2): configurable `[network]`
+settings (`exit_country` ISO 3166-1 alpha-2, `ip_version` preference) with
+validation and restart-required effects; applied via Arti `StreamPrefs` in a
+custom `TorClient` proxy/DNS path when custom network prefs or isolation are
+active (requires `arti-client` geoip for exit country),
+desktop Settings popup (tabbed: General, Node Configuration, Advanced Tor
+Configuration) behind a power-user gate with proxy/listener/bind-all editing,
+Node Configuration exit-country/IP-version controls, stream-isolation controls,
+and config import/export (redacted, no secrets), plus a standalone log viewer
+(filters, copy/save, wrap, persisted redaction preference) and daemon/UI
 redaction hardening.
 
-M2 still open: exit country/IPv6/`StreamPrefs` defaults, and runtime/cross-OS
-verification for M2 exit criteria (new identity, port conflicts, bind-all
-exposure, stream isolation behavior, opt-in `.onion` resolution on a live Tor
-network, and feature tests for every exposed knob).
+M2 still open: runtime/cross-OS verification for M2 exit criteria (exit country
+and IPv6/`StreamPrefs` behavior on a live Tor network, new identity, port
+conflicts, bind-all exposure, stream isolation behavior, opt-in `.onion`
+resolution, and feature tests for every exposed knob).
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 

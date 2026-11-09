@@ -213,15 +213,6 @@ export default function App() {
     }
   }
 
-  async function refreshStatus() {
-    try {
-      const initial = await invoke<DaemonStatus>("status");
-      if (initial) setStatus(initial);
-    } catch {
-      // ignore
-    }
-  }
-
   const percent = Math.max(0, Math.min(100, status?.bootstrap?.percent ?? 0));
   const showProgress = isActive || status?.state === "error";
 

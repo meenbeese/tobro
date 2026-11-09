@@ -134,6 +134,23 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
                 isolate_protocol: config.stream.isolate_protocol,
                 keep_alive_isolation: config.stream.keep_alive_isolation,
             },
+            network_prefs: tobro_tor::adapter::NetworkStreamPrefs {
+                exit_country: config.network.normalized_exit_country(),
+                ip_version: match config.network.ip_version {
+                    tobro_config::IpVersionPreference::Ipv4Preferred => {
+                        tobro_tor::adapter::IpVersionPref::Ipv4Preferred
+                    }
+                    tobro_config::IpVersionPreference::Ipv6Preferred => {
+                        tobro_tor::adapter::IpVersionPref::Ipv6Preferred
+                    }
+                    tobro_config::IpVersionPreference::Ipv4Only => {
+                        tobro_tor::adapter::IpVersionPref::Ipv4Only
+                    }
+                    tobro_config::IpVersionPreference::Ipv6Only => {
+                        tobro_tor::adapter::IpVersionPref::Ipv6Only
+                    }
+                },
+            },
         }));
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),

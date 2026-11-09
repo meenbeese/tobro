@@ -287,7 +287,8 @@ fn config_effects(
         || current.proxy.dns_port != next.proxy.dns_port
         || current.proxy.bind_all_interfaces != next.proxy.bind_all_interfaces;
     let stream_changed = current.stream != next.stream;
-    let restart_required = listeners_changed || stream_changed;
+    let network_changed = current.network != next.network;
+    let restart_required = listeners_changed || stream_changed || network_changed;
     let mut warnings = tobro_config::proxy_warnings(&next.proxy);
     if next.stream.needs_isolation_frontend() {
         warnings.push(
@@ -295,9 +296,15 @@ fn config_effects(
                 .to_owned(),
         );
     }
+    if next.network.normalized_exit_country().is_some() {
+        warnings.push(
+            "exit country preference is set: availability depends on Tor network/geoip data and may reduce path diversity"
+                .to_owned(),
+        );
+    }
     if running && restart_required {
         warnings.push(
-            "active runtime requires stop/connect (or restart) for listener or stream isolation changes to take effect"
+            "active runtime requires stop/connect (or restart) for listener, stream isolation, or network/StreamPrefs changes to take effect"
                 .to_owned(),
         );
     }
@@ -305,6 +312,7 @@ fn config_effects(
         "restart_required": restart_required,
         "listeners_changed": listeners_changed,
         "stream_changed": stream_changed,
+        "network_changed": network_changed,
         "runtime_active": running,
         "warnings": warnings,
     })
@@ -360,6 +368,23 @@ fn config_apply_patch(
             isolate_protocol: next.stream.isolate_protocol,
             keep_alive_isolation: next.stream.keep_alive_isolation,
         },
+        network_prefs: tobro_tor::adapter::NetworkStreamPrefs {
+            exit_country: next.network.normalized_exit_country(),
+            ip_version: match next.network.ip_version {
+                tobro_config::IpVersionPreference::Ipv4Preferred => {
+                    tobro_tor::adapter::IpVersionPref::Ipv4Preferred
+                }
+                tobro_config::IpVersionPreference::Ipv6Preferred => {
+                    tobro_tor::adapter::IpVersionPref::Ipv6Preferred
+                }
+                tobro_config::IpVersionPreference::Ipv4Only => {
+                    tobro_tor::adapter::IpVersionPref::Ipv4Only
+                }
+                tobro_config::IpVersionPreference::Ipv6Only => {
+                    tobro_tor::adapter::IpVersionPref::Ipv6Only
+                }
+            },
+        },
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -376,6 +401,11 @@ fn config_apply_patch(
             "http_port": next_listeners.effective_http_port(),
             "dns_port": next_listeners.dns_port,
             "bind_all_interfaces": next_listeners.bind_all_interfaces,
+        },
+        "network": {
+            "exit_country": next.network.normalized_exit_country(),
+            "ip_version": next.network.ip_version,
+            "has_stream_prefs": next.network.has_stream_prefs(),
         },
         "stream": {
             "isolate_destination": next.stream.isolate_destination,
@@ -488,13 +518,22 @@ impl DaemonControl for SupervisorControl {
                     isolate_protocol: config.stream.isolate_protocol,
                     keep_alive_isolation: config.stream.keep_alive_isolation,
                 },
+                network_prefs: tobro_tor::adapter::NetworkStreamPrefs {
+                    exit_country: config.network.normalized_exit_country(),
+                    ip_version: match config.network.ip_version {
+                        tobro_config::IpVersionPreference::Ipv4Preferred => tobro_tor::adapter::IpVersionPref::Ipv4Preferred,
+                        tobro_config::IpVersionPreference::Ipv6Preferred => tobro_tor::adapter::IpVersionPref::Ipv6Preferred,
+                        tobro_config::IpVersionPreference::Ipv4Only => tobro_tor::adapter::IpVersionPref::Ipv4Only,
+                        tobro_config::IpVersionPreference::Ipv6Only => tobro_tor::adapter::IpVersionPref::Ipv6Only,
+                    },
+                },
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
                 Err(poisoned) => *poisoned.into_inner() = next.clone(),
             }
             let apply = if running {
-                "validated and saved for next connection; active listeners/stream isolation require stop/connect to apply"
+                "validated and saved for next connection; active listeners/stream isolation/network prefs require stop/connect to apply"
             } else {
                 "validated and applied for next connection"
             };
@@ -508,6 +547,11 @@ impl DaemonControl for SupervisorControl {
                     "http_port": next.effective_http_port(),
                     "dns_port": next.dns_port,
                     "bind_all_interfaces": next.bind_all_interfaces
+                },
+                "network": {
+                    "exit_country": config.network.normalized_exit_country(),
+                    "ip_version": config.network.ip_version,
+                    "has_stream_prefs": config.network.has_stream_prefs(),
                 },
                 "stream": {
                     "isolate_destination": config.stream.isolate_destination,
@@ -1350,8 +1394,8 @@ mod config_tests {
     }
 
     #[test]
-    fn config_apply_stream_isolation_requires_restart_when_running(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn config_apply_stream_isolation_requires_restart_when_running()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
         let path = dir.path().join("config.toml");
         tobro_config::Config::default().save(&path)?;

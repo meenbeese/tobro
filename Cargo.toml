@@ -29,9 +29,9 @@ publish = false
 
 [workspace.dependencies]
 # --- Tor / Arti -----------------------------------------------------------
-# `experimental-api` exposes the proxy/DNS server APIs we need.
+# `experimental-api` exposes proxy/DNS server APIs; `geoip` enables exit country (F-37/M2).
 arti = { version = "=2.8.0", features = ["experimental-api", "http-connect", "dns-proxy"] }
-arti-client = "=0.48.0"
+arti-client = { version = "=0.48.0", features = ["geoip"] }
 tor-config = "=0.48.0"
 tor-rtcompat = { version = "=0.48.0", features = ["tokio", "native-tls"] }
 
@@ -74,6 +74,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 libsql = "0.6"
 keyring = "4"
 zeroize = "1"
+hickory-proto = "0.26"
 
 # --- HTTP (Moat, bridge data, updates) -----------------------------------
 reqwest = { version = "0.13", default-features = false, features = [
