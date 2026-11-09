@@ -58,8 +58,9 @@ export function ConnectionInfo({
 }: ConnectionInfoProps) {
   const [now, setNow] = useState(Date.now());
 
-  const isConnected = reachable && (status?.state === "connected" || status?.state === "serving");
-  
+  const isConnected =
+    reachable && (status?.state === "connected" || status?.state === "serving");
+
   useEffect(() => {
     if (!isConnected || !connectedAt) {
       return;
@@ -80,8 +81,12 @@ export function ConnectionInfo({
   const httpPort = status?.http_port ?? status?.socks_port ?? "—";
   const dnsPort = status?.dns_port ?? "—";
 
-  const socksUrl = typeof socksPort === "number" ? `socks5h://${socksHost}:${socksPort}` : null;
-  const httpProxy = typeof httpPort === "number" ? `http://${socksHost}:${httpPort}` : null;
+  const socksUrl =
+    typeof socksPort === "number"
+      ? `socks5h://${socksHost}:${socksPort}`
+      : null;
+  const httpProxy =
+    typeof httpPort === "number" ? `http://${socksHost}:${httpPort}` : null;
 
   if (!reachable || !status) {
     return null;
@@ -93,7 +98,9 @@ export function ConnectionInfo({
         <>
           <div className="connection-row">
             <span className="connection-label">Status</span>
-            <span className="connection-value connection-value-good">Connected via Tor</span>
+            <span className="connection-value connection-value-good">
+              Connected via Tor
+            </span>
           </div>
           {duration ? (
             <div className="connection-row">
@@ -103,7 +110,9 @@ export function ConnectionInfo({
           ) : null}
           <div className="connection-row">
             <span className="connection-label">Exit</span>
-            <span className="connection-value connection-value-muted">Unknown</span>
+            <span className="connection-value connection-value-muted">
+              Unknown
+            </span>
           </div>
           <div className="connection-section">
             <div className="connection-section-title">Proxy endpoints</div>
@@ -114,7 +123,9 @@ export function ConnectionInfo({
                   {socksHost}:{socksPort}
                 </code>
               </div>
-              {showCopyButtons && socksUrl ? <CopyButton text={socksUrl} label="Copy" /> : null}
+              {showCopyButtons && socksUrl ? (
+                <CopyButton text={socksUrl} label="Copy" />
+              ) : null}
             </div>
             <div className="connection-endpoint">
               <div className="connection-endpoint-info">
@@ -123,7 +134,9 @@ export function ConnectionInfo({
                   {socksHost}:{httpPort}
                 </code>
               </div>
-              {showCopyButtons && httpProxy ? <CopyButton text={httpProxy} label="Copy" /> : null}
+              {showCopyButtons && httpProxy ? (
+                <CopyButton text={httpProxy} label="Copy" />
+              ) : null}
             </div>
             <div className="connection-endpoint">
               <div className="connection-endpoint-info">
@@ -142,7 +155,8 @@ export function ConnectionInfo({
         <div className="connection-row">
           <span className="connection-label">Proxies</span>
           <span className="connection-value connection-value-muted">
-            {socksHost}:{socksPort} (SOCKS) • {socksHost}:{httpPort} (HTTP) • {socksHost}:{dnsPort} (DNS)
+            {socksHost}:{socksPort} (SOCKS) • {socksHost}:{httpPort} (HTTP) •{" "}
+            {socksHost}:{dnsPort} (DNS)
           </span>
         </div>
       )}

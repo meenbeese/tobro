@@ -22,7 +22,10 @@ export function CopyButton({
   const handleCopy = useCallback(async () => {
     if (disabled || !text) return;
     try {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      if (
+        navigator.clipboard &&
+        typeof navigator.clipboard.writeText === "function"
+      ) {
         await navigator.clipboard.writeText(text);
       } else {
         // Fallback for older environments

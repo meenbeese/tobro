@@ -426,14 +426,7 @@ fn handle_worker_msg(
     match msg {
         Some(WorkerMsg::Adapter(event)) => {
             let state_dir = last_start.as_ref().map(|(sd, _, _)| sd.as_path());
-            handle_adapter_event(
-                lifecycle,
-                event,
-                listeners,
-                state_dir,
-                status_tx,
-                events_tx,
-            );
+            handle_adapter_event(lifecycle, event, listeners, state_dir, status_tx, events_tx);
         }
         Some(WorkerMsg::Finished(result)) => {
             *worker = None;
@@ -571,46 +564,44 @@ fn handle_adapter_event(
                 debug!("adapter reported stopped");
             }
         },
-        AdapterEvent::OnionServiceStatus { id, status } => {
-            match &status {
-                tobro_tor::onion_service::OnionServiceRuntimeStatus::Published { onion_address } => {
-                    info!(%id, %onion_address, "onion service published");
-                    let _ = events_tx.send(SupervisorEvent::OnionPublished {
-                        id: id.clone(),
-                        onion_address: onion_address.clone(),
+        AdapterEvent::OnionServiceStatus { id, status } => match &status {
+            tobro_tor::onion_service::OnionServiceRuntimeStatus::Published { onion_address } => {
+                info!(%id, %onion_address, "onion service published");
+                let _ = events_tx.send(SupervisorEvent::OnionPublished {
+                    id: id.clone(),
+                    onion_address: onion_address.clone(),
+                });
+                if let Some(state_dir) = state_dir {
+                    let db_path = state_dir.join(tobro_store::DB_FILE_NAME);
+                    let id2 = id.clone();
+                    let addr2 = onion_address.clone();
+                    tokio::spawn(async move {
+                        if let Ok(db) = tobro_store::Db::open(&db_path).await {
+                            let patch = tobro_store::OnionServicePatch {
+                                name: None,
+                                enabled: None,
+                                ports: None,
+                                onion_address: Some(Some(addr2)),
+                            };
+                            let _ = db.update_onion_service(&id2, patch).await;
+                        }
                     });
-                    if let Some(state_dir) = state_dir {
-                        let db_path = state_dir.join(tobro_store::DB_FILE_NAME);
-                        let id2 = id.clone();
-                        let addr2 = onion_address.clone();
-                        tokio::spawn(async move {
-                            if let Ok(db) = tobro_store::Db::open(&db_path).await {
-                                let patch = tobro_store::OnionServicePatch {
-                                    name: None,
-                                    enabled: None,
-                                    ports: None,
-                                    onion_address: Some(Some(addr2)),
-                                };
-                                let _ = db.update_onion_service(&id2, patch).await;
-                            }
-                        });
-                    }
-                }
-                tobro_tor::onion_service::OnionServiceRuntimeStatus::Error { message } => {
-                    warn!(%id, %message, "onion service error");
-                    let _ = events_tx.send(SupervisorEvent::OnionError {
-                        id: id.clone(),
-                        message: message.clone(),
-                    });
-                }
-                tobro_tor::onion_service::OnionServiceRuntimeStatus::Starting => {
-                    debug!(%id, "onion service starting");
-                }
-                tobro_tor::onion_service::OnionServiceRuntimeStatus::Stopped => {
-                    debug!(%id, "onion service stopped");
                 }
             }
-        }
+            tobro_tor::onion_service::OnionServiceRuntimeStatus::Error { message } => {
+                warn!(%id, %message, "onion service error");
+                let _ = events_tx.send(SupervisorEvent::OnionError {
+                    id: id.clone(),
+                    message: message.clone(),
+                });
+            }
+            tobro_tor::onion_service::OnionServiceRuntimeStatus::Starting => {
+                debug!(%id, "onion service starting");
+            }
+            tobro_tor::onion_service::OnionServiceRuntimeStatus::Stopped => {
+                debug!(%id, "onion service stopped");
+            }
+        },
     }
 }
 

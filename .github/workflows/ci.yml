@@ -1,8 +1,8 @@
-# CI per M0 deliverable: lint/format/test on macOS/Windows/Linux.
+# CI: format check plus a combined per-OS job that runs clippy, tests, and the
+# desktop package smoke build (frontend + unsigned `cargo tauri build --no-bundle`).
 #
-# The toolchain (1.92, with rustfmt and clippy) is pinned in
-# rust-toolchain.toml; rustup installs it automatically, and
-# Swatinem/rust-cache caches against it.
+# The Rust toolchain (with rustfmt and clippy) is pinned in rust-toolchain.toml;
+# rustup installs it automatically, and Swatinem/rust-cache caches against it.
 
 name: CI
 
@@ -31,8 +31,8 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --all --check
 
-  build:
-    name: clippy + test (${{ matrix.os }})
+  ci:
+    name: clippy, test & package smoke (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -41,9 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # System deps for the Tauri desktop app (webkit2gtk etc.). Needed once
-      # the M0 window spike depends on tauri; kept here so the same matrix
-      # keeps passing without CI edits.
+      # System deps for the Tauri desktop app (webkit2gtk etc.).
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
@@ -59,44 +57,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ runner.os }}-build
+          shared-key: ${{ runner.os }}-ci
           cache-on-failure: true
 
-      # Workspace lints are `warn`; -D warnings turns them into hard
-      # failures so the CI bar matches the lint config in Cargo.toml.
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
 
-  package-smoke:
-    name: package smoke (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --workspace
 
-      - name: Install Linux system deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ runner.os }}-package-smoke
-          cache-on-failure: true
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
       - uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache

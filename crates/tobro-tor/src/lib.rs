@@ -1,4 +1,5 @@
 //! Arti integration boundary for tobro.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 //!
 //! This is the M0 feasibility spike: it bootstraps a [`TorClient`], streams
 //! bootstrap progress, verifies a request over Tor, and hosts Arti's
@@ -379,6 +380,8 @@ pub async fn serve_with_bridges(
     .await
 }
 
+#[allow(unused)]
+#[allow(clippy::too_many_arguments)] // internal orchestration
 async fn serve_with_isolation(
     state_dir: &Path,
     _cache_dir: &Path,

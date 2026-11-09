@@ -325,7 +325,7 @@ impl BridgeDistribution {
         transport_type: Option<&str>,
         country: Option<&str>,
     ) -> Vec<&'a BridgeSet> {
-        let t = transport_type.map(|s| normalize_protocol(s));
+        let t = transport_type.map(normalize_protocol);
         let c = country.map(|s| s.trim().to_ascii_lowercase());
         self.sets
             .iter()
@@ -443,7 +443,7 @@ fn normalize_protocol(p: &str) -> String {
 
 /// Infer the PT protocol name from a bridge line, if present.
 pub fn bridge_line_protocol(line: &str) -> Option<String> {
-    let mut parts = line.trim().split_whitespace();
+    let mut parts = line.split_whitespace();
     let first = parts.next()?;
     let proto = if first.eq_ignore_ascii_case("bridge") {
         parts.next()?

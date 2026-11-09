@@ -14,7 +14,10 @@ export function readThemePreference(): ThemePreference {
 }
 
 export function systemPrefersDark(): boolean {
-  return typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  return (
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-color-scheme: dark)").matches
+  );
 }
 
 export function resolvedTheme(pref: ThemePreference): "light" | "dark" {

@@ -20,21 +20,15 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     {windowKind === "settings" ? (
       <main className="app settings-window">
-        <Settings
-          onClose={() => void getCurrentWindow().close()}
-        />
+        <Settings onClose={() => void getCurrentWindow().close()} />
       </main>
     ) : windowKind === "about" ? (
       <main className="app about-window">
-        <About
-          onClose={() => void getCurrentWindow().close()}
-        />
+        <About onClose={() => void getCurrentWindow().close()} />
       </main>
     ) : windowKind === "logs" ? (
       <main className="app logs-window">
-        <Logs
-          onClose={() => void getCurrentWindow().close()}
-        />
+        <Logs onClose={() => void getCurrentWindow().close()} />
       </main>
     ) : (
       <App />

@@ -84,8 +84,12 @@ export function LogViewer({
   const [open, setOpen] = useState(collapsible ? defaultOpen : true);
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState<LevelFilter>("all");
-  const [applyRedaction, setApplyRedaction] = useState(() => readBoolPref(PREF_REDACT, true));
-  const [wrapLines, setWrapLines] = useState(() => readBoolPref(PREF_WRAP, true));
+  const [applyRedaction, setApplyRedaction] = useState(() =>
+    readBoolPref(PREF_REDACT, true),
+  );
+  const [wrapLines, setWrapLines] = useState(() =>
+    readBoolPref(PREF_WRAP, true),
+  );
   const [message, setMessage] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [pinnedToBottom, setPinnedToBottom] = useState(true);
@@ -163,7 +167,10 @@ export function LogViewer({
     if (!el) return;
     const count = displayEntries.length;
     if (pinnedToBottom) {
-      if (count !== lastSeenCountRef.current || el.scrollHeight > el.clientHeight) {
+      if (
+        count !== lastSeenCountRef.current ||
+        el.scrollHeight > el.clientHeight
+      ) {
         scrollToLatest("auto");
       } else {
         lastSeenCountRef.current = count;
@@ -187,7 +194,9 @@ export function LogViewer({
     try {
       const text = serializeEntries(filtered, applyRedaction);
       await navigator.clipboard.writeText(text);
-      setMessage(`Copied ${filtered.length} entr${filtered.length === 1 ? "y" : "ies"}.`);
+      setMessage(
+        `Copied ${filtered.length} entr${filtered.length === 1 ? "y" : "ies"}.`,
+      );
     } catch (e) {
       setError(`Copy failed: ${String(e)}`);
     }
@@ -198,8 +207,13 @@ export function LogViewer({
     setMessage("");
     try {
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      downloadText(`tobro-logs-${stamp}.txt`, serializeEntries(filtered, applyRedaction));
-      setMessage(`Saved ${filtered.length} entr${filtered.length === 1 ? "y" : "ies"}.`);
+      downloadText(
+        `tobro-logs-${stamp}.txt`,
+        serializeEntries(filtered, applyRedaction),
+      );
+      setMessage(
+        `Saved ${filtered.length} entr${filtered.length === 1 ? "y" : "ies"}.`,
+      );
     } catch (e) {
       setError(`Save failed: ${String(e)}`);
     }
@@ -212,7 +226,9 @@ export function LogViewer({
   }
 
   return (
-    <section className={`card logs ${isOpen ? "open" : "collapsed"} ${className ?? ""}`.trim()}>
+    <section
+      className={`card logs ${isOpen ? "open" : "collapsed"} ${className ?? ""}`.trim()}
+    >
       <div className="logs-header">
         <h2>{title}</h2>
         <div className="logs-header-actions">
@@ -237,7 +253,11 @@ export function LogViewer({
 
       {isOpen ? (
         <div id="event-log-panel">
-          <div className="log-controls" role="group" aria-label="Log filters and actions">
+          <div
+            className="log-controls"
+            role="group"
+            aria-label="Log filters and actions"
+          >
             <label className="log-control">
               <span className="sr-only">Filter by text</span>
               <input
@@ -250,7 +270,11 @@ export function LogViewer({
             </label>
             <label className="log-control">
               <span className="sr-only">Filter by level</span>
-              <select value={level} onChange={(e) => setLevel(e.target.value as LevelFilter)} aria-label="Log level filter">
+              <select
+                value={level}
+                onChange={(e) => setLevel(e.target.value as LevelFilter)}
+                aria-label="Log level filter"
+              >
                 <option value="all">All levels</option>
                 <option value="info">Info</option>
                 <option value="error">Errors</option>
@@ -273,14 +297,26 @@ export function LogViewer({
               Wrap
             </label>
             <div className="log-actions">
-              <button type="button" onClick={() => void onCopy()} disabled={filtered.length === 0}>
+              <button
+                type="button"
+                onClick={() => void onCopy()}
+                disabled={filtered.length === 0}
+              >
                 Copy
               </button>
-              <button type="button" onClick={onSave} disabled={filtered.length === 0}>
+              <button
+                type="button"
+                onClick={onSave}
+                disabled={filtered.length === 0}
+              >
                 Save
               </button>
               {onClear ? (
-                <button type="button" onClick={onClearClick} disabled={entries.length === 0}>
+                <button
+                  type="button"
+                  onClick={onClearClick}
+                  disabled={entries.length === 0}
+                >
                   Clear
                 </button>
               ) : null}
@@ -317,10 +353,21 @@ export function LogViewer({
               </li>
             ) : null}
             {displayEntries.map((entry) => (
-              <li key={entry.id} className={`log-line ${entry.level === "error" ? "error" : ""}`}>
-                <span className="log-ts" title={entry.ts}>{formatStamp(entry.ts)}</span>
-                <span className={`log-level ${entry.level === "error" ? "error" : "info"}`}>[{entry.level}]</span>
-                <span className={`log-source ${entry.source ? "" : "empty"}`}>{entry.source ?? ""}</span>
+              <li
+                key={entry.id}
+                className={`log-line ${entry.level === "error" ? "error" : ""}`}
+              >
+                <span className="log-ts" title={entry.ts}>
+                  {formatStamp(entry.ts)}
+                </span>
+                <span
+                  className={`log-level ${entry.level === "error" ? "error" : "info"}`}
+                >
+                  [{entry.level}]
+                </span>
+                <span className={`log-source ${entry.source ? "" : "empty"}`}>
+                  {entry.source ?? ""}
+                </span>
                 <span className="log-text">{entry.displayText}</span>
               </li>
             ))}

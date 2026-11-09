@@ -34,7 +34,10 @@ function redactLabeledSecrets(input: string): string {
       `(^|[^A-Za-z0-9_-])(${label.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")})([\\s:=\\"']+)([^\\s&;,\\"'\\r\\n]+)`,
       "gi",
     );
-    out = out.replace(re, (_m, pre, lab, sep) => `${pre}${lab}${sep}${REDACTED}`);
+    out = out.replace(
+      re,
+      (_m, pre, lab, sep) => `${pre}${lab}${sep}${REDACTED}`,
+    );
   }
   return out;
 }

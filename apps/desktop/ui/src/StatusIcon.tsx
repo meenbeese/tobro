@@ -1,5 +1,3 @@
-import type { ReactNode } from "react";
-
 export type DaemonState =
   | "starting"
   | "bootstrapping"
@@ -37,11 +35,18 @@ function getTitle(state?: string | null, reachable?: boolean): string {
   return "Unknown";
 }
 
-export function StatusIcon({ state, reachable = false, size = 20, className = "" }: StatusIconProps) {
+export function StatusIcon({
+  state,
+  reachable = false,
+  size = 20,
+  className = "",
+}: StatusIconProps) {
   const color = getColor(state, reachable);
   const title = getTitle(state, reachable);
-  const isActive = reachable && (state === "starting" || state === "bootstrapping");
-  const isConnected = reachable && (state === "connected" || state === "serving");
+  const isActive =
+    reachable && (state === "starting" || state === "bootstrapping");
+  const isConnected =
+    reachable && (state === "connected" || state === "serving");
 
   return (
     <svg
@@ -53,12 +58,25 @@ export function StatusIcon({ state, reachable = false, size = 20, className = ""
       className={`status-icon ${className} ${isConnected ? "status-icon-connected" : ""} ${isActive ? "status-icon-active" : ""}`}
       role="img"
       aria-label={title}
-      title={title}
     >
-      <circle cx="12" cy="12" r="9" stroke={color} strokeWidth="1.5" opacity="0.4" />
+      <title>{title}</title>
+      <circle
+        cx="12"
+        cy="12"
+        r="9"
+        stroke={color}
+        strokeWidth="1.5"
+        opacity="0.4"
+      />
       <circle cx="12" cy="12" r="5.5" stroke={color} strokeWidth="2" />
       {isConnected ? (
-        <path d="M9.5 12.2L11 13.7L14.5 10.2" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        <path
+          d="M9.5 12.2L11 13.7L14.5 10.2"
+          stroke={color}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
       ) : isActive ? (
         <path
           d="M12 7V12L14.5 13.5"

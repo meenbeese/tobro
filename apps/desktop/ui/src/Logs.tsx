@@ -20,7 +20,11 @@ export function Logs({ onClose }: LogsProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const nextLogId = useRef(1);
 
-  function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
+  function appendLog(
+    text: string,
+    level: "info" | "error" = "info",
+    source?: string,
+  ) {
     const entry: LogEntry = {
       id: nextLogId.current++,
       ts: new Date().toISOString(),
@@ -47,7 +51,8 @@ export function Logs({ onClose }: LogsProps) {
         if (kind === "status") return;
         if (kind === "reachable") {
           const p = payload as { socket?: string };
-          if (p?.socket) appendLog(`daemon reachable (${p.socket})`, "info", "daemon");
+          if (p?.socket)
+            appendLog(`daemon reachable (${p.socket})`, "info", "daemon");
           else appendLog("daemon reachable", "info", "daemon");
           return;
         }
@@ -72,8 +77,13 @@ export function Logs({ onClose }: LogsProps) {
           return;
         }
         if (kind === "ui.log") {
-          const p = payload as { text?: string; level?: "info" | "error"; source?: string };
-          if (p?.text) appendLog(p.text, p.level === "error" ? "error" : "info", p.source);
+          const p = payload as {
+            text?: string;
+            level?: "info" | "error";
+            source?: string;
+          };
+          if (p?.text)
+            appendLog(p.text, p.level === "error" ? "error" : "info", p.source);
           return;
         }
         if (kind === "event") {
@@ -88,14 +98,22 @@ export function Logs({ onClose }: LogsProps) {
           } else if (e.method === "daemon.state_changed") {
             const s = (e.params ?? {}) as { state?: string; message?: string };
             const detail = s.message ? ` — ${s.message}` : "";
-            appendLog(`state → ${s.state ?? "?"}${detail}`, s.state === "error" ? "error" : "info", "daemon");
+            appendLog(
+              `state → ${s.state ?? "?"}${detail}`,
+              s.state === "error" ? "error" : "info",
+              "daemon",
+            );
           } else if (e.method) {
             appendLog(e.method, "info", "daemon");
           }
         }
       });
     })();
-    appendLog("Log window opened. Live daemon events will appear here.", "info", "ui");
+    appendLog(
+      "Log window opened. Live daemon events will appear here.",
+      "info",
+      "ui",
+    );
     return () => {
       if (unlisten) void unlisten();
     };

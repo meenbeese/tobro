@@ -30,7 +30,9 @@ export async function setCaptureProtectionEnabled(enabled: boolean) {
     // ignore
   }
   await applyCaptureProtection(enabled);
-  window.dispatchEvent(new CustomEvent(CAPTURE_PROTECTION_EVENT, { detail: enabled }));
+  window.dispatchEvent(
+    new CustomEvent(CAPTURE_PROTECTION_EVENT, { detail: enabled }),
+  );
   try {
     await emit(CAPTURE_PROTECTION_EVENT, { enabled });
   } catch {
@@ -42,7 +44,8 @@ export function initCaptureProtection() {
   const enabled = readCaptureProtectionEnabled();
   void applyCaptureProtection(enabled);
 
-  const sync = () => void applyCaptureProtection(readCaptureProtectionEnabled());
+  const sync = () =>
+    void applyCaptureProtection(readCaptureProtectionEnabled());
 
   window.addEventListener("storage", (e) => {
     if (e.key === CAPTURE_PROTECTION_KEY) sync();

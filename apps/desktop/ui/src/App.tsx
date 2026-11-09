@@ -2,7 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { GearSix, Info } from "@phosphor-icons/react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import appIconUrl from "./assets/icon.svg";
 import { StatusIcon } from "./StatusIcon";
 import { ConnectionInfo } from "./ConnectionInfo";
@@ -52,9 +59,11 @@ function formatStatus(status: DaemonStatus | null, reachable: boolean): string {
   if (!reachable) return "Ready to connect";
   if (!status) return "Waiting for status…";
   const bootstrap = status.bootstrap;
-  const percent = typeof bootstrap?.percent === "number" ? `${bootstrap.percent}%` : "";
+  const percent =
+    typeof bootstrap?.percent === "number" ? `${bootstrap.percent}%` : "";
   const detail = bootstrap?.detail ? ` — ${bootstrap.detail}` : "";
-  if (status.state === "bootstrapping") return `Bootstrapping ${percent}${detail}`.trim();
+  if (status.state === "bootstrapping")
+    return `Bootstrapping ${percent}${detail}`.trim();
   if (status.state === "connected" || status.state === "serving") {
     return `Connected${percent ? ` (${percent})` : ""}${detail}`;
   }
@@ -77,7 +86,11 @@ export default function App() {
   const [connectedAt, setConnectedAt] = useState<number | null>(null);
   const idleTimer = useRef<number | null>(null);
 
-  function appendLog(text: string, level: "info" | "error" = "info", source = "ui") {
+  function appendLog(
+    text: string,
+    level: "info" | "error" = "info",
+    source = "ui",
+  ) {
     void emit("tobro-event", {
       kind: "ui.log",
       payload: { text, level, source, ts: new Date().toISOString() },
@@ -95,8 +108,10 @@ export default function App() {
             setStatus((prev) => {
               const prevState = prev?.state;
               const nextState = newStatus.state;
-              const wasConnected = prevState === "connected" || prevState === "serving";
-              const isNowConnected = nextState === "connected" || nextState === "serving";
+              const wasConnected =
+                prevState === "connected" || prevState === "serving";
+              const isNowConnected =
+                nextState === "connected" || nextState === "serving";
               if (!wasConnected && isNowConnected) {
                 setConnectedAt(Date.now());
               } else if (wasConnected && !isNowConnected) {
@@ -149,7 +164,11 @@ export default function App() {
           } else if (e.method === "daemon.state_changed") {
             const s = (e.params ?? {}) as { state?: string; message?: string };
             const detail = s.message ? ` — ${s.message}` : "";
-            appendLog(`state → ${s.state ?? "?"}${detail}`, s.state === "error" ? "error" : "info", "daemon");
+            appendLog(
+              `state → ${s.state ?? "?"}${detail}`,
+              s.state === "error" ? "error" : "info",
+              "daemon",
+            );
           } else if (e.method) {
             appendLog(`${e.method}`, "info", "daemon");
           }
@@ -173,29 +192,43 @@ export default function App() {
     };
   }, []);
 
-  const headline = useMemo(() => formatStatus(status, reachable), [status, reachable]);
-  const isActive = reachable && (status?.state === "starting" || status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving");
+  const headline = useMemo(
+    () => formatStatus(status, reachable),
+    [status, reachable],
+  );
+  const isActive =
+    reachable &&
+    (status?.state === "starting" ||
+      status?.state === "bootstrapping" ||
+      status?.state === "connected" ||
+      status?.state === "serving");
   // Allow Connect even when the local daemon is unavailable so the desktop can
   // start tobrod and connect with a single button (Orbot parity).
   const canConnect = !busy && !isActive && status?.state !== "stopping";
-  const canNewIdentity = reachable && !busy && (status?.state === "connected" || status?.state === "serving");
+  const canNewIdentity =
+    reachable &&
+    !busy &&
+    (status?.state === "connected" || status?.state === "serving");
 
-  const refreshLockStatus = useCallback(async (opts?: { lockIfEnabled?: boolean }) => {
-    try {
-      const s = await invoke<AppLockStatus>("get_app_lock_status");
-      setLockStatus(s);
-      const shouldBeLockable = s.enabled && s.has_password;
-      if (!shouldBeLockable) {
-        setLocked(false);
-      } else if (opts?.lockIfEnabled) {
-        setLocked(true);
+  const refreshLockStatus = useCallback(
+    async (opts?: { lockIfEnabled?: boolean }) => {
+      try {
+        const s = await invoke<AppLockStatus>("get_app_lock_status");
+        setLockStatus(s);
+        const shouldBeLockable = s.enabled && s.has_password;
+        if (!shouldBeLockable) {
+          setLocked(false);
+        } else if (opts?.lockIfEnabled) {
+          setLocked(true);
+        }
+        return s;
+      } catch (e) {
+        appendLog(`app lock status: ${String(e)}`, "error", "ui");
+        return null;
       }
-      return s;
-    } catch (e) {
-      appendLog(`app lock status: ${String(e)}`, "error", "ui");
-      return null;
-    }
-  }, []);
+    },
+    [],
+  );
 
   useEffect(() => {
     void refreshLockStatus({ lockIfEnabled: true });
@@ -212,8 +245,16 @@ export default function App() {
         setUnlockError("");
       }, ms);
     };
-    const events: (keyof WindowEventMap)[] = ["mousemove", "mousedown", "keydown", "touchstart", "scroll"];
-    events.forEach((ev) => window.addEventListener(ev, reset, { passive: true }));
+    const events: (keyof WindowEventMap)[] = [
+      "mousemove",
+      "mousedown",
+      "keydown",
+      "touchstart",
+      "scroll",
+    ];
+    events.forEach((ev) =>
+      window.addEventListener(ev, reset, { passive: true }),
+    );
     reset();
     return () => {
       events.forEach((ev) => window.removeEventListener(ev, reset));
@@ -222,7 +263,12 @@ export default function App() {
         idleTimer.current = null;
       }
     };
-  }, [lockStatus?.enabled, lockStatus?.lock_on_idle, lockStatus?.idle_minutes, locked]);
+  }, [
+    lockStatus?.enabled,
+    lockStatus?.lock_on_idle,
+    lockStatus?.idle_minutes,
+    locked,
+  ]);
 
   useEffect(() => {
     const onVisibility = () => {
@@ -245,7 +291,11 @@ export default function App() {
     setUnlockBusy(true);
     setUnlockError("");
     try {
-      const res = await invoke<{ ok?: boolean; locked?: boolean; error?: string }>("unlock_app_lock", {
+      const res = await invoke<{
+        ok?: boolean;
+        locked?: boolean;
+        error?: string;
+      }>("unlock_app_lock", {
         password: unlockPassword || null,
         useOsAuth: false,
       });
@@ -266,7 +316,11 @@ export default function App() {
     setUnlockBusy(true);
     setUnlockError("");
     try {
-      const res = await invoke<{ ok?: boolean; locked?: boolean; error?: string }>("unlock_app_lock", {
+      const res = await invoke<{
+        ok?: boolean;
+        locked?: boolean;
+        error?: string;
+      }>("unlock_app_lock", {
         password: null,
         useOsAuth: true,
       });
@@ -274,7 +328,9 @@ export default function App() {
         setLocked(false);
         setUnlockPassword("");
       } else {
-        setUnlockError(res?.error || "OS authentication failed. Enter your password.");
+        setUnlockError(
+          res?.error || "OS authentication failed. Enter your password.",
+        );
       }
     } catch (err) {
       setUnlockError(String(err));
@@ -302,7 +358,11 @@ export default function App() {
         center: true,
       });
       settings.once("tauri://error", (e) => {
-        appendLog(`settings window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+        appendLog(
+          `settings window error: ${JSON.stringify(e.payload ?? e)}`,
+          "error",
+          "ui",
+        );
       });
     } catch (e) {
       appendLog(`failed to open settings: ${String(e)}`, "error", "ui");
@@ -328,7 +388,11 @@ export default function App() {
         center: true,
       });
       about.once("tauri://error", (e) => {
-        appendLog(`about window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+        appendLog(
+          `about window error: ${JSON.stringify(e.payload ?? e)}`,
+          "error",
+          "ui",
+        );
       });
     } catch (e) {
       appendLog(`failed to open about: ${String(e)}`, "error", "ui");
@@ -354,7 +418,11 @@ export default function App() {
         center: true,
       });
       logsWindow.once("tauri://error", (e) => {
-        appendLog(`logs window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+        appendLog(
+          `logs window error: ${JSON.stringify(e.payload ?? e)}`,
+          "error",
+          "ui",
+        );
       });
     } catch (e) {
       appendLog(`failed to open logs: ${String(e)}`, "error", "ui");
@@ -405,23 +473,40 @@ export default function App() {
   return (
     <>
       {locked ? (
-        <div className="lock-overlay" role="dialog" aria-modal="true" aria-labelledby="lock-title">
+        <div
+          className="lock-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="lock-title"
+        >
           <form className="lock-card card" onSubmit={(e) => void onUnlock(e)}>
             <h2 id="lock-title">Tobro is locked</h2>
             <p className="muted">
               App lock is enabled. Unlock with your password.
-              {lockStatus?.prefer_os_auth ? " OS authentication is preferred when available." : ""}
+              {lockStatus?.prefer_os_auth
+                ? " OS authentication is preferred when available."
+                : ""}
             </p>
             {lockStatus?.os_auth_available ? (
               <div className="actions">
-                <button type="button" className="primary" disabled={unlockBusy} onClick={() => void onTryOsAuth()}>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={unlockBusy}
+                  onClick={() => void onTryOsAuth()}
+                >
                   Use OS authentication
                 </button>
               </div>
             ) : lockStatus?.prefer_os_auth ? (
-              <p className="muted">OS authentication: {lockStatus.os_auth_method || "unavailable"}. Use your password.</p>
+              <p className="muted">
+                OS authentication: {lockStatus.os_auth_method || "unavailable"}.
+                Use your password.
+              </p>
             ) : null}
-            <label className="field-label" htmlFor="unlock-password">Password</label>
+            <label className="field-label" htmlFor="unlock-password">
+              Password
+            </label>
             <input
               id="unlock-password"
               type="password"
@@ -431,136 +516,214 @@ export default function App() {
               autoFocus
               disabled={unlockBusy}
             />
-            {unlockError ? <p className="error" role="alert">{unlockError}</p> : null}
+            {unlockError ? (
+              <p className="error" role="alert">
+                {unlockError}
+              </p>
+            ) : null}
             <div className="actions">
-              <button type="submit" className="primary" disabled={unlockBusy || !unlockPassword}>
+              <button
+                type="submit"
+                className="primary"
+                disabled={unlockBusy || !unlockPassword}
+              >
                 {unlockBusy ? "Unlocking…" : "Unlock"}
               </button>
             </div>
           </form>
         </div>
       ) : null}
-      <main className={`app${locked ? " app-locked" : ""}`} aria-hidden={locked || undefined}>
-      <header className="hero">
-        <div className="hero-top">
-          <div className="brand">
-            <img src={appIconUrl} alt="" className="app-icon" width={44} height={44} />
-            <div>
-              <h1>Tobro</h1>
-              <p className="muted">{daemonInfo || "Connecting to local daemon…"}</p>
+      <main
+        className={`app${locked ? " app-locked" : ""}`}
+        aria-hidden={locked || undefined}
+      >
+        <header className="hero">
+          <div className="hero-top">
+            <div className="brand">
+              <img
+                src={appIconUrl}
+                alt=""
+                className="app-icon"
+                width={44}
+                height={44}
+              />
+              <div>
+                <h1>Tobro</h1>
+                <p className="muted">
+                  {daemonInfo || "Connecting to local daemon…"}
+                </p>
+              </div>
             </div>
-          </div>
-          <div className="hero-utilities" aria-label="Settings and about">
-            <button
-              type="button"
-              className="toolbar-icon-button"
-              onClick={() => void openSettings()}
-              aria-haspopup="dialog"
-              aria-label="Settings"
-              title="Settings"
-            >
-              <GearSix size={20} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="toolbar-icon-button"
-              onClick={() => void openAbout()}
-              aria-haspopup="dialog"
-              aria-label="About"
-              title="About"
-            >
-              <Info size={20} aria-hidden="true" />
-            </button>
-          </div>
-        </div>
-        <nav className="toolbar" aria-label="App actions">
-          <button type="button" onClick={onNewIdentity} disabled={!canNewIdentity} title="Request new circuits (implemented). Guard state preserved.">
-            New identity
-          </button>
-          <button type="button" disabled title="Change exit country (coming soon)">
-            Change exit
-          </button>
-          <button type="button" onClick={() => void openLogs()} aria-haspopup="dialog" title="Logs">
-            Logs
-          </button>
-        </nav>
-      </header>
-
-      <section className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"} ${status?.state === "bootstrapping" || status?.state === "starting" ? "status-animating" : ""}`}>
-        <div className="status-header">
-          <StatusIcon state={status?.state} reachable={reachable} size={28} />
-          <div className="status-title-group">
-            <p className="headline">{headline}</p>
-            {reachable ? (
-              (() => {
-                const badgeLabel =
-                  status?.state === "connected" || status?.state === "serving"
-                    ? "Connected"
-                    : status?.state === "bootstrapping"
-                      ? "Bootstrapping"
-                      : status?.state === "starting"
-                        ? "Starting"
-                        : status?.state === "stopping"
-                          ? "Stopping"
-                          : status?.state === "stopped"
-                            ? "Stopped"
-                            : status?.state === "error"
-                              ? "Error"
-                              : "Unknown";
-                const headlineLower = headline.toLowerCase();
-                const badgeLower = badgeLabel.toLowerCase();
-                if (headlineLower === badgeLower || headlineLower === `${badgeLower}…` || headlineLower.startsWith(badgeLower)) {
-                  return null;
-                }
-                return <span className={`status-badge status-badge-${status?.state ?? "unknown"}`}>{badgeLabel}</span>;
-              })()
-            ) : (
-              <span className="status-badge status-badge-unreachable">Offline</span>
-            )}
-          </div>
-        </div>
-        {!reachable ? (
-          <p className="muted" style={{ marginTop: 0 }}>
-            If the local <code>tobrod</code> daemon is not running, Tobro will try to start it automatically when you connect.
-          </p>
-        ) : null}
-        {showProgress ? (
-          <div className="progress" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
-            <div className="progress-bar" style={{ width: `${percent}%` }} />
-          </div>
-        ) : null}
-        {status?.bootstrap?.blocked ? <p className="blocked">Blocked: {status.bootstrap.blocked}</p> : null}
-        {status?.bind_all_interfaces ? (
-          <p className="error bind-all-warning" role="alert">
-            Security warning: listeners are bound to all interfaces (SOCKS/HTTP/DNS exposed beyond localhost). Use firewall rules and trusted networks only.
-          </p>
-        ) : null}
-        <ConnectionInfo status={status} reachable={reachable} connectedAt={connectedAt} />
-        <p className="muted ports-hint">
-          Proxy, node, and advanced Tor settings are in <button type="button" className="link-button" onClick={() => void openSettings()}>Settings</button>.
-        </p>
-        <div className="actions">
-          {!isActive ? (
-            <button className="primary" onClick={onConnect} disabled={!canConnect}>
-              Connect
-            </button>
-          ) : (
-            <>
+            <div className="hero-utilities" aria-label="Settings and about">
               <button
                 type="button"
-                onClick={onNewIdentity}
-                disabled={!canNewIdentity}
-                title="Request new circuits. Guard state is preserved; this is not identical to Tor's NEWNYM."
+                className="toolbar-icon-button"
+                onClick={() => void openSettings()}
+                aria-haspopup="dialog"
+                aria-label="Settings"
+                title="Settings"
               >
-                New identity
+                <GearSix size={20} aria-hidden="true" />
               </button>
-              <button className="danger" onClick={onStop} disabled={!reachable || busy || status?.state === "stopping"}>
-                Stop
+              <button
+                type="button"
+                className="toolbar-icon-button"
+                onClick={() => void openAbout()}
+                aria-haspopup="dialog"
+                aria-label="About"
+                title="About"
+              >
+                <Info size={20} aria-hidden="true" />
               </button>
-            </>
-          )}
-        </div>
-      </section>
+            </div>
+          </div>
+          <nav className="toolbar" aria-label="App actions">
+            <button
+              type="button"
+              onClick={onNewIdentity}
+              disabled={!canNewIdentity}
+              title="Request new circuits (implemented). Guard state preserved."
+            >
+              New identity
+            </button>
+            <button
+              type="button"
+              disabled
+              title="Change exit country (coming soon)"
+            >
+              Change exit
+            </button>
+            <button
+              type="button"
+              onClick={() => void openLogs()}
+              aria-haspopup="dialog"
+              title="Logs"
+            >
+              Logs
+            </button>
+          </nav>
+        </header>
+
+        <section
+          className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"} ${status?.state === "bootstrapping" || status?.state === "starting" ? "status-animating" : ""}`}
+        >
+          <div className="status-header">
+            <StatusIcon state={status?.state} reachable={reachable} size={28} />
+            <div className="status-title-group">
+              <p className="headline">{headline}</p>
+              {reachable ? (
+                (() => {
+                  const badgeLabel =
+                    status?.state === "connected" || status?.state === "serving"
+                      ? "Connected"
+                      : status?.state === "bootstrapping"
+                        ? "Bootstrapping"
+                        : status?.state === "starting"
+                          ? "Starting"
+                          : status?.state === "stopping"
+                            ? "Stopping"
+                            : status?.state === "stopped"
+                              ? "Stopped"
+                              : status?.state === "error"
+                                ? "Error"
+                                : "Unknown";
+                  const headlineLower = headline.toLowerCase();
+                  const badgeLower = badgeLabel.toLowerCase();
+                  if (
+                    headlineLower === badgeLower ||
+                    headlineLower === `${badgeLower}…` ||
+                    headlineLower.startsWith(badgeLower)
+                  ) {
+                    return null;
+                  }
+                  return (
+                    <span
+                      className={`status-badge status-badge-${status?.state ?? "unknown"}`}
+                    >
+                      {badgeLabel}
+                    </span>
+                  );
+                })()
+              ) : (
+                <span className="status-badge status-badge-unreachable">
+                  Offline
+                </span>
+              )}
+            </div>
+          </div>
+          {!reachable ? (
+            <p className="muted" style={{ marginTop: 0 }}>
+              If the local <code>tobrod</code> daemon is not running, Tobro will
+              try to start it automatically when you connect.
+            </p>
+          ) : null}
+          {showProgress ? (
+            <div
+              className="progress"
+              role="progressbar"
+              aria-valuenow={percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div className="progress-bar" style={{ width: `${percent}%` }} />
+            </div>
+          ) : null}
+          {status?.bootstrap?.blocked ? (
+            <p className="blocked">Blocked: {status.bootstrap.blocked}</p>
+          ) : null}
+          {status?.bind_all_interfaces ? (
+            <p className="error bind-all-warning" role="alert">
+              Security warning: listeners are bound to all interfaces
+              (SOCKS/HTTP/DNS exposed beyond localhost). Use firewall rules and
+              trusted networks only.
+            </p>
+          ) : null}
+          <ConnectionInfo
+            status={status}
+            reachable={reachable}
+            connectedAt={connectedAt}
+          />
+          <p className="muted ports-hint">
+            Proxy, node, and advanced Tor settings are in{" "}
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => void openSettings()}
+            >
+              Settings
+            </button>
+            .
+          </p>
+          <div className="actions">
+            {!isActive ? (
+              <button
+                className="primary"
+                onClick={onConnect}
+                disabled={!canConnect}
+              >
+                Connect
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={onNewIdentity}
+                  disabled={!canNewIdentity}
+                  title="Request new circuits. Guard state is preserved; this is not identical to Tor's NEWNYM."
+                >
+                  New identity
+                </button>
+                <button
+                  className="danger"
+                  onClick={onStop}
+                  disabled={!reachable || busy || status?.state === "stopping"}
+                >
+                  Stop
+                </button>
+              </>
+            )}
+          </div>
+        </section>
       </main>
     </>
   );

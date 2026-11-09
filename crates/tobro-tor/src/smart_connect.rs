@@ -283,10 +283,10 @@ fn resolve_lines_for_kind(
         return (custom.to_vec(), Some(BridgeSource::Custom));
     }
     if let Some(tid) = kind.transport_id() {
-        if let Some(r) = resolved.get(tid) {
-            if !r.lines.is_empty() {
-                return (r.lines.clone(), Some(r.source));
-            }
+        if let Some(r) = resolved.get(tid)
+            && !r.lines.is_empty()
+        {
+            return (r.lines.clone(), Some(r.source));
         }
         if let Some(dist) = fallback_dist {
             let lines = dist.lines_for(Some(tid), country);
@@ -591,9 +591,11 @@ mod tests {
 
     #[test]
     fn plans_custom_when_lines_present() {
-        let mut cfg = SmartConnectConfig::default();
-        cfg.has_configured_bridges = true;
-        cfg.custom_lines = vec!["obfs4 1.2.3.4:1 AAAA cert=x iat-mode=0".to_owned()];
+        let cfg = SmartConnectConfig {
+            has_configured_bridges: true,
+            custom_lines: vec!["obfs4 1.2.3.4:1 AAAA cert=x iat-mode=0".to_owned()],
+            ..Default::default()
+        };
         let plan = SmartConnectPlan::build(&cfg, &Default::default(), None);
         assert!(plan.attempts.iter().any(|a| a.kind == AttemptKind::Custom));
         // direct should not be first when bridges are configured

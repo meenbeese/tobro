@@ -101,12 +101,12 @@ impl RunningHostedService {
         async_stream::stream! {
             while let Some(st) = stream.next().await {
                 let mut status = map_status(&id, &st);
-                if matches!(status, OnionServiceRuntimeStatus::Starting) {
-                    if let Some(addr) = svc.onion_address() {
-                        status = OnionServiceRuntimeStatus::Published {
-                            onion_address: addr.display_unredacted().to_string(),
-                        };
-                    }
+                if matches!(status, OnionServiceRuntimeStatus::Starting)
+                    && let Some(addr) = svc.onion_address()
+                {
+                    status = OnionServiceRuntimeStatus::Published {
+                        onion_address: addr.display_unredacted().to_string(),
+                    };
                 }
                 yield status;
             }
