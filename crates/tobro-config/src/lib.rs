@@ -87,6 +87,7 @@ impl Default for Config {
 /// Supports Tor/Arti bridge lines and external PT clients:
 /// - lyrebird (`obfs4`, `meek_lite`/`meek`, `webtunnel`)
 /// - snowflake-client (`snowflake`, including AMP/front/broker params in bridge lines)
+/// - dnstt-client (`dnstt`)
 ///
 /// Bridge material may be sensitive; avoid logging full lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +96,7 @@ pub struct BridgesConfig {
     /// Enable bridge/PT usage. When false, `lines` are ignored.
     pub enabled: bool,
     /// Bridge lines in Tor bridge format (e.g. `obfs4 ...`, `webtunnel ...`,
-    /// `snowflake ...`, or `Bridge <transport> ...`).
+    /// `snowflake ...`, `dnstt ...`, or `Bridge <transport> ...`).
     #[serde(default)]
     pub lines: Vec<String>,
     /// Preferred lyrebird binary path override. When unset, tobro searches for
@@ -117,6 +118,17 @@ pub struct BridgesConfig {
     /// Extra directory to search for `snowflake-client`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snowflake_dir: Option<String>,
+    /// Preferred `dnstt-client` binary path override. When unset, tobro
+    /// searches for `dnstt-client` in sidecar/app locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnstt_path: Option<String>,
+    /// Extra directory to search for `dnstt-client`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnstt_dir: Option<String>,
+    /// Preferred country for bridge selection (ISO 3166-1 alpha-2), used for
+    /// built-in/Moat bridge filtering when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
 }
 
 fn default_lyrebird_transports() -> Vec<String> {
@@ -137,6 +149,9 @@ impl Default for BridgesConfig {
             lyrebird_transports: default_lyrebird_transports(),
             snowflake_path: None,
             snowflake_dir: None,
+            dnstt_path: None,
+            dnstt_dir: None,
+            country: None,
         }
     }
 }
@@ -455,6 +470,22 @@ impl Config {
                 "bridges.snowflake_path must not be empty when set".to_owned(),
             ));
         }
+        if let Some(p) = &self.bridges.dnstt_path
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "bridges.dnstt_path must not be empty when set".to_owned(),
+            ));
+        }
+        if let Some(country) = self.bridges.country.as_deref() {
+            let c = country.trim().to_ascii_lowercase();
+            if !c.is_empty() && (c.len() != 2 || !c.chars().all(|ch| ch.is_ascii_alphabetic())) {
+                return Err(ConfigError::Invalid(format!(
+                    "bridges.country must be an ISO 3166-1 alpha-2 code (two letters), got {:?}",
+                    self.bridges.country.as_deref().unwrap_or("")
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -692,7 +723,7 @@ pub fn unsupported_knob_error(path: &str) -> Option<String> {
         }
         "transports" => (
             path,
-            "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path/transport_dir for lyrebird, snowflake_path/snowflake_dir for snowflake-client, lyrebird_transports).",
+            "top-level `transports` is not a config section; use `[bridges]` (enabled, lines, transport_path/transport_dir for lyrebird, snowflake_path/snowflake_dir for snowflake-client, dnstt_path/dnstt_dir for dnstt-client, lyrebird_transports).",
         ),
         "onion_services" | "onion_services.client_auth" => (
             path,

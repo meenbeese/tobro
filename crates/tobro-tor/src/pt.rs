@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 pub const LYREBIRD_PROTOCOLS: &[&str] = &["obfs4", "meek_lite", "webtunnel"];
 /// Snowflake protocol name.
 pub const SNOWFLAKE_PROTOCOL: &str = "snowflake";
+/// DNSTT protocol name.
+pub const DNSTT_PROTOCOL: &str = "dnstt";
 
 /// Bridge/pluggable transport settings applied to an Arti client config.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +34,12 @@ pub struct BridgeSettings {
     /// Path to `snowflake-client` (or compatible binary). Required when bridge
     /// lines use the `snowflake` transport.
     pub snowflake_path: Option<PathBuf>,
+    /// Path to `dnstt-client` (or compatible binary). Required when bridge
+    /// lines use the `dnstt` transport.
+    pub dnstt_path: Option<PathBuf>,
+    /// Preferred country for bridge selection (ISO 3166-1 alpha-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
 }
 
 impl BridgeSettings {
@@ -104,6 +112,7 @@ pub fn apply_to_builder(
     // Track which protocols are actually needed by bridge lines.
     let mut needed_lyrebird: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut needed_snowflake = false;
+    let mut needed_dnstt = false;
     let mut unknown: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in settings.normalized_lines() {
         let parsed: BridgeConfigBuilder = line.parse().with_context(|| {
@@ -118,6 +127,8 @@ pub fn apply_to_builder(
                 needed_lyrebird.insert(proto);
             } else if proto == SNOWFLAKE_PROTOCOL {
                 needed_snowflake = true;
+            } else if proto == DNSTT_PROTOCOL {
+                needed_dnstt = true;
             } else {
                 unknown.insert(proto);
             }
@@ -173,6 +184,30 @@ pub fn apply_to_builder(
                     .context("invalid snowflake protocol name")?,
             ])
             .path(CfgPath::new(snowflake_path.to_string_lossy().into_owned()))
+            .run_on_startup(true);
+        builder.bridges().transports().push(transport);
+    }
+
+    if needed_dnstt {
+        let dnstt_path = settings.dnstt_path.as_ref().ok_or_else(|| {
+            anyhow!(
+                "bridge lines require the `dnstt` transport but no dnstt-client binary path was configured/resolved"
+            )
+        })?;
+        if !dnstt_path.exists() {
+            bail!(
+                "configured dnstt-client binary does not exist: {}",
+                dnstt_path.display()
+            );
+        }
+        let mut transport = TransportConfigBuilder::default();
+        transport
+            .protocols(vec![
+                DNSTT_PROTOCOL
+                    .parse()
+                    .context("invalid dnstt protocol name")?,
+            ])
+            .path(CfgPath::new(dnstt_path.to_string_lossy().into_owned()))
             .run_on_startup(true);
         builder.bridges().transports().push(transport);
     }
@@ -243,6 +278,7 @@ mod tests {
             lyrebird_path: None,
             lyrebird_protocols: vec![],
             snowflake_path: None,
+            ..Default::default()
         };
         let mut builder = arti_client::config::TorClientConfig::builder();
         let err = apply_to_builder(&mut builder, &settings).expect_err("must fail");
@@ -260,6 +296,7 @@ mod tests {
             lyrebird_path: Some(PathBuf::from("/nonexistent/lyrebird")),
             lyrebird_protocols: vec![],
             snowflake_path: None,
+            ..Default::default()
         };
         let mut builder = arti_client::config::TorClientConfig::builder();
         let err = apply_to_builder(&mut builder, &settings).expect_err("must fail");
@@ -285,6 +322,7 @@ mod tests {
             lyrebird_path: Some(bin),
             lyrebird_protocols: vec![],
             snowflake_path: None,
+            ..Default::default()
         };
         let mut builder = arti_client::config::TorClientConfig::builder();
         apply_to_builder(&mut builder, &settings).expect("apply");
@@ -317,6 +355,7 @@ fn rejects_snowflake_bridge_without_binary() {
             lyrebird_path: None,
             lyrebird_protocols: vec![],
             snowflake_path: None,
+            ..Default::default()
         };
     let mut builder = arti_client::config::TorClientConfig::builder();
     let err = apply_to_builder(&mut builder, &settings).expect_err("must fail");
@@ -338,6 +377,7 @@ fn applies_snowflake_transport_including_amp_params() {
             lyrebird_path: None,
             lyrebird_protocols: vec![],
             snowflake_path: Some(bin),
+            ..Default::default()
         };
     let mut builder = arti_client::config::TorClientConfig::builder();
     apply_to_builder(&mut builder, &settings).expect("apply");
@@ -360,6 +400,7 @@ fn applies_mixed_lyrebird_and_snowflake_transports() {
             lyrebird_path: Some(lyrebird),
             lyrebird_protocols: vec![],
             snowflake_path: Some(snowflake),
+            ..Default::default()
         };
     let mut builder = arti_client::config::TorClientConfig::builder();
     apply_to_builder(&mut builder, &settings).expect("apply");

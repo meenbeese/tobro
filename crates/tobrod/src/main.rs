@@ -295,6 +295,8 @@ pub(crate) fn resolve_bridge_settings(
             lyrebird_protocols: cfg.lyrebird_transports.clone(),
             lyrebird_path: None,
             snowflake_path: None,
+            dnstt_path: None,
+            country: cfg.country.clone(),
         };
     }
 
@@ -318,6 +320,9 @@ pub(crate) fn resolve_bridge_settings(
     let needs_snowflake = protocols
         .iter()
         .any(|p| p == tobro_tor::pt::SNOWFLAKE_PROTOCOL);
+    let needs_dnstt = protocols
+        .iter()
+        .any(|p| p == tobro_tor::pt::DNSTT_PROTOCOL);
 
     let lyrebird_path = if needs_lyrebird {
         resolve_pt_binary(
@@ -346,6 +351,22 @@ pub(crate) fn resolve_bridge_settings(
     } else {
         None
     };
+    let dnstt_path = if needs_dnstt {
+        resolve_pt_binary(
+            cfg.dnstt_path.as_deref(),
+            cfg.dnstt_dir.as_deref(),
+            state_dir,
+            &[
+                OsString::from("dnstt-client"),
+                OsString::from("dnstt-client.exe"),
+                OsString::from("dnstt"),
+            ],
+            "dnstt-client",
+            "bridges.dnstt_path/dnstt_dir",
+        )
+    } else {
+        None
+    };
 
     tobro_tor::BridgeSettings {
         enabled: true,
@@ -353,5 +374,7 @@ pub(crate) fn resolve_bridge_settings(
         lyrebird_path,
         lyrebird_protocols: cfg.lyrebird_transports.clone(),
         snowflake_path,
+        dnstt_path,
+        country: cfg.country.clone(),
     }
 }
