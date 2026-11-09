@@ -613,6 +613,18 @@ fn start_worker(
                 };
 
                 let mut sub = prepared.control.subscribe();
+                // Bootstrap progress events were emitted to bootstrap_and_prepare's
+                // internal control channel while this worker was awaiting it, so a
+                // subscriber created now misses them. Lifecycle reaches Ready only
+                // after BootstrapProgress{ready:true} followed by ListenersReady.
+                let _ = msg_tx.send(WorkerMsg::Adapter(AdapterEvent::Bootstrap(
+                    tobro_tor::BootstrapEvent {
+                        percent: 100,
+                        ready: true,
+                        blocked: None,
+                        detail: "bootstrapped".to_owned(),
+                    },
+                )));
                 // Announce ready state.
                 let _ = msg_tx.send(WorkerMsg::Adapter(AdapterEvent::Status(
                     prepared.control.status(),
