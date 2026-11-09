@@ -1417,4 +1417,92 @@ mod config_tests {
         assert!(ls.stream_isolation.isolate_destination);
         Ok(())
     }
+
+    #[test]
+    fn config_apply_network_prefs_maps_and_requires_restart_when_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        tobro_config::Config::default().save(&path)?;
+        let listeners = Arc::new(RwLock::new(ListenerConfig::default()));
+        let result = config_apply_patch(
+            &path,
+            &json!({ "network": { "exit_country": "US", "ip_version": "ipv6_only" } }),
+            true,
+            &listeners,
+        )
+        .map_err(|e| format!("{e}"))?;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["effects"]["network_changed"], true);
+        assert_eq!(result["effects"]["restart_required"], true);
+        assert_eq!(result["network"]["exit_country"], "us");
+        assert_eq!(result["network"]["ip_version"], "ipv6_only");
+        assert_eq!(result["network"]["has_stream_prefs"], true);
+        let warnings = result["effects"]["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("exit country")),
+            "expected exit country warning, got {warnings:?}"
+        );
+        let loaded = tobro_config::Config::load(&path)?;
+        assert_eq!(
+            loaded.network.normalized_exit_country().as_deref(),
+            Some("us")
+        );
+        assert_eq!(
+            loaded.network.ip_version,
+            tobro_config::IpVersionPreference::Ipv6Only
+        );
+        let ls = listeners.read().unwrap().clone();
+        assert_eq!(ls.network_prefs.exit_country.as_deref(), Some("us"));
+        assert_eq!(
+            ls.network_prefs.ip_version,
+            tobro_tor::adapter::IpVersionPref::Ipv6Only
+        );
+        assert!(ls.needs_custom_proxy());
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_network_patch_reports_effects() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        tobro_config::Config::default().save(&path)?;
+        let result = config_validate_patch(
+            &path,
+            &json!({ "network": { "exit_country": "de", "ip_version": "ipv4_preferred" } }),
+            false,
+        )
+        .map_err(|e| format!("{e}"))?;
+        assert_eq!(result["valid"], true);
+        assert_eq!(result["effects"]["network_changed"], true);
+        assert_eq!(result["effects"]["restart_required"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn config_effects_network_change_warns_for_exit_country() {
+        let current = tobro_config::Config::default();
+        let mut next = current.clone();
+        next.network.exit_country = Some("nl".to_owned());
+        let effects = super::config_effects(&current, &next, true);
+        assert_eq!(effects["network_changed"], true);
+        assert_eq!(effects["restart_required"], true);
+        assert_eq!(effects["runtime_active"], true);
+        let warnings = effects["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("exit country"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("stop/connect"))
+        );
+    }
 }

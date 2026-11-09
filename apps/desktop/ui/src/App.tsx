@@ -145,10 +145,6 @@ export default function App() {
   const canConnect = !busy && !isActive && status?.state !== "stopping";
   const canNewIdentity = reachable && !busy && (status?.state === "connected" || status?.state === "serving");
 
-  function onPlaceholder(feature: string) {
-    appendLog(`${feature}: coming soon.`, "info", "ui");
-  }
-
   async function openSettings() {
     try {
       const existing = await WebviewWindow.getByLabel("settings");
@@ -172,6 +168,32 @@ export default function App() {
       });
     } catch (e) {
       appendLog(`failed to open settings: ${String(e)}`, "error", "ui");
+    }
+  }
+
+  async function openAbout() {
+    try {
+      const existing = await WebviewWindow.getByLabel("about");
+      if (existing) {
+        await existing.show();
+        await existing.setFocus();
+        return;
+      }
+      const about = new WebviewWindow("about", {
+        url: "index.html?window=about",
+        title: "About — Tobro",
+        width: 760,
+        height: 680,
+        minWidth: 520,
+        minHeight: 420,
+        resizable: true,
+        center: true,
+      });
+      about.once("tauri://error", (e) => {
+        appendLog(`about window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+      });
+    } catch (e) {
+      appendLog(`failed to open about: ${String(e)}`, "error", "ui");
     }
   }
 
@@ -236,7 +258,7 @@ export default function App() {
           <button type="button" onClick={() => void openSettings()} aria-haspopup="dialog" title="Settings">
             Settings
           </button>
-          <button type="button" onClick={() => onPlaceholder("About")} title="About (coming soon)">
+          <button type="button" onClick={() => void openAbout()} aria-haspopup="dialog" title="About">
             About
           </button>
         </nav>

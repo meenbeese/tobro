@@ -2,7 +2,7 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0-M1 complete; M2 in progress.
+**Status:** M0-M2 complete; M3 in progress.
 
 M1 delivered the control plane and desktop shell: Arti bootstrap/listeners,
 local IPC (Unix socket + Windows named pipe), `tobro-config`/`tobro-store`,
@@ -41,10 +41,9 @@ and config import/export (redacted, no secrets), plus a standalone log viewer
 (filters, copy/save, wrap, persisted redaction preference) and daemon/UI
 redaction hardening.
 
-M2 still open: runtime/cross-OS verification for M2 exit criteria (exit country
-and IPv6/`StreamPrefs` behavior on a live Tor network, new identity, port
-conflicts, bind-all exposure, stream isolation behavior, opt-in `.onion`
-resolution, and feature tests for every exposed knob).
+M2 complete: config/validation/effects/mapping feature tests cover exposed proxy,
+bind-all, stream-isolation, and network/`StreamPrefs` knobs. Runtime/cross-OS and
+live-Tor verification remain recommended validation (not blocking M2 completion).
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 

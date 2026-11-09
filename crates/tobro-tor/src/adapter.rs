@@ -119,6 +119,54 @@ impl ListenerConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_stream_prefs_active_only_for_non_default() {
+        assert!(!NetworkStreamPrefs::default().is_active());
+        let mut prefs = NetworkStreamPrefs::default();
+        prefs.exit_country = Some("us".to_owned());
+        assert!(prefs.is_active());
+        let mut prefs = NetworkStreamPrefs::default();
+        prefs.ip_version = IpVersionPref::Ipv6Only;
+        assert!(prefs.is_active());
+        let mut prefs = NetworkStreamPrefs::default();
+        prefs.exit_country = Some("   ".to_owned());
+        assert!(!prefs.is_active());
+    }
+
+    #[test]
+    fn listener_needs_custom_proxy_for_network_or_isolation() {
+        let mut cfg = ListenerConfig::default();
+        assert!(!cfg.needs_custom_proxy());
+        cfg.stream_isolation.isolate_destination = true;
+        assert!(cfg.needs_custom_proxy());
+        let mut cfg = ListenerConfig::default();
+        cfg.network_prefs.ip_version = IpVersionPref::Ipv6Preferred;
+        assert!(cfg.needs_custom_proxy());
+        let mut cfg = ListenerConfig::default();
+        cfg.network_prefs.exit_country = Some("de".to_owned());
+        assert!(cfg.needs_custom_proxy());
+    }
+
+    #[test]
+    fn ip_version_pref_serde_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        for (s, v) in [
+            ("\"ipv4_preferred\"", IpVersionPref::Ipv4Preferred),
+            ("\"ipv6_preferred\"", IpVersionPref::Ipv6Preferred),
+            ("\"ipv4_only\"", IpVersionPref::Ipv4Only),
+            ("\"ipv6_only\"", IpVersionPref::Ipv6Only),
+        ] {
+            let parsed: IpVersionPref = serde_json::from_str(s)?;
+            assert_eq!(parsed, v);
+            assert_eq!(serde_json::to_string(&v)?, s);
+        }
+        Ok(())
+    }
+}
+
 impl ListenerConfig {
     /// Effective HTTP port (follows SOCKS when unset/combined).
     pub fn effective_http_port(&self) -> u16 {

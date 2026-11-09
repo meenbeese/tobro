@@ -9,7 +9,10 @@
       "cwd": "ui"
     },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/build-ui.sh",
+    "beforeBuildCommand": {
+      "script": "bash scripts/build-ui.sh",
+      "cwd": "."
+    },
     "frontendDist": "ui/dist"
   },
   "app": {

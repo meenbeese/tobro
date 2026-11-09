@@ -858,6 +858,68 @@ level = "info"
         cfg.network.exit_country = Some("USA".to_owned());
         let err = cfg.validate();
         assert!(matches!(err, Err(ConfigError::Invalid(_))));
+        if let Err(ConfigError::Invalid(msg)) = err {
+            assert!(msg.contains("alpha-2"));
+        }
+    }
+
+    #[test]
+    fn normalizes_exit_country_and_network_stream_prefs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut cfg = Config::default();
+        assert!(!cfg.network.has_stream_prefs());
+        cfg.network.exit_country = Some(" De ".to_owned());
+        cfg.validate()?;
+        assert_eq!(cfg.network.normalized_exit_country().as_deref(), Some("de"));
+        assert!(cfg.network.has_stream_prefs());
+        cfg.network.exit_country = Some("   ".to_owned());
+        assert_eq!(cfg.network.normalized_exit_country(), None);
+        assert!(!cfg.network.has_stream_prefs());
+        cfg.network.ip_version = IpVersionPreference::Ipv6Only;
+        assert!(cfg.network.has_stream_prefs());
+        Ok(())
+    }
+
+    #[test]
+    fn network_ip_version_variants_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        for ip in [
+            IpVersionPreference::Ipv4Preferred,
+            IpVersionPreference::Ipv6Preferred,
+            IpVersionPreference::Ipv4Only,
+            IpVersionPreference::Ipv6Only,
+        ] {
+            let mut config = Config::default();
+            config.network.ip_version = ip;
+            config.network.exit_country = Some("nl".to_owned());
+            config.save(&path)?;
+            let loaded = Config::load(&path)?;
+            assert_eq!(loaded.network.ip_version, ip);
+            assert_eq!(
+                loaded.network.normalized_exit_country().as_deref(),
+                Some("nl")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_network_sub_knobs_but_allows_network_section() {
+        for key in ["network.geoip", "network.stream_prefs"] {
+            let patch = match key {
+                "network.geoip" => serde_json::json!({ "network": { "geoip": true } }),
+                _ => serde_json::json!({ "network": { "stream_prefs": {} } }),
+            };
+            let err =
+                check_unsupported_knobs(&patch).expect_err("must reject unsupported sub-knob");
+            assert!(err.contains("unsupported config knob"), "{err}");
+            assert!(err.contains("never silently ignored"), "{err}");
+        }
+        check_unsupported_knobs(&serde_json::json!({
+            "network": { "exit_country": "US", "ip_version": "ipv4_only" }
+        }))
+        .expect("supported network fields must be accepted");
     }
 
     #[test]
