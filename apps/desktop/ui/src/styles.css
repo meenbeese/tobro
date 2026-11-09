@@ -116,7 +116,8 @@ body {
   font-weight: 600;
 }
 .status-connected .headline, .status-serving .headline { color: var(--good); }
-.status-error .headline, .unreachable .headline { color: var(--bad); }
+.status-error .headline { color: var(--bad); }
+.unreachable .headline { color: var(--fg); }
 .status-bootstrapping .headline, .status-stopping .headline { color: var(--warn); }
 .progress {
   height: 8px;

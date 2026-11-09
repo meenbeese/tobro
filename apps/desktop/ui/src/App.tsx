@@ -47,7 +47,7 @@ interface AppLockStatus {
 }
 
 function formatStatus(status: DaemonStatus | null, reachable: boolean): string {
-  if (!reachable) return "Daemon unavailable";
+  if (!reachable) return "Ready to connect";
   if (!status) return "Waiting for status…";
   const bootstrap = status.bootstrap;
   const percent = typeof bootstrap?.percent === "number" ? `${bootstrap.percent}%` : "";
@@ -121,6 +121,7 @@ export default function App() {
         }
         if (kind === "unreachable") {
           setReachable(false);
+          setStatus(null);
           const p = payload as { error?: string };
           if (p?.error) appendLog(p.error, "error", "daemon");
           return;
@@ -156,7 +157,7 @@ export default function App() {
   }, []);
 
   const headline = useMemo(() => formatStatus(status, reachable), [status, reachable]);
-  const isActive = status?.state === "starting" || status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving";
+  const isActive = reachable && (status?.state === "starting" || status?.state === "bootstrapping" || status?.state === "connected" || status?.state === "serving");
   // Allow Connect even when the local daemon is unavailable so the desktop can
   // start tobrod and connect with a single button (Orbot parity).
   const canConnect = !busy && !isActive && status?.state !== "stopping";
@@ -423,6 +424,11 @@ export default function App() {
 
       <section className={`card status status-${status?.state ?? "unknown"} ${reachable ? "" : "unreachable"}`}>
         <p className="headline">{headline}</p>
+        {!reachable ? (
+          <p className="muted" style={{ marginTop: 0 }}>
+            If the local <code>tobrod</code> daemon is not running, Tobro will try to start it automatically when you connect.
+          </p>
+        ) : null}
         {showProgress ? (
           <div className="progress" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
             <div className="progress-bar" style={{ width: `${percent}%` }} />
