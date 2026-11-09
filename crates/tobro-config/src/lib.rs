@@ -58,6 +58,8 @@ pub struct Config {
     pub general: GeneralConfig,
     /// Local proxy listener settings.
     pub proxy: ProxyConfig,
+    /// Upstream/outbound proxy used by Tor to reach the network (F-18/F-19).
+    pub outbound_proxy: OutboundProxyConfig,
     /// Network/stream defaults (M2): exit country, IPv6/StreamPrefs.
     pub network: NetworkConfig,
     /// Stream isolation and behavior settings (F-42/F-43).
@@ -74,6 +76,7 @@ impl Default for Config {
             version: 1,
             general: GeneralConfig::default(),
             proxy: ProxyConfig::default(),
+            outbound_proxy: OutboundProxyConfig::default(),
             network: NetworkConfig::default(),
             stream: StreamConfig::default(),
             bridges: BridgesConfig::default(),
@@ -347,6 +350,211 @@ pub struct GeneralConfig {
     pub start_on_login: bool,
 }
 
+/// Upstream/outbound proxy type used by Tor channels (F-18/F-19).
+///
+/// `Shadowsocks` is implemented by running a local `sslocal` sidecar and
+/// pointing Arti's outbound channel proxy at its local SOCKS5 listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundProxyType {
+    /// No outbound proxy (direct Tor connections).
+    #[default]
+    None,
+    /// HTTP CONNECT proxy.
+    Http,
+    /// HTTPS alias treated as HTTP CONNECT (Arti channel proxy uses HTTP CONNECT).
+    Https,
+    /// SOCKS4 proxy.
+    Socks4,
+    /// SOCKS5 proxy.
+    Socks5,
+    /// Shadowsocks via local `sslocal` sidecar.
+    Shadowsocks,
+}
+
+/// Outbound proxy configuration (F-18/F-19).
+///
+/// Sensitive fields (`password`, `shadowsocks_password`, `username`) must not be
+/// logged or returned unredacted in diagnostics/IPC config responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutboundProxyConfig {
+    /// Outbound proxy type/mode.
+    pub proxy_type: OutboundProxyType,
+    /// Proxy/remote server host (IP or hostname accepted by config; HTTP/SOCKS
+    /// outbound parsing may require an IP/URL form depending on backend support).
+    pub host: String,
+    /// Proxy/remote server port.
+    pub port: u16,
+    /// Username for HTTP/SOCKS auth. Ignored for `none`/`shadowsocks` local hop.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    /// Password for HTTP/SOCKS auth, or unused for `none`. Sensitive.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+    /// Shadowsocks encryption method (e.g. `aes-256-gcm`, `chacha20-ietf-poly1305`).
+    #[serde(default = "default_shadowsocks_method")]
+    pub shadowsocks_method: String,
+    /// Shadowsocks remote password. Sensitive. Falls back to `password` when empty
+    /// for compatibility with simple clients.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shadowsocks_password: String,
+    /// Optional `sslocal` binary path override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sslocal_path: Option<String>,
+    /// Optional extra directory to search for `sslocal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sslocal_dir: Option<String>,
+}
+
+fn default_shadowsocks_method() -> String {
+    "aes-256-gcm".to_owned()
+}
+
+impl Default for OutboundProxyConfig {
+    fn default() -> Self {
+        Self {
+            proxy_type: OutboundProxyType::None,
+            host: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            shadowsocks_method: default_shadowsocks_method(),
+            shadowsocks_password: String::new(),
+            sslocal_path: None,
+            sslocal_dir: None,
+        }
+    }
+}
+
+impl OutboundProxyConfig {
+    /// True when an outbound proxy is configured and should be applied.
+    pub fn is_active(&self) -> bool {
+        self.proxy_type != OutboundProxyType::None
+    }
+
+    /// Normalized host (trimmed).
+    pub fn normalized_host(&self) -> &str {
+        self.host.trim()
+    }
+
+    /// Effective Shadowsocks password (`shadowsocks_password` or fallback `password`).
+    pub fn effective_shadowsocks_password(&self) -> &str {
+        let p = self.shadowsocks_password.trim();
+        if p.is_empty() {
+            self.password.trim()
+        } else {
+            p
+        }
+    }
+
+    /// Normalized proxy type (`https` treated as `http` for Arti HTTP CONNECT).
+    pub fn normalized_proxy_type(&self) -> OutboundProxyType {
+        match self.proxy_type {
+            OutboundProxyType::Https => OutboundProxyType::Http,
+            other => other,
+        }
+    }
+
+    /// True when this config requires a local `sslocal` sidecar.
+    pub fn needs_sslocal(&self) -> bool {
+        self.is_active() && self.proxy_type == OutboundProxyType::Shadowsocks
+    }
+
+    /// Redacted clone safe for logs/IPC config display (secrets replaced).
+    pub fn redacted(&self) -> Self {
+        let mut c = self.clone();
+        if !c.password.is_empty() {
+            c.password = "[REDACTED]".to_owned();
+        }
+        if !c.shadowsocks_password.is_empty() {
+            c.shadowsocks_password = "[REDACTED]".to_owned();
+        }
+        c
+    }
+
+    /// Validate outbound proxy settings.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        let host = self.normalized_host();
+        if host.is_empty() {
+            return Err(ConfigError::Invalid(
+                "outbound_proxy.host must not be empty when outbound_proxy.proxy_type is set"
+                    .to_owned(),
+            ));
+        }
+        if host
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '@')
+        {
+            return Err(ConfigError::Invalid(format!(
+                "outbound_proxy.host contains invalid characters: {host:?}"
+            )));
+        }
+        if self.port == 0 {
+            return Err(ConfigError::Invalid(
+                "outbound_proxy.port must not be zero when outbound_proxy is enabled".to_owned(),
+            ));
+        }
+        if let Some(p) = &self.sslocal_path
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "outbound_proxy.sslocal_path must not be empty when set".to_owned(),
+            ));
+        }
+        if let Some(p) = &self.sslocal_dir
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "outbound_proxy.sslocal_dir must not be empty when set".to_owned(),
+            ));
+        }
+        match self.normalized_proxy_type() {
+            OutboundProxyType::None => {}
+            OutboundProxyType::Http | OutboundProxyType::Socks4 | OutboundProxyType::Socks5 => {
+                // tor-chanmgr 0.48 ProxyProtocol URL parsing accepts IP-literal hosts only.
+                if host.parse::<std::net::IpAddr>().is_err() {
+                    return Err(ConfigError::Invalid(format!(
+                        "outbound_proxy.host must be an IP address for {kind} outbound proxies (hostname resolution is not supported by the current backend); got {host:?}",
+                        kind = match self.normalized_proxy_type() {
+                            OutboundProxyType::Http => "HTTP/HTTPS",
+                            OutboundProxyType::Socks4 => "SOCKS4",
+                            OutboundProxyType::Socks5 => "SOCKS5",
+                            _ => "this",
+                        }
+                    )));
+                }
+                if self.normalized_proxy_type() == OutboundProxyType::Socks4
+                    && !self.password.trim().is_empty()
+                {
+                    return Err(ConfigError::Invalid(
+                        "outbound_proxy.password is not supported for SOCKS4; use SOCKS5 or HTTP if authentication is required".to_owned(),
+                    ));
+                }
+            }
+            OutboundProxyType::Https => unreachable!("normalized"),
+            OutboundProxyType::Shadowsocks => {
+                if self.shadowsocks_method.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "outbound_proxy.shadowsocks_method must not be empty for Shadowsocks"
+                            .to_owned(),
+                    ));
+                }
+                if self.effective_shadowsocks_password().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "outbound_proxy.shadowsocks_password (or password) must be set for Shadowsocks"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_http_port_follow() -> u16 {
     0
 }
@@ -545,6 +753,7 @@ impl Config {
                 )));
             }
         }
+        self.outbound_proxy.validate()?;
         Ok(())
     }
 }

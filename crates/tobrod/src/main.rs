@@ -6,6 +6,7 @@
 
 mod ipc;
 mod lifecycle;
+pub(crate) mod outbound;
 pub(crate) mod pt_supervisor;
 pub(crate) mod redact;
 mod spike;
@@ -124,6 +125,8 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         .with_context(|| format!("failed to bind IPC at {}", socket_path.display()))?;
 
     let bridge_settings = resolve_bridge_settings(&config.bridges, Some(&state_dir));
+    let outbound_proxy = outbound::resolve_static_outbound_proxy(&config.outbound_proxy)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
@@ -154,10 +157,12 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
                 },
             },
             bridges: bridge_settings,
+            outbound_proxy,
         }));
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),
         config_path.clone(),
+        state_dir.clone(),
         std::sync::Arc::clone(&listeners),
     );
     let ipc_state = state_dir.clone();

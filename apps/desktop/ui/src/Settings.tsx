@@ -59,6 +59,30 @@ interface NetworkSettings {
   ip_version: IpVersion;
 }
 
+type OutboundProxyType = "none" | "http" | "https" | "socks4" | "socks5" | "shadowsocks";
+
+interface OutboundProxySettings {
+  proxy_type: OutboundProxyType;
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+  shadowsocks_method: string;
+  shadowsocks_password: string;
+  sslocal_path: string;
+}
+
+const EMPTY_OUTBOUND: OutboundProxySettings = {
+  proxy_type: "none",
+  host: "",
+  port: "1080",
+  username: "",
+  password: "",
+  shadowsocks_method: "aes-256-gcm",
+  shadowsocks_password: "",
+  sslocal_path: "",
+};
+
 interface ConfigResponse {
   ok?: boolean;
   path?: string;
@@ -226,6 +250,15 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [networkMessage, setNetworkMessage] = useState("");
   const [networkError, setNetworkError] = useState("");
 
+  // Outbound proxy (F-18/F-19)
+  const [outbound, setOutbound] = useState<OutboundProxySettings>(EMPTY_OUTBOUND);
+  const [outboundDirty, setOutboundDirty] = useState(false);
+  const [outboundBusy, setOutboundBusy] = useState(false);
+  const [outboundMessage, setOutboundMessage] = useState("");
+  const [outboundError, setOutboundError] = useState("");
+  const [outboundPasswordTouched, setOutboundPasswordTouched] = useState(false);
+  const [outboundSsPasswordTouched, setOutboundSsPasswordTouched] = useState(false);
+
   // Config import/export
   const [configPath, setConfigPath] = useState("");
   const [currentConfig, setCurrentConfig] = useState<unknown>(null);
@@ -268,6 +301,30 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  function applyOutboundFromConfig(config: unknown) {
+    const o = (config as { outbound_proxy?: Record<string, unknown> } | null)?.outbound_proxy;
+    if (o && typeof o === "object") {
+      const t = o.proxy_type;
+      const proxy_type: OutboundProxyType =
+        t === "http" || t === "https" || t === "socks4" || t === "socks5" || t === "shadowsocks" ? t : "none";
+      setOutbound({
+        proxy_type,
+        host: typeof o.host === "string" ? o.host : "",
+        port: typeof o.port === "number" && Number.isFinite(o.port) ? String(o.port) : (typeof o.port === "string" ? o.port : "1080"),
+        username: typeof o.username === "string" ? o.username : "",
+        password: typeof o.password === "string" ? o.password : "",
+        shadowsocks_method: typeof o.shadowsocks_method === "string" && o.shadowsocks_method ? o.shadowsocks_method : "aes-256-gcm",
+        shadowsocks_password: typeof o.shadowsocks_password === "string" ? o.shadowsocks_password : "",
+        sslocal_path: typeof o.sslocal_path === "string" ? o.sslocal_path : "",
+      });
+      setOutboundDirty(false);
+      setOutboundPasswordTouched(false);
+      setOutboundSsPasswordTouched(false);
+      setOutboundError("");
+      setOutboundMessage("");
+    }
+  }
+
   async function loadPorts() {
     try {
       const loaded = await invoke<ProxyPorts>("get_proxy_ports");
@@ -292,6 +349,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
       applyNetworkFromConfig(result.config ?? null);
+      applyOutboundFromConfig(result.config ?? null);
     } catch {
       // best-effort; listener loading may still work from local config
     }
@@ -631,6 +689,64 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  function onOutboundChange<K extends keyof OutboundProxySettings>(key: K, value: OutboundProxySettings[K]) {
+    setOutbound((prev) => ({ ...prev, [key]: value }));
+    setOutboundDirty(true);
+    setOutboundError("");
+    setOutboundMessage("");
+    if (key === "password") setOutboundPasswordTouched(true);
+    if (key === "shadowsocks_password") setOutboundSsPasswordTouched(true);
+  }
+
+  async function onSaveOutbound(e?: FormEvent) {
+    e?.preventDefault();
+    setOutboundBusy(true);
+    setOutboundError("");
+    setOutboundMessage("");
+    try {
+      const isActive = outbound.proxy_type !== "none";
+      const port = isActive ? Number.parseInt(outbound.port, 10) : 0;
+      if (isActive && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+        throw new Error("Outbound proxy port must be an integer between 1 and 65535.");
+      }
+      const patchOutbound: Record<string, unknown> = {
+        proxy_type: outbound.proxy_type,
+        host: outbound.host.trim(),
+        port: isActive ? port : 0,
+        username: outbound.username,
+        shadowsocks_method: outbound.shadowsocks_method.trim() || "aes-256-gcm",
+        sslocal_path: outbound.sslocal_path.trim() || null,
+      };
+      if (!outboundPasswordTouched && outbound.password === "[REDACTED]") {
+        // keep existing secret on disk (merge preserves current value)
+      } else {
+        patchOutbound.password = outbound.password;
+      }
+      if (!outboundSsPasswordTouched && outbound.shadowsocks_password === "[REDACTED]") {
+        // keep existing secret on disk
+      } else {
+        patchOutbound.shadowsocks_password = outbound.shadowsocks_password;
+      }
+      const result = await invoke<ConfigResponse>("daemon_apply_config", {
+        patch: { outbound_proxy: patchOutbound },
+      });
+      if (result.config) setCurrentConfig(result.config);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyOutboundFromConfig(result.config ?? null);
+      const warnings = result.effects?.warnings ?? [];
+      const msg = summarizeEffects(result.effects).join(" ");
+      setOutboundMessage(warnings.length ? `${msg} Warnings: ${warnings.join(" | ")}` : msg || "Saved.");
+      log(`outbound proxy saved (type=${outbound.proxy_type})`);
+      onApplied?.();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setOutboundError(message);
+      log(`outbound proxy save failed: ${message}`, "error");
+    } finally {
+      setOutboundBusy(false);
+    }
+  }
+
   async function onRefreshConfig() {
     setBusy(true);
     setConfigError("");
@@ -640,6 +756,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
       applyNetworkFromConfig(result.config ?? null);
+      applyOutboundFromConfig(result.config ?? null);
       setConfigMessages(["Loaded current daemon config (redacted; no secrets)."]);
       log("config: loaded current config");
     } catch (e) {
@@ -722,6 +839,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       if (typeof result.path === "string") setConfigPath(result.path);
       applyStreamFromConfig(result.config ?? null);
       applyNetworkFromConfig(result.config ?? null);
+      applyOutboundFromConfig(result.config ?? null);
       const lines = ["Config validated and saved (daemon config API)."];
       lines.push(...summarizeEffects(result.effects));
       lines.push("Redacted config contains no secrets; secrets remain in the OS keychain/store when used.");
@@ -1169,6 +1287,141 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <div className="actions">
                   <button className="primary" type="submit" disabled={portsBusy || !portsDirty}>{portsBusy ? "Saving…" : "Save proxy settings"}</button>
                   <button type="button" onClick={() => void loadPorts()} disabled={portsBusy}>Reset</button>
+                </div>
+              </form>
+
+              <form className="settings-section outbound-proxy" onSubmit={(e) => void onSaveOutbound(e)}>
+                <h3>Outbound proxy (upstream)</h3>
+                <p className="muted">
+                  Route Tor’s network connections through an upstream proxy. <strong>HTTP</strong> (CONNECT) and{" "}
+                  <strong>SOCKS4/SOCKS5</strong> are applied directly to Arti channels (host must be an IP address with the
+                  current backend). <strong>Shadowsocks</strong> starts a local <code>sslocal</code> sidecar and uses it as a
+                  local SOCKS5 outbound proxy. Changes require Stop → Connect while Tor is running.
+                </p>
+                <div className="field-row">
+                  <label htmlFor="outbound-proxy-type">Type</label>
+                  <select
+                    id="outbound-proxy-type"
+                    value={outbound.proxy_type}
+                    disabled={outboundBusy}
+                    onChange={(e) => onOutboundChange("proxy_type", e.target.value as OutboundProxyType)}
+                  >
+                    <option value="none">None (direct)</option>
+                    <option value="http">HTTP CONNECT</option>
+                    <option value="https">HTTPS (HTTP CONNECT alias)</option>
+                    <option value="socks4">SOCKS4</option>
+                    <option value="socks5">SOCKS5</option>
+                    <option value="shadowsocks">Shadowsocks (via sslocal)</option>
+                  </select>
+                </div>
+                {outbound.proxy_type !== "none" ? (
+                  <>
+                    <div className="field-row">
+                      <label htmlFor="outbound-proxy-host">{outbound.proxy_type === "shadowsocks" ? "Shadowsocks server host" : "Proxy host (IP address)"}</label>
+                      <input
+                        id="outbound-proxy-host"
+                        type="text"
+                        value={outbound.host}
+                        disabled={outboundBusy}
+                        onChange={(e) => onOutboundChange("host", e.target.value)}
+                        placeholder={outbound.proxy_type === "shadowsocks" ? "ss.example.com or 203.0.113.1" : "127.0.0.1"}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    </div>
+                    <div className="field-row">
+                      <label htmlFor="outbound-proxy-port">{outbound.proxy_type === "shadowsocks" ? "Shadowsocks server port" : "Proxy port"}</label>
+                      <input
+                        id="outbound-proxy-port"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        inputMode="numeric"
+                        value={outbound.port}
+                        disabled={outboundBusy}
+                        onChange={(e) => onOutboundChange("port", e.target.value)}
+                      />
+                    </div>
+                    {outbound.proxy_type !== "shadowsocks" ? (
+                      <>
+                        <div className="field-row">
+                          <label htmlFor="outbound-proxy-user">Username (optional)</label>
+                          <input
+                            id="outbound-proxy-user"
+                            type="text"
+                            value={outbound.username}
+                            disabled={outboundBusy}
+                            onChange={(e) => onOutboundChange("username", e.target.value)}
+                            autoComplete="off"
+                          />
+                        </div>
+                        {outbound.proxy_type !== "socks4" ? (
+                          <div className="field-row">
+                            <label htmlFor="outbound-proxy-pass">Password (optional, sensitive)</label>
+                            <input
+                              id="outbound-proxy-pass"
+                              type="password"
+                              value={outbound.password}
+                              disabled={outboundBusy}
+                              onChange={(e) => onOutboundChange("password", e.target.value)}
+                              autoComplete="new-password"
+                            />
+                          </div>
+                        ) : (
+                          <p className="muted">SOCKS4 supports a user ID (username) but not password authentication.</p>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <div className="field-row">
+                          <label htmlFor="outbound-ss-method">Shadowsocks method</label>
+                          <input
+                            id="outbound-ss-method"
+                            type="text"
+                            value={outbound.shadowsocks_method}
+                            disabled={outboundBusy}
+                            onChange={(e) => onOutboundChange("shadowsocks_method", e.target.value)}
+                            placeholder="aes-256-gcm"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </div>
+                        <div className="field-row">
+                          <label htmlFor="outbound-ss-pass">Shadowsocks password (sensitive)</label>
+                          <input
+                            id="outbound-ss-pass"
+                            type="password"
+                            value={outbound.shadowsocks_password}
+                            disabled={outboundBusy}
+                            onChange={(e) => onOutboundChange("shadowsocks_password", e.target.value)}
+                            autoComplete="new-password"
+                          />
+                        </div>
+                        <div className="field-row">
+                          <label htmlFor="outbound-sslocal-path">sslocal path (optional)</label>
+                          <input
+                            id="outbound-sslocal-path"
+                            type="text"
+                            value={outbound.sslocal_path}
+                            disabled={outboundBusy}
+                            onChange={(e) => onOutboundChange("sslocal_path", e.target.value)}
+                            placeholder="Auto-detect (or /path/to/sslocal)"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </div>
+                        <p className="muted">Requires <code>sslocal</code> from shadowsocks-rust. The sidecar starts on Connect and is stopped on Disconnect.</p>
+                      </>
+                    )}
+                  </>
+                ) : null}
+                {outboundError ? <p className="error">{outboundError}</p> : null}
+                {outboundMessage ? <p className="muted">{outboundMessage}</p> : null}
+                <div className="actions">
+                  <button className="primary" type="submit" disabled={outboundBusy || !outboundDirty}>
+                    {outboundBusy ? "Saving…" : "Save outbound proxy"}
+                  </button>
+                  <button type="button" disabled={outboundBusy} onClick={() => void loadConfigState()}>Reset</button>
                 </div>
               </form>
 

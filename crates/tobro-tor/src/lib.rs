@@ -134,7 +134,13 @@ impl std::fmt::Debug for Tor {
 impl Tor {
     /// Create an unbootstrapped client with tobro-controlled state directories.
     pub async fn create(state_dir: &Path, cache_dir: &Path) -> anyhow::Result<Self> {
-        Self::create_with_bridges(state_dir, cache_dir, &BridgeSettings::default()).await
+        Self::create_with_settings(
+            state_dir,
+            cache_dir,
+            &BridgeSettings::default(),
+            &adapter::OutboundProxySettings::default(),
+        )
+        .await
     }
 
     /// Create an unbootstrapped client with bridge/PT settings (M3).
@@ -143,7 +149,23 @@ impl Tor {
         cache_dir: &Path,
         bridges: &BridgeSettings,
     ) -> anyhow::Result<Self> {
-        let config = client_config(state_dir, cache_dir, bridges)?;
+        Self::create_with_settings(
+            state_dir,
+            cache_dir,
+            bridges,
+            &adapter::OutboundProxySettings::default(),
+        )
+        .await
+    }
+
+    /// Create an unbootstrapped client with bridge/PT and outbound proxy settings.
+    pub async fn create_with_settings(
+        state_dir: &Path,
+        cache_dir: &Path,
+        bridges: &BridgeSettings,
+        outbound_proxy: &adapter::OutboundProxySettings,
+    ) -> anyhow::Result<Self> {
+        let config = client_config(state_dir, cache_dir, bridges, outbound_proxy)?;
         let client = Client::builder()
             .config(config)
             .bootstrap_behavior(BootstrapBehavior::Manual)
@@ -286,6 +308,7 @@ pub async fn serve(
         stream_isolation,
         network_prefs,
         &BridgeSettings::default(),
+        &adapter::OutboundProxySettings::default(),
     )
     .await
 }
@@ -301,8 +324,9 @@ pub async fn serve_with_bridges(
     stream_isolation: adapter::StreamIsolationPolicy,
     network_prefs: adapter::NetworkStreamPrefs,
     bridges: &BridgeSettings,
+    outbound_proxy: &adapter::OutboundProxySettings,
 ) -> anyhow::Result<()> {
-    let config = client_config(state_dir, cache_dir, bridges)?;
+    let config = client_config(state_dir, cache_dir, bridges, outbound_proxy)?;
     let needs_custom = stream_isolation.needs_frontend() || network_prefs.is_active();
 
     if needs_custom {
@@ -473,10 +497,22 @@ fn listen_for_port(port: u16, bind_all_interfaces: bool) -> anyhow::Result<Liste
     Ok(listen)
 }
 
+fn apply_outbound_proxy_to_builder(
+    builder: &mut TorClientConfigBuilder,
+    outbound_proxy: &adapter::OutboundProxySettings,
+) -> anyhow::Result<()> {
+    if let Some(proxy) = &outbound_proxy.proxy {
+        // tor-config derive (tor-chanmgr 0.48): setter for Option<ProxyProtocol> field.
+        builder.channel().outbound_proxy(Some(proxy.clone()));
+    }
+    Ok(())
+}
+
 fn client_config(
     state_dir: &Path,
     cache_dir: &Path,
     bridges: &BridgeSettings,
+    outbound_proxy: &adapter::OutboundProxySettings,
 ) -> anyhow::Result<TorClientConfig> {
     // Ensure private permissions before Arti/mistrust checks. This also repairs
     // existing directories created with overly permissive modes (e.g. 0755).
@@ -486,6 +522,8 @@ fn client_config(
     let mut builder = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
     pt::apply_to_builder(&mut builder, bridges)
         .context("invalid bridge/pluggable transport configuration")?;
+    apply_outbound_proxy_to_builder(&mut builder, outbound_proxy)
+        .context("invalid outbound proxy configuration")?;
     let config = builder.build()?;
 
     // Arti refuses state/cache directories that are accessible to other users.

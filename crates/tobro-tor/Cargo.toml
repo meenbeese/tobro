@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 arti = { workspace = true, features = ["dns-proxy", "experimental-api"] }
 arti-client = { workspace = true, features = ["geoip"] }
+tor-chanmgr = "=0.48.0"
 tor-config = { workspace = true }
 tor-rtcompat = { workspace = true }
 tor-socksproto = { version = "=0.48.0", features = ["proxy-handshake"] }
@@ -18,6 +19,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 futures = { workspace = true }
 
+percent-encoding = "2"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

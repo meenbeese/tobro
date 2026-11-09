@@ -11,13 +11,121 @@
 //! `arti::run_proxy` returns a `!Send` future, so the serving phase is returned as a
 //! future for the caller/supervisor to run (e.g. on a dedicated runtime/thread or local task).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::Context as _;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
+use tor_chanmgr::ProxyProtocol;
 
 use crate::{BootstrapEvent, BridgeSettings, Tor};
+
+fn encode_userinfo_component(s: &str) -> String {
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+}
+
+/// Effective outbound proxy applied to Arti channel connections (F-18/F-19).
+///
+/// For Shadowsocks, this represents the local `sslocal` SOCKS5 endpoint after
+/// the sidecar is started by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboundProxySettings {
+    /// Proxy protocol, or `None` for direct connections.
+    #[serde(skip)]
+    pub proxy: Option<ProxyProtocol>,
+    /// Human-readable summary (no secrets) for status/logging.
+    pub summary: Option<String>,
+}
+
+impl OutboundProxySettings {
+    /// No outbound proxy.
+    pub fn direct() -> Self {
+        Self::default()
+    }
+
+    fn parse_url(url: &str, summary: String) -> anyhow::Result<Self> {
+        let proxy = ProxyProtocol::from_str(url)
+            .map_err(|e| anyhow::anyhow!("invalid outbound proxy URL: {e}"))?;
+        Ok(Self {
+            proxy: Some(proxy),
+            summary: Some(summary),
+        })
+    }
+
+    /// Build an HTTP CONNECT outbound proxy.
+    pub fn http(addr: SocketAddr, username: String, password: String) -> anyhow::Result<Self> {
+        if username.is_empty() && !password.is_empty() {
+            anyhow::bail!("HTTP proxy auth requires a username when a password is set");
+        }
+        let (url, summary) = if username.is_empty() {
+            (format!("http://{addr}"), format!("http://{addr}"))
+        } else {
+            let user = encode_userinfo_component(&username);
+            let auth = if password.is_empty() {
+                format!("{user}@")
+            } else {
+                let pass = encode_userinfo_component(&password);
+                format!("{user}:{pass}@")
+            };
+            (
+                format!("http://{auth}{addr}"),
+                format!("http://<auth>@{addr}"),
+            )
+        };
+        Self::parse_url(&url, summary)
+    }
+
+    /// Build a SOCKS outbound proxy.
+    pub fn socks(
+        version: u8,
+        addr: SocketAddr,
+        username: String,
+        password: String,
+    ) -> anyhow::Result<Self> {
+        let scheme = match version {
+            4 => "socks4",
+            5 => "socks5",
+            _ => anyhow::bail!("unsupported SOCKS version {version}"),
+        };
+        if version == 4 && !password.is_empty() {
+            anyhow::bail!("SOCKS4 does not support password authentication; use SOCKS5");
+        }
+        let (url, summary) = if username.is_empty() && password.is_empty() {
+            (format!("{scheme}://{addr}"), format!("{scheme}://{addr}"))
+        } else if version == 4 {
+            let user = encode_userinfo_component(&username);
+            (
+                format!("{scheme}://{user}@{addr}"),
+                format!("{scheme}://<auth>@{addr}"),
+            )
+        } else {
+            let user = encode_userinfo_component(&username);
+            let pass = encode_userinfo_component(&password);
+            (
+                format!("{scheme}://{user}:{pass}@{addr}"),
+                format!("{scheme}://<auth>@{addr}"),
+            )
+        };
+        Self::parse_url(&url, summary)
+    }
+
+    /// Local SOCKS5 endpoint for a Shadowsocks `sslocal` sidecar.
+    pub fn shadowsocks_local(addr: SocketAddr) -> anyhow::Result<Self> {
+        Self::parse_url(
+            &format!("socks5://{addr}"),
+            format!("shadowsocks via local socks5://{addr}"),
+        )
+    }
+
+    /// True when a proxy is configured.
+    pub fn is_active(&self) -> bool {
+        self.proxy.is_some()
+    }
+}
 
 /// Stream isolation policy (F-42/F-43).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -99,6 +207,10 @@ pub struct ListenerConfig {
     /// Bridge/pluggable transport settings (M3: lyrebird obfs4/meek_lite/webtunnel).
     #[serde(default)]
     pub bridges: BridgeSettings,
+    /// Upstream/outbound proxy for Tor channel connections (F-18/F-19).
+    /// Runtime-only; not serialized as part of listener config snapshots.
+    #[serde(default, skip)]
+    pub outbound_proxy: OutboundProxySettings,
 }
 
 impl Default for ListenerConfig {
@@ -111,6 +223,7 @@ impl Default for ListenerConfig {
             stream_isolation: StreamIsolationPolicy::default(),
             network_prefs: NetworkStreamPrefs::default(),
             bridges: BridgeSettings::default(),
+            outbound_proxy: OutboundProxySettings::default(),
         }
     }
 }
@@ -291,6 +404,7 @@ impl PreparedService {
             self.listeners.stream_isolation,
             self.listeners.network_prefs.clone(),
             &self.listeners.bridges,
+            &self.listeners.outbound_proxy,
         );
         tokio::pin!(serve);
 
@@ -339,9 +453,14 @@ pub async fn bootstrap_and_prepare(
         detail: "starting".to_owned(),
     });
 
-    let observer = Tor::create_with_bridges(&state_dir, &cache_dir, &listeners.bridges)
-        .await
-        .context("could not create the Arti client")?;
+    let observer = Tor::create_with_settings(
+        &state_dir,
+        &cache_dir,
+        &listeners.bridges,
+        &listeners.outbound_proxy,
+    )
+    .await
+    .context("could not create the Arti client")?;
 
     let events_for_bootstrap = control.events_tx.clone();
     let status_for_bootstrap = control.status_tx.clone();

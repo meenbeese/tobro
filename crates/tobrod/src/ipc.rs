@@ -252,8 +252,9 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
 }
 
 fn redacted_config_value(config: &tobro_config::Config) -> Result<serde_json::Value, String> {
-    // Config currently contains no secrets; secrets belong in the keychain/store.
-    serde_json::to_value(config).map_err(|e| format!("could not serialize config: {e}"))
+    let mut redacted = config.clone();
+    redacted.outbound_proxy = redacted.outbound_proxy.redacted();
+    serde_json::to_value(redacted).map_err(|e| format!("could not serialize config: {e}"))
 }
 
 fn load_current_config(path: &std::path::Path) -> Result<tobro_config::Config, String> {
@@ -288,7 +289,13 @@ fn config_effects(
         || current.proxy.bind_all_interfaces != next.proxy.bind_all_interfaces;
     let stream_changed = current.stream != next.stream;
     let network_changed = current.network != next.network;
-    let restart_required = listeners_changed || stream_changed || network_changed;
+    let bridges_changed = current.bridges != next.bridges;
+    let outbound_proxy_changed = current.outbound_proxy != next.outbound_proxy;
+    let restart_required = listeners_changed
+        || stream_changed
+        || network_changed
+        || bridges_changed
+        || outbound_proxy_changed;
     let mut warnings = tobro_config::proxy_warnings(&next.proxy);
     if next.stream.needs_isolation_frontend() {
         warnings.push(
@@ -302,9 +309,28 @@ fn config_effects(
                 .to_owned(),
         );
     }
+    if next.outbound_proxy.needs_sslocal() {
+        warnings.push(
+            "Shadowsocks outbound proxy requires the `sslocal` sidecar (shadowsocks-rust). Configure outbound_proxy.sslocal_path/sslocal_dir if it is not found automatically; sslocal starts when you connect"
+                .to_owned(),
+        );
+    }
+    if next.outbound_proxy.is_active()
+        && matches!(
+            next.outbound_proxy.normalized_proxy_type(),
+            tobro_config::OutboundProxyType::Http
+                | tobro_config::OutboundProxyType::Socks4
+                | tobro_config::OutboundProxyType::Socks5
+        )
+    {
+        warnings.push(
+            "HTTP/SOCKS outbound proxy host must be an IP address with the current backend; ensure the proxy is reachable and trusted"
+                .to_owned(),
+        );
+    }
     if running && restart_required {
         warnings.push(
-            "active runtime requires stop/connect (or restart) for listener, stream isolation, or network/StreamPrefs changes to take effect"
+            "active runtime requires stop/connect (or restart) for listener, stream, network, bridge, or outbound proxy changes to take effect"
                 .to_owned(),
         );
     }
@@ -313,6 +339,8 @@ fn config_effects(
         "listeners_changed": listeners_changed,
         "stream_changed": stream_changed,
         "network_changed": network_changed,
+        "bridges_changed": bridges_changed,
+        "outbound_proxy_changed": outbound_proxy_changed,
         "runtime_active": running,
         "warnings": warnings,
     })
@@ -357,6 +385,7 @@ fn config_apply_patch(
     let effects = config_effects(&current, &next, running);
     next.save(path)
         .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
+    let outbound_proxy = crate::outbound::resolve_static_outbound_proxy(&next.outbound_proxy)?;
     let next_listeners = ListenerConfig {
         socks_port: next.proxy.socks_port,
         http_port: next.proxy.effective_http_port(),
@@ -386,6 +415,7 @@ fn config_apply_patch(
             },
         },
         bridges: crate::resolve_bridge_settings(&next.bridges, None),
+        outbound_proxy,
     };
     match listeners.write() {
         Ok(mut current) => *current = next_listeners.clone(),
@@ -420,11 +450,22 @@ fn config_apply_patch(
 }
 
 /// Supervisor handle paired with config path and live listener settings for IPC.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SupervisorControl {
     handle: SupervisorHandle,
     config_path: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
     listeners: Arc<RwLock<ListenerConfig>>,
+    outbound_sidecar: Arc<tokio::sync::Mutex<Option<crate::outbound::SslocalHandle>>>,
+}
+
+impl std::fmt::Debug for SupervisorControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupervisorControl")
+            .field("config_path", &self.config_path)
+            .field("state_dir", &self.state_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SupervisorControl {
@@ -432,12 +473,22 @@ impl SupervisorControl {
     pub fn new(
         handle: SupervisorHandle,
         config_path: std::path::PathBuf,
+        state_dir: std::path::PathBuf,
         listeners: Arc<RwLock<ListenerConfig>>,
     ) -> Self {
         Self {
             handle,
             config_path,
+            state_dir,
             listeners,
+            outbound_sidecar: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn stop_outbound_sidecar(&self) {
+        let mut guard = self.outbound_sidecar.lock().await;
+        if let Some(sidecar) = guard.take() {
+            sidecar.stop().await;
         }
     }
 }
@@ -451,16 +502,48 @@ impl DaemonControl for SupervisorControl {
         &self,
         state_dir: std::path::PathBuf,
         cache_dir: std::path::PathBuf,
-        listeners: ListenerConfig,
+        mut listeners: ListenerConfig,
     ) -> Result<(), String> {
-        self.handle
+        // Stop any previous outbound sidecar before (re)connecting.
+        self.stop_outbound_sidecar().await;
+
+        let config = tobro_config::Config::load_or_default(&self.config_path)
+            .map_err(|e| format!("failed to load config for connect: {e}"))?;
+        config
+            .validate()
+            .map_err(|e| format!("invalid config: {e}"))?;
+        if config.outbound_proxy.needs_sslocal() {
+            let sidecar = crate::outbound::start_sslocal_and_resolve(
+                &config.outbound_proxy,
+                Some(&state_dir),
+            )
+            .await
+            .map_err(|e| redact_secrets(&format!("Shadowsocks (sslocal) failed: {e:#}")))?;
+            listeners.outbound_proxy = sidecar.outbound_settings().map_err(|e| e.to_string())?;
+            *self.outbound_sidecar.lock().await = Some(sidecar);
+        } else {
+            listeners.outbound_proxy =
+                crate::outbound::resolve_static_outbound_proxy(&config.outbound_proxy)?;
+        }
+
+        match self
+            .handle
             .connect(state_dir, cache_dir, listeners)
             .await
             .map_err(|e| e.to_string())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.stop_outbound_sidecar().await;
+                Err(e)
+            }
+        }
     }
 
     async fn disconnect(&self) -> Result<(), String> {
-        self.handle.disconnect().await.map_err(|e| e.to_string())
+        let res = self.handle.disconnect().await.map_err(|e| e.to_string());
+        self.stop_outbound_sidecar().await;
+        res
     }
 
     async fn new_identity(&self) -> Result<(), String> {
@@ -508,6 +591,8 @@ impl DaemonControl for SupervisorControl {
                 .validate()
                 .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
             let warnings = tobro_config::proxy_warnings(&config.proxy);
+            let outbound_proxy = crate::outbound::resolve_static_outbound_proxy(&config.outbound_proxy)
+                .map_err(|e| format!("invalid outbound proxy: {e}"))?;
             let next = ListenerConfig {
                 socks_port: config.proxy.socks_port,
                 http_port: config.proxy.effective_http_port(),
@@ -529,6 +614,7 @@ impl DaemonControl for SupervisorControl {
                     },
                 },
                 bridges: crate::resolve_bridge_settings(&config.bridges, None),
+                outbound_proxy,
             };
             match listeners.write() {
                 Ok(mut current) => *current = next.clone(),
