@@ -8,11 +8,13 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
 ## At a glance
 
-- **Tor engine:** Arti 2.8 (`arti-client` 0.48), embedded in Rust.
-- **App:** Tauri 2 + React 19 + TypeScript, with a separate `tobrod` daemon.
+- **Tor:** Arti 2.8 (embedded) via `tobrod` daemon + Tauri/React desktop app.
 - **Platforms:** macOS, Windows, Linux.
-- **Scope:** connect/disconnect, bridges and pluggable transports, proxy services, onion services, Kindness Mode, tray/autostart, CLI.
-- **Non-goals:** mobile, Tor relay/exit mode, raw `torrc` compatibility, bundled browser.
+- **Proxy:** local SOCKS5, HTTP CONNECT, and DNS (configurable).
+- **Bridges (M3):** `[bridges]` config + **lyrebird** for **obfs4**, **meek_lite** (`meek`), and **WebTunnel**. Snowflake/Moat/Smart Connect planned.
+- **Desktop:** connect/stop/new identity, bootstrap status, tray, autostart, app lock, settings, floating logs.
+- **CLI:** `tobroctl` — status/connect/stop/new identity/config/watch.
+- **Non-goals:** mobile, relay/exit, `torrc` compatibility, bundled browser.
 
 ## Core state machine
 
@@ -65,6 +67,24 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 │  └─────────────────────────────┘        └──────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+## Bridges (lyrebird / M3)
+
+Enable bridges in `config.toml` and provide bridge lines. For obfs4, meek_lite, or WebTunnel, tobro resolves `lyrebird` (or use `bridges.transport_path` / `transport_dir`) and configures Arti’s PT transport:
+
+```toml
+[bridges]
+enabled = true
+lines = [
+  "obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0",
+  "Bridge webtunnel 192.0.2.2:443 FINGERPRINT url=https://example.com/ ver=0.0.1",
+  "Bridge meek_lite 192.0.2.3:443 FINGERPRINT url=https://meek.example/ front=cdn.example",
+]
+# transport_path = "/path/to/lyrebird"   # optional
+# transport_dir = "/path/to/sidecars"    # optional
+```
+
+`meek` is accepted as an alias for `meek_lite` in tobro’s normalization where applicable.
 
 ## CLI commands
 
@@ -135,11 +155,10 @@ it. You can still run the daemon manually: `cargo run -p tobrod -- run`.
 
 The shell connects to `tobrod` over local IPC (default platform state path, or
 `--socket <path>`), shows status/bootstrap progress, provides Connect/Stop/New
-identity, includes an Advanced Settings screen (power-user gated) for
-listener-port editing and config import/export (redacted, no secrets), and keeps
-an event log viewer (filters/copy/save, redaction controls). If `tobrod` is not
-running, the GUI attempts to start it automatically. The window hides to the tray
-on close; quit from the tray menu to exit the GUI. The daemon is independent.
+identity, settings (listener/config management), and a floating logs window
+(filter/redact/copy/save). If `tobrod` is not running, the GUI attempts to start
+it automatically. The window hides to the tray on close; quit from the tray menu
+to exit the GUI. The daemon is independent.
 
 ## License
 

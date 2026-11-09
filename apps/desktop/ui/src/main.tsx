@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 import { About } from "./About";
+import { Logs } from "./Logs";
 import { Settings } from "./Settings";
 import { initTheme } from "./theme";
 import { initCaptureProtection } from "./captureProtection";
@@ -26,6 +27,12 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     ) : windowKind === "about" ? (
       <main className="app about-window">
         <About
+          onClose={() => void getCurrentWindow().close()}
+        />
+      </main>
+    ) : windowKind === "logs" ? (
+      <main className="app logs-window">
+        <Logs
           onClose={() => void getCurrentWindow().close()}
         />
       </main>

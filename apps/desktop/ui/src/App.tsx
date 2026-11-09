@@ -1,9 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import appIconUrl from "./assets/icon.svg";
-import { LogViewer, type LogEntry } from "./LogViewer";
 
 type DaemonState =
   | "starting"
@@ -67,8 +66,6 @@ export default function App() {
   const [reachable, setReachable] = useState(false);
   const [daemonInfo, setDaemonInfo] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const nextLogId = useRef(1);
   const [lockStatus, setLockStatus] = useState<AppLockStatus | null>(null);
   const [locked, setLocked] = useState(false);
   const [unlockPassword, setUnlockPassword] = useState("");
@@ -76,15 +73,11 @@ export default function App() {
   const [unlockBusy, setUnlockBusy] = useState(false);
   const idleTimer = useRef<number | null>(null);
 
-  function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
-    const entry: LogEntry = {
-      id: nextLogId.current++,
-      ts: new Date().toISOString(),
-      text,
-      level,
-      source,
-    };
-    setLogs((prev) => [...prev.slice(-499), entry]);
+  function appendLog(text: string, level: "info" | "error" = "info", source = "ui") {
+    void emit("tobro-event", {
+      kind: "ui.log",
+      payload: { text, level, source, ts: new Date().toISOString() },
+    });
   }
 
   useEffect(() => {
@@ -318,6 +311,32 @@ export default function App() {
     }
   }
 
+  async function openLogs() {
+    try {
+      const existing = await WebviewWindow.getByLabel("logs");
+      if (existing) {
+        await existing.show();
+        await existing.setFocus();
+        return;
+      }
+      const logsWindow = new WebviewWindow("logs", {
+        url: "index.html?window=logs",
+        title: "Logs — Tobro",
+        width: 980,
+        height: 640,
+        minWidth: 640,
+        minHeight: 360,
+        resizable: true,
+        center: true,
+      });
+      logsWindow.once("tauri://error", (e) => {
+        appendLog(`logs window error: ${JSON.stringify(e.payload ?? e)}`, "error", "ui");
+      });
+    } catch (e) {
+      appendLog(`failed to open logs: ${String(e)}`, "error", "ui");
+    }
+  }
+
   async function onConnect() {
     setBusy(true);
     appendLog("requesting connect…", "info", "ui");
@@ -413,6 +432,9 @@ export default function App() {
           <button type="button" disabled title="Change exit country (coming soon)">
             Change exit
           </button>
+          <button type="button" onClick={() => void openLogs()} aria-haspopup="dialog" title="Logs">
+            Logs
+          </button>
           <button type="button" onClick={() => void openSettings()} aria-haspopup="dialog" title="Settings">
             Settings
           </button>
@@ -470,8 +492,6 @@ export default function App() {
           )}
         </div>
       </section>
-
-      <LogViewer entries={logs} onClear={() => setLogs([])} defaultOpen={false} />
       </main>
     </>
   );

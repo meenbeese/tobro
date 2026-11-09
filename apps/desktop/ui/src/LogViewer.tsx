@@ -30,7 +30,10 @@ type LevelFilter = "all" | LogLevel;
 export interface LogViewerProps {
   entries: LogEntry[];
   onClear?: () => void;
+  onClose?: () => void;
   defaultOpen?: boolean;
+  collapsible?: boolean;
+  title?: string;
   className?: string;
 }
 
@@ -69,8 +72,16 @@ function serializeEntries(entries: LogEntry[], redacted: boolean): string {
   return `${header.join("\n")}${lines.join("\n")}\n`;
 }
 
-export function LogViewer({ entries, onClear, defaultOpen = false, className }: LogViewerProps) {
-  const [open, setOpen] = useState(defaultOpen);
+export function LogViewer({
+  entries,
+  onClear,
+  onClose,
+  defaultOpen = false,
+  collapsible = true,
+  title = "Log",
+  className,
+}: LogViewerProps) {
+  const [open, setOpen] = useState(collapsible ? defaultOpen : true);
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState<LevelFilter>("all");
   const [applyRedaction, setApplyRedaction] = useState(() => readBoolPref(PREF_REDACT, true));
@@ -142,29 +153,33 @@ export function LogViewer({ entries, onClear, defaultOpen = false, className }: 
     onClear?.();
   }
 
+  const isOpen = collapsible ? open : true;
+
   return (
-    <section className={`card logs ${open ? "open" : "collapsed"} ${className ?? ""}`.trim()}>
+    <section className={`card logs ${isOpen ? "open" : "collapsed"} ${className ?? ""}`.trim()}>
       <div className="logs-header">
-        <h2>Log</h2>
+        <h2>{title}</h2>
         <div className="logs-header-actions">
           <span className="muted logs-count" aria-live="polite">
             {filtered.length === entries.length
               ? `${entries.length}`
               : `${filtered.length}/${entries.length}`}
           </span>
-          <button
-            type="button"
-            className="logs-toggle"
-            aria-expanded={open}
-            aria-controls="event-log-panel"
-            onClick={() => setOpen((v) => !v)}
-          >
-            {open ? "Hide" : "Show"}
-          </button>
+          {collapsible ? (
+            <button
+              type="button"
+              className="logs-toggle"
+              aria-expanded={open}
+              aria-controls="event-log-panel"
+              onClick={() => setOpen((v) => !v)}
+            >
+              {open ? "Hide" : "Show"}
+            </button>
+          ) : null}
         </div>
       </div>
 
-      {open ? (
+      {isOpen ? (
         <div id="event-log-panel">
           <div className="log-controls" role="group" aria-label="Log filters and actions">
             <label className="log-control">
@@ -211,6 +226,11 @@ export function LogViewer({ entries, onClear, defaultOpen = false, className }: 
               {onClear ? (
                 <button type="button" onClick={onClearClick} disabled={entries.length === 0}>
                   Clear
+                </button>
+              ) : null}
+              {onClose ? (
+                <button type="button" onClick={onClose}>
+                  Close
                 </button>
               ) : null}
             </div>

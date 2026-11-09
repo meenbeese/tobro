@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "logs-capability",
+  "description": "Permissions for the logs popup window.",
+  "windows": ["logs"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-close",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "notification:default",
+    "global-shortcut:default"
+  ]
+}
