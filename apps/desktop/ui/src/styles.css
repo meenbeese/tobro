@@ -423,3 +423,32 @@ input, select, textarea { font: inherit; }
   font: inherit;
 }
 .tabpanel[hidden] { display: none; }
+
+.lock-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: color-mix(in srgb, var(--bg) 92%, #000);
+  backdrop-filter: blur(2px);
+}
+.lock-card {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lock-card h2 { margin: 0; }
+.lock-card input {
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font: inherit;
+}
+.field-label { font-size: 0.9rem; color: var(--muted); }
+.app-locked { filter: blur(1px); user-select: none; }

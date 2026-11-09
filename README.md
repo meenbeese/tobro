@@ -2,48 +2,7 @@
 
 A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 
-**Status:** M0-M2 complete; M3 in progress.
-
-M1 delivered the control plane and desktop shell: Arti bootstrap/listeners,
-local IPC (Unix socket + Windows named pipe), `tobro-config`/`tobro-store`,
-`tobrod` lifecycle/supervisor + `tobro-tor` adapter core, hardened IPC
-(allowlist, hello-preflight, param validation, Unix peer checks, idle timeout,
-event resync), `tobroctl`, and a Tauri 2 + React desktop shell with
-connect/stop, status/bootstrap UI, tray/quit-to-tray, redaction utilities,
-and unsigned packaging smoke builds.
-
-M2 progress so far: CI speedups (safe caching/prebuilt Tauri CLI), configurable
-proxy/DNS ports with conflict detection/helpers and honest SOCKS+HTTP listener
-semantics, bind-all-interfaces opt-in (`proxy.bind_all_interfaces`, default off)
-with bind-aware port checks and clear security/firewall warnings in config/IPC/UI,
-DNS/`.onion` wiring verification (CI unit/config tests) plus an opt-in runtime
-`.onion` resolution check via `tobrod spike --dns-check-host <v3>.onion`
-(UDP-only Arti DNS, retry-aware), `daemon.new_identity` (new circuits via
-supervised restart while preserving guard/state dirs) with tests/CLI/UI, daemon
-config API (`config.get`/`config.validate`/`config.apply`, redacted/no secrets,
-patch-based, deny-unknown-fields preserved), `tobroctl config get|validate|apply`,
-supported node-restrictions/unsupported-knob UX (supported subset documented in
-UI; known unsupported config knobs rejected explicitly, never silently ignored),
-stream isolation (F-42/F-43): configurable `[stream]` policy for
-destination/port/protocol isolation and SOCKS auth keep-alive isolation;
-destination/port isolation is applied by a thin isolation pre-proxy that
-injects Arti-compatible SOCKS auth / HTTP `Tor-Stream-Isolation` tokens, while
-SOCKS auth isolation remains native to Arti,
-exit country / IPv6 / `StreamPrefs` defaults (M2): configurable `[network]`
-settings (`exit_country` ISO 3166-1 alpha-2, `ip_version` preference) with
-validation and restart-required effects; applied via Arti `StreamPrefs` in a
-custom `TorClient` proxy/DNS path when custom network prefs or isolation are
-active (requires `arti-client` geoip for exit country),
-desktop Settings popup (tabbed: General, Node Configuration, Advanced Tor
-Configuration) behind a power-user gate with proxy/listener/bind-all editing,
-Node Configuration exit-country/IP-version controls, stream-isolation controls,
-and config import/export (redacted, no secrets), plus a standalone log viewer
-(filters, copy/save, wrap, persisted redaction preference) and daemon/UI
-redaction hardening.
-
-M2 complete: config/validation/effects/mapping feature tests cover exposed proxy,
-bind-all, stream-isolation, and network/`StreamPrefs` knobs. Runtime/cross-OS and
-live-Tor verification remain recommended validation (not blocking M2 completion).
+**Status:** M0-M2, M4 complete; M3 in progress.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -111,6 +70,15 @@ cargo run -p tobroctl -- watch          # stream state/bootstrap notifications
 cargo run -p tobrod -- spike --exit-after-check
 # opt-in .onion resolution check through the local DNS proxy (UDP; needs live Tor + a reachable target)
 cargo run -p tobrod -- spike --exit-after-check --timeout-secs 300 --dns-check-host <v3-onion-hostname>.onion
+```
+
+### Desktop app options
+
+```sh
+# Start the GUI hidden to the tray (used by autostart/start-minimized)
+cargo run -p tobro -- --minimized
+# equivalent
+cargo run -p tobro -- --hidden
 ```
 
 `tobrod run` starts stopped; use `connect` to start Tor. `tobroctl` prints JSON to

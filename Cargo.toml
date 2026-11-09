@@ -75,6 +75,10 @@ libsql = "0.6"
 keyring = "4"
 zeroize = "1"
 hickory-proto = "0.26"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
 
 # --- HTTP (Moat, bridge data, updates) -----------------------------------
 reqwest = { version = "0.13", default-features = false, features = [

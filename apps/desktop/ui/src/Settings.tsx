@@ -165,6 +165,27 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [globalShortcutBusy, setGlobalShortcutBusy] = useState(false);
   const [globalShortcutMessage, setGlobalShortcutMessage] = useState<string>("");
   const [globalShortcutError, setGlobalShortcutError] = useState<string>("");
+  const [autostart, setAutostart] = useState<{ enabled: boolean; start_minimized: boolean } | null>(null);
+  const [autostartInfo, setAutostartInfo] = useState<{ supported: boolean; method: string; details: string } | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartMessage, setAutostartMessage] = useState("");
+  const [autostartError, setAutostartError] = useState("");
+  const [appLock, setAppLock] = useState<{
+    enabled: boolean;
+    lock_on_idle: boolean;
+    idle_minutes: number;
+    lock_on_close: boolean;
+    prefer_os_auth: boolean;
+    has_password: boolean;
+    os_auth_available: boolean;
+    os_auth_method: string;
+  } | null>(null);
+  const [appLockBusy, setAppLockBusy] = useState(false);
+  const [appLockMessage, setAppLockMessage] = useState("");
+  const [appLockError, setAppLockError] = useState("");
+  const [lockPassword, setLockPassword] = useState("");
+  const [lockPasswordConfirm, setLockPasswordConfirm] = useState("");
+  const [lockCurrentPassword, setLockCurrentPassword] = useState("");
   const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
     general: null,
     node: null,
@@ -276,10 +297,191 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  async function loadAutostart() {
+    try {
+      const s = await invoke<{
+        supported: boolean;
+        enabled: boolean;
+        start_minimized: boolean;
+        method: string;
+        details: string;
+      }>("get_autostart");
+      setAutostart({ enabled: s.enabled, start_minimized: s.start_minimized });
+      setAutostartInfo({ supported: s.supported, method: s.method, details: s.details });
+      setAutostartError("");
+    } catch (e) {
+      setAutostartError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function onSaveAutostart(e?: FormEvent) {
+    e?.preventDefault();
+    if (!autostart) return;
+    setAutostartBusy(true);
+    setAutostartError("");
+    setAutostartMessage("");
+    try {
+      const s = await invoke<{
+        supported: boolean;
+        enabled: boolean;
+        start_minimized: boolean;
+        method: string;
+        details: string;
+      }>("set_autostart", {
+        enabled: autostart.enabled,
+        startMinimized: autostart.start_minimized,
+      });
+      setAutostart({ enabled: s.enabled, start_minimized: s.start_minimized });
+      setAutostartInfo({ supported: s.supported, method: s.method, details: s.details });
+      setAutostartMessage(
+        s.enabled
+          ? `Autostart enabled (${s.method}).${s.start_minimized ? " Will start minimized." : ""}`
+          : "Autostart disabled.",
+      );
+      log(`autostart ${s.enabled ? "enabled" : "disabled"}${s.start_minimized ? " (start minimized)" : ""}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAutostartError(msg);
+      log(`autostart: ${msg}`, "error");
+      await loadAutostart();
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
+
+  async function loadAppLock() {
+    try {
+      const s = await invoke<{
+        enabled: boolean;
+        lock_on_idle: boolean;
+        idle_minutes: number;
+        lock_on_close: boolean;
+        prefer_os_auth: boolean;
+        has_password: boolean;
+        os_auth_available: boolean;
+        os_auth_method: string;
+      }>("get_app_lock_status");
+      setAppLock(s);
+      setAppLockError("");
+    } catch (e) {
+      setAppLockError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function onSaveAppLockConfig(e?: FormEvent) {
+    e?.preventDefault();
+    if (!appLock) return;
+    setAppLockBusy(true);
+    setAppLockError("");
+    setAppLockMessage("");
+    try {
+      const s = await invoke<{
+        enabled: boolean;
+        lock_on_idle: boolean;
+        idle_minutes: number;
+        lock_on_close: boolean;
+        prefer_os_auth: boolean;
+        has_password: boolean;
+        os_auth_available: boolean;
+        os_auth_method: string;
+      }>("set_app_lock_config", {
+        enabled: appLock.enabled,
+        lockOnIdle: appLock.lock_on_idle,
+        idleMinutes: appLock.idle_minutes,
+        lockOnClose: appLock.lock_on_close,
+        preferOsAuth: appLock.prefer_os_auth,
+      });
+      setAppLock(s);
+      setAppLockMessage(s.enabled ? "App lock enabled." : "App lock settings saved (lock disabled).");
+      log(`app lock ${s.enabled ? "enabled" : "disabled"} (idle=${s.lock_on_idle}, close=${s.lock_on_close})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppLockError(msg);
+      log(`app lock: ${msg}`, "error");
+      await loadAppLock();
+    } finally {
+      setAppLockBusy(false);
+    }
+  }
+
+  async function onSetAppLockPassword(e?: FormEvent) {
+    e?.preventDefault();
+    setAppLockBusy(true);
+    setAppLockError("");
+    setAppLockMessage("");
+    if (lockPassword !== lockPasswordConfirm) {
+      setAppLockError("New passwords do not match.");
+      setAppLockBusy(false);
+      return;
+    }
+    try {
+      const s = await invoke<{
+        enabled: boolean;
+        lock_on_idle: boolean;
+        idle_minutes: number;
+        lock_on_close: boolean;
+        prefer_os_auth: boolean;
+        has_password: boolean;
+        os_auth_available: boolean;
+        os_auth_method: string;
+      }>("set_app_lock_password", {
+        password: lockPassword,
+        currentPassword: appLock?.has_password ? (lockCurrentPassword || null) : null,
+      });
+      setAppLock(s);
+      setLockPassword("");
+      setLockPasswordConfirm("");
+      setLockCurrentPassword("");
+      setAppLockMessage("Password saved. Enable app lock when ready.");
+      log("app lock password updated");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppLockError(msg);
+      log(`app lock password: ${msg}`, "error");
+    } finally {
+      setAppLockBusy(false);
+    }
+  }
+
+  async function onRemoveAppLockPassword(e?: FormEvent) {
+    e?.preventDefault();
+    setAppLockBusy(true);
+    setAppLockError("");
+    setAppLockMessage("");
+    try {
+      const s = await invoke<{
+        enabled: boolean;
+        lock_on_idle: boolean;
+        idle_minutes: number;
+        lock_on_close: boolean;
+        prefer_os_auth: boolean;
+        has_password: boolean;
+        os_auth_available: boolean;
+        os_auth_method: string;
+      }>("remove_app_lock_password", {
+        currentPassword: lockCurrentPassword,
+      });
+      setAppLock(s);
+      setLockPassword("");
+      setLockPasswordConfirm("");
+      setLockCurrentPassword("");
+      setAppLockMessage("Password removed and app lock disabled.");
+      log("app lock password removed");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppLockError(msg);
+      log(`app lock password removal: ${msg}`, "error");
+    } finally {
+      setAppLockBusy(false);
+    }
+  }
+
   useEffect(() => {
     if (powerUser) {
       void loadPorts();
       void loadConfigState();
+      void loadAutostart();
+      void loadAppLock();
     }
   }, [powerUser]);
 
@@ -758,6 +960,169 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </button>
                 </div>
               </form>
+
+              <form className="settings-section" onSubmit={(e) => void onSaveAutostart(e)}>
+                <h3>Startup</h3>
+                <p className="muted">
+                  Start Tobro automatically when you sign in (platform-specific): <strong>LaunchAgent</strong> on macOS,{" "}
+                  <strong>Run key</strong> (HKCU) on Windows, <strong>systemd user unit</strong> on Linux. Changes apply to
+                  the OS autostart configuration. <strong>Start minimized</strong> launches Tobro hidden to the tray
+                  (<code>--minimized</code>).
+                </p>
+                {!autostartInfo?.supported ? (
+                  <p className="muted">Autostart is not available on this platform.</p>
+                ) : (
+                  <>
+                    <label className="checkbox-label" htmlFor="settings-autostart-enabled">
+                      <input
+                        id="settings-autostart-enabled"
+                        type="checkbox"
+                        checked={autostart?.enabled ?? false}
+                        disabled={autostartBusy || !autostart}
+                        onChange={(e) =>
+                          setAutostart((prev) => ({
+                            enabled: e.target.checked,
+                            start_minimized: prev?.start_minimized ?? false,
+                          }))
+                        }
+                      />
+                      <span><strong>Start at login</strong></span>
+                    </label>
+                    <label className="checkbox-label" htmlFor="settings-autostart-minimized">
+                      <input
+                        id="settings-autostart-minimized"
+                        type="checkbox"
+                        checked={autostart?.start_minimized ?? false}
+                        disabled={autostartBusy || !autostart?.enabled}
+                        onChange={(e) =>
+                          setAutostart((prev) => ({
+                            enabled: prev?.enabled ?? false,
+                            start_minimized: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span><strong>Start minimized</strong> (tray)</span>
+                    </label>
+                    {autostartInfo ? (
+                      <p className="muted">
+                        Method: {autostartInfo.method}. <span className="muted">{autostartInfo.details}</span>
+                      </p>
+                    ) : null}
+                    {autostartError ? <p className="error">{autostartError}</p> : null}
+                    {autostartMessage ? <p className="muted">{autostartMessage}</p> : null}
+                    <div className="actions">
+                      <button className="primary" type="submit" disabled={autostartBusy || !autostart}>
+                        {autostartBusy ? "Applying…" : "Apply startup settings"}
+                      </button>
+                      <button type="button" disabled={autostartBusy} onClick={() => void loadAutostart()}>
+                        Refresh
+                      </button>
+                    </div>
+                  </>
+                )}
+              </form>
+
+              <div className="settings-section">
+                <h3>App lock</h3>
+                <p className="muted">
+                  Lock Tobro to prevent casual access to the UI. Unlock with <strong>OS authentication</strong> (when
+                  supported/integrated) or a <strong>password fallback</strong>. Lock can trigger on{" "}
+                  <strong>idle</strong> and/or when the window is <strong>closed/hidden to tray</strong> (configurable).
+                  Password verification is stored locally (PBKDF2-HMAC-SHA256). This protects UI access; it does not
+                  encrypt Tor state or replace OS account security.
+                </p>
+                {appLock ? (
+                  <>
+                    <form onSubmit={(e) => void onSaveAppLockConfig(e)}>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={appLock.enabled}
+                          disabled={appLockBusy || !appLock.has_password}
+                          onChange={(e) => setAppLock({ ...appLock, enabled: e.target.checked })}
+                        />
+                        <span><strong>Enable app lock</strong>{!appLock.has_password ? " (set a password first)" : ""}</span>
+                      </label>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={appLock.lock_on_idle}
+                          disabled={appLockBusy}
+                          onChange={(e) => setAppLock({ ...appLock, lock_on_idle: e.target.checked })}
+                        />
+                        <span>Lock on idle</span>
+                      </label>
+                      <div className="field-row">
+                        <label htmlFor="app-lock-idle-minutes">Idle timeout (minutes)</label>
+                        <input
+                          id="app-lock-idle-minutes"
+                          type="number"
+                          min={1}
+                          max={240}
+                          value={appLock.idle_minutes}
+                          disabled={appLockBusy || !appLock.lock_on_idle}
+                          onChange={(e) => setAppLock({ ...appLock, idle_minutes: Number(e.target.value) || 5 })}
+                        />
+                      </div>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={appLock.lock_on_close}
+                          disabled={appLockBusy}
+                          onChange={(e) => setAppLock({ ...appLock, lock_on_close: e.target.checked })}
+                        />
+                        <span>Lock when window is closed/hidden to tray</span>
+                      </label>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={appLock.prefer_os_auth}
+                          disabled={appLockBusy}
+                          onChange={(e) => setAppLock({ ...appLock, prefer_os_auth: e.target.checked })}
+                        />
+                        <span>Prefer OS authentication when available</span>
+                      </label>
+                      <p className="muted">
+                        OS auth: {appLock.os_auth_available ? "available" : `not available — ${appLock.os_auth_method}`}. Password fallback is used when OS auth is unavailable.
+                      </p>
+                      <div className="actions">
+                        <button className="primary" type="submit" disabled={appLockBusy}>Save app lock settings</button>
+                        <button type="button" disabled={appLockBusy} onClick={() => void loadAppLock()}>Refresh</button>
+                      </div>
+                    </form>
+
+                    <form onSubmit={(e) => void onSetAppLockPassword(e)} style={{ marginTop: 12 }}>
+                      <h4>{appLock.has_password ? "Change password" : "Set password"}</h4>
+                      {appLock.has_password ? (
+                        <div className="field-row">
+                          <label htmlFor="app-lock-current">Current password</label>
+                          <input id="app-lock-current" type="password" value={lockCurrentPassword} onChange={(e) => setLockCurrentPassword(e.target.value)} autoComplete="current-password" />
+                        </div>
+                      ) : null}
+                      <div className="field-row">
+                        <label htmlFor="app-lock-new">New password</label>
+                        <input id="app-lock-new" type="password" value={lockPassword} onChange={(e) => setLockPassword(e.target.value)} autoComplete="new-password" />
+                      </div>
+                      <div className="field-row">
+                        <label htmlFor="app-lock-confirm">Confirm new password</label>
+                        <input id="app-lock-confirm" type="password" value={lockPasswordConfirm} onChange={(e) => setLockPasswordConfirm(e.target.value)} autoComplete="new-password" />
+                      </div>
+                      <div className="actions">
+                        <button className="primary" type="submit" disabled={appLockBusy || !lockPassword}>{appLock.has_password ? "Change password" : "Set password"}</button>
+                        {appLock.has_password ? (
+                          <button type="button" className="danger" disabled={appLockBusy || !lockCurrentPassword} onClick={(e) => void onRemoveAppLockPassword(e)}>
+                            Remove password / disable lock
+                          </button>
+                        ) : null}
+                      </div>
+                    </form>
+                    {appLockError ? <p className="error">{appLockError}</p> : null}
+                    {appLockMessage ? <p className="muted">{appLockMessage}</p> : null}
+                  </>
+                ) : (
+                  <p className="muted">Loading app lock settings…</p>
+                )}
+              </div>
 
               <form className="settings-section port-editor" onSubmit={onSavePorts}>
                 <h3>Proxy / listener settings</h3>

@@ -20,6 +20,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tobro-config = { path = "../../crates/tobro-config" }
 tobro-ipc = { path = "../../crates/tobro-ipc" }
+pbkdf2 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
 
 [build-dependencies]
 tauri-build = { workspace = true }

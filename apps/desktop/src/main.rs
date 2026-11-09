@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, oneshot};
+use zeroize::Zeroize;
 
 use tobro_ipc::{Client, DaemonState, DaemonStatus, Message, methods, socket_path};
 
@@ -376,6 +377,10 @@ fn main() {
             // Best-effort default: reduce accidental capture exposure until UI syncs preference.
             apply_window_capture_protection(app.handle(), true);
             setup_tray(app.handle())?;
+            let start_minimized = std::env::args().any(|a| a == "--minimized" || a == "--hidden");
+            if start_minimized && let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(watch_daemon(handle, daemon_socket, command_rx));
             Ok(())
@@ -393,6 +398,13 @@ fn main() {
             open_external_url,
             set_capture_protection,
             set_global_shortcut,
+            get_autostart,
+            set_autostart,
+            get_app_lock_status,
+            set_app_lock_config,
+            set_app_lock_password,
+            remove_app_lock_password,
+            unlock_app_lock,
             daemon_connect,
             daemon_stop,
             daemon_new_identity,
@@ -726,6 +738,622 @@ fn set_global_shortcut(app: AppHandle, shortcut: Option<String>) -> Result<(), S
         .register(parsed)
         .map_err(|e| format!("Could not register shortcut (it may be in use): {e}"))?;
     Ok(())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AutostartStatus {
+    supported: bool,
+    enabled: bool,
+    start_minimized: bool,
+    method: String,
+    details: String,
+}
+
+fn current_exe_for_autostart() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("could not determine executable path: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join("app.tobro.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_launch_agent(start_minimized: bool) -> Result<String, String> {
+    let exe = current_exe_for_autostart()?;
+    let path = macos_launch_agent_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create LaunchAgents dir: {e}"))?;
+    }
+    let mut args = format!(
+        "    <string>{}</string>\n",
+        xml_escape(&exe.display().to_string())
+    );
+    if start_minimized {
+        args.push_str("    <string>--minimized</string>\n");
+    }
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>app.tobro</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
+"#
+    );
+    std::fs::write(&path, plist).map_err(|e| format!("failed to write LaunchAgent: {e}"))?;
+    Ok(path.display().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_launch_agent() -> Result<String, String> {
+    let path = macos_launch_agent_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("failed to remove LaunchAgent: {e}"))?;
+    }
+    Ok(path.display().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_autostart() -> AutostartStatus {
+    let path = macos_launch_agent_path().ok();
+    let enabled = path.as_ref().is_some_and(|p| p.exists());
+    let start_minimized = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|s| s.contains("--minimized") || s.contains("--hidden"));
+    AutostartStatus {
+        supported: true,
+        enabled,
+        start_minimized: enabled && start_minimized,
+        method: "LaunchAgent (~/Library/LaunchAgents)".to_owned(),
+        details: path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "LaunchAgent path unavailable".to_owned()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_run_key(start_minimized: bool) -> Result<String, String> {
+    let exe = current_exe_for_autostart()?;
+    let mut data = format!("\"{}\"", exe.display());
+    if start_minimized {
+        data.push_str(" --minimized");
+    }
+    let out = Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "tobro",
+            "/t",
+            "REG_SZ",
+            "/f",
+            "/d",
+            &data,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run reg.exe: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "reg add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\tobro".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_windows_run_key() -> Result<String, String> {
+    let out = Command::new("reg")
+        .args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "tobro",
+            "/f",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run reg.exe: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let s = stderr.to_lowercase();
+        if !s.contains("unable to find") && !s.contains("does not exist") {
+            return Err(format!("reg delete failed: {}", stderr.trim()));
+        }
+    }
+    Ok(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\tobro".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_autostart() -> AutostartStatus {
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "tobro",
+        ])
+        .output();
+    let (enabled, start_minimized) = match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            (true, s.contains("--minimized") || s.contains("--hidden"))
+        }
+        _ => (false, false),
+    };
+    AutostartStatus {
+        supported: true,
+        enabled,
+        start_minimized: enabled && start_minimized,
+        method: "Run key (HKCU)".to_owned(),
+        details: r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\tobro".to_owned(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_systemd_user_unit_path() -> Result<PathBuf, String> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or("could not determine config directory")?;
+    Ok(config.join("systemd").join("user").join("tobro.service"))
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_systemd_unit(start_minimized: bool) -> Result<String, String> {
+    let exe = current_exe_for_autostart()?;
+    let path = linux_systemd_user_unit_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create systemd user dir: {e}"))?;
+    }
+    let exec = if start_minimized {
+        format!("\"{}\" --minimized", exe.display())
+    } else {
+        format!("\"{}\"", exe.display())
+    };
+    let unit = format!(
+        r#"[Unit]
+Description=tobro desktop Tor client
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={exec}
+Restart=no
+
+[Install]
+WantedBy=default.target
+"#
+    );
+    std::fs::write(&path, unit).map_err(|e| format!("failed to write systemd user unit: {e}"))?;
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+    let details = match Command::new("systemctl")
+        .args(["--user", "enable", "tobro.service"])
+        .output()
+    {
+        Ok(out) if out.status.success() => path.display().to_string(),
+        Ok(out) => format!(
+            "{} (unit written; `systemctl --user enable` failed: {})",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => format!(
+            "{} (unit written; could not run systemctl: {e})",
+            path.display()
+        ),
+    };
+    Ok(details)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_linux_systemd_unit() -> Result<String, String> {
+    let path = linux_systemd_user_unit_path()?;
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "tobro.service"])
+        .output();
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("failed to remove systemd user unit: {e}"))?;
+    }
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+    Ok(path.display().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_autostart() -> AutostartStatus {
+    let path = linux_systemd_user_unit_path().ok();
+    let enabled = path.as_ref().is_some_and(|p| p.exists());
+    let start_minimized = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|s| s.contains("--minimized") || s.contains("--hidden"));
+    AutostartStatus {
+        supported: true,
+        enabled,
+        start_minimized: enabled && start_minimized,
+        method: "systemd user unit (~/.config/systemd/user)".to_owned(),
+        details: path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "systemd user unit path unavailable".to_owned()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn read_fallback_autostart() -> AutostartStatus {
+    AutostartStatus {
+        supported: false,
+        enabled: false,
+        start_minimized: false,
+        method: "unsupported".to_owned(),
+        details: "Autostart is not implemented for this platform.".to_owned(),
+    }
+}
+
+#[tauri::command]
+fn get_autostart() -> AutostartStatus {
+    #[cfg(target_os = "macos")]
+    {
+        read_macos_autostart()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        read_windows_autostart()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        read_linux_autostart()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        read_fallback_autostart()
+    }
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool, start_minimized: bool) -> Result<AutostartStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if enabled {
+            let _ = write_macos_launch_agent(start_minimized)?;
+        } else {
+            let _ = remove_macos_launch_agent()?;
+        }
+        Ok(read_macos_autostart())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            let _ = write_windows_run_key(start_minimized)?;
+        } else {
+            let _ = remove_windows_run_key()?;
+        }
+        Ok(read_windows_autostart())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if enabled {
+            let _ = write_linux_systemd_unit(start_minimized)?;
+        } else {
+            let _ = remove_linux_systemd_unit()?;
+        }
+        Ok(read_linux_autostart())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (enabled, start_minimized);
+        Err("Autostart is not implemented for this platform.".to_owned())
+    }
+}
+
+// --- App lock (configurable): password fallback + best-effort OS auth hooks ---
+// Password verifier is stored locally (PBKDF2-HMAC-SHA256). OS auth is
+// platform-dependent; when unavailable, the UI falls back to password.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct PasswordVerifier {
+    salt_hex: String,
+    hash_hex: String,
+    iterations: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AppLockConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_true")]
+    lock_on_idle: bool,
+    #[serde(default = "default_idle_minutes")]
+    idle_minutes: u16,
+    #[serde(default = "default_true")]
+    lock_on_close: bool,
+    #[serde(default = "default_true")]
+    prefer_os_auth: bool,
+    #[serde(default)]
+    password: Option<PasswordVerifier>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_idle_minutes() -> u16 {
+    5
+}
+
+impl Default for AppLockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lock_on_idle: true,
+            idle_minutes: 5,
+            lock_on_close: true,
+            prefer_os_auth: true,
+            password: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AppLockStatus {
+    enabled: bool,
+    lock_on_idle: bool,
+    idle_minutes: u16,
+    lock_on_close: bool,
+    prefer_os_auth: bool,
+    has_password: bool,
+    os_auth_available: bool,
+    os_auth_method: String,
+}
+
+fn app_lock_path() -> Result<PathBuf, String> {
+    let project = directories::ProjectDirs::from("", "", "tobro")
+        .ok_or("could not determine the platform data directory")?;
+    Ok(project.data_dir().join("app-lock.json"))
+}
+
+fn read_app_lock_config() -> Result<AppLockConfig, String> {
+    let path = app_lock_path()?;
+    if !path.exists() {
+        return Ok(AppLockConfig::default());
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read app lock config: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("failed to parse app lock config: {e}"))
+}
+
+fn write_app_lock_config(cfg: &AppLockConfig) -> Result<(), String> {
+    let path = app_lock_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create app data dir: {e}"))?;
+    }
+    let data = serde_json::to_string_pretty(cfg)
+        .map_err(|e| format!("failed to serialize app lock config: {e}"))?;
+    std::fs::write(&path, data).map_err(|e| format!("failed to write app lock config: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn normalize_idle_minutes(minutes: u16) -> u16 {
+    minutes.clamp(1, 240)
+}
+
+fn hash_password(password: &str) -> Result<PasswordVerifier, String> {
+    use pbkdf2::pbkdf2_hmac;
+    use rand::RngCore;
+    use sha2::Sha256;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let iterations: u32 = 600_000;
+    let mut hash = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut hash);
+    Ok(PasswordVerifier {
+        salt_hex: hex::encode(salt),
+        hash_hex: hex::encode(hash),
+        iterations,
+    })
+}
+
+fn verify_password(password: &str, verifier: &PasswordVerifier) -> Result<bool, String> {
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
+    let salt = hex::decode(&verifier.salt_hex)
+        .map_err(|_| "invalid stored password verifier".to_owned())?;
+    let expected = hex::decode(&verifier.hash_hex)
+        .map_err(|_| "invalid stored password verifier".to_owned())?;
+    let mut out = vec![0u8; expected.len()];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, verifier.iterations, &mut out);
+    Ok(out == expected)
+}
+
+fn os_auth_status() -> (bool, String) {
+    // Best-effort OS auth: native biometric/system-auth integration is platform-specific.
+    // Password fallback is always available when a password is configured.
+    #[cfg(target_os = "macos")]
+    {
+        // Touch ID / LocalAuthentication requires native framework integration; not wired here.
+        (
+            false,
+            "macOS system auth integration not available in this build; use password".to_owned(),
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        (
+            false,
+            "Windows Hello integration not available in this build; use password".to_owned(),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        (
+            false,
+            "Linux system auth integration not available in this build; use password".to_owned(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        (
+            false,
+            "OS auth not available on this platform; use password".to_owned(),
+        )
+    }
+}
+
+#[tauri::command]
+fn get_app_lock_status() -> Result<AppLockStatus, String> {
+    let cfg = read_app_lock_config()?;
+    let (os_auth_available, os_auth_method) = os_auth_status();
+    Ok(AppLockStatus {
+        enabled: cfg.enabled && cfg.password.is_some(),
+        lock_on_idle: cfg.lock_on_idle,
+        idle_minutes: cfg.idle_minutes,
+        lock_on_close: cfg.lock_on_close,
+        prefer_os_auth: cfg.prefer_os_auth,
+        has_password: cfg.password.is_some(),
+        os_auth_available,
+        os_auth_method,
+    })
+}
+
+#[tauri::command]
+fn set_app_lock_config(
+    enabled: bool,
+    lock_on_idle: bool,
+    idle_minutes: u16,
+    lock_on_close: bool,
+    prefer_os_auth: bool,
+) -> Result<AppLockStatus, String> {
+    let mut cfg = read_app_lock_config()?;
+    cfg.lock_on_idle = lock_on_idle;
+    cfg.idle_minutes = normalize_idle_minutes(idle_minutes);
+    cfg.lock_on_close = lock_on_close;
+    cfg.prefer_os_auth = prefer_os_auth;
+    if enabled && cfg.password.is_none() {
+        return Err("Set a password before enabling app lock.".to_owned());
+    }
+    cfg.enabled = enabled;
+    write_app_lock_config(&cfg)?;
+    get_app_lock_status()
+}
+
+#[tauri::command]
+fn set_app_lock_password(
+    password: String,
+    current_password: Option<String>,
+) -> Result<AppLockStatus, String> {
+    let mut password = password;
+    if password.len() < 8 {
+        password.zeroize();
+        return Err("Password must be at least 8 characters.".to_owned());
+    }
+    let mut cfg = read_app_lock_config()?;
+    if let Some(verifier) = &cfg.password {
+        let Some(mut current) = current_password else {
+            password.zeroize();
+            return Err("Current password is required to change the password.".to_owned());
+        };
+        let ok = verify_password(&current, verifier)?;
+        current.zeroize();
+        if !ok {
+            password.zeroize();
+            return Err("Current password is incorrect.".to_owned());
+        }
+    }
+    let verifier = hash_password(&password)?;
+    password.zeroize();
+    cfg.password = Some(verifier);
+    // Do not auto-enable; user explicitly enables after setting password.
+    write_app_lock_config(&cfg)?;
+    get_app_lock_status()
+}
+
+#[tauri::command]
+fn remove_app_lock_password(current_password: String) -> Result<AppLockStatus, String> {
+    let mut current_password = current_password;
+    let mut cfg = read_app_lock_config()?;
+    let Some(verifier) = &cfg.password else {
+        current_password.zeroize();
+        return Err("No password is set.".to_owned());
+    };
+    let ok = verify_password(&current_password, verifier)?;
+    current_password.zeroize();
+    if !ok {
+        return Err("Current password is incorrect.".to_owned());
+    }
+    cfg.password = None;
+    cfg.enabled = false;
+    write_app_lock_config(&cfg)?;
+    get_app_lock_status()
+}
+
+#[tauri::command]
+fn unlock_app_lock(password: Option<String>, use_os_auth: Option<bool>) -> Result<Value, String> {
+    let cfg = read_app_lock_config()?;
+    if !cfg.enabled || cfg.password.is_none() {
+        return Ok(json!({ "ok": true, "locked": false }));
+    }
+    let (os_auth_available, os_auth_method) = os_auth_status();
+    let try_os = use_os_auth.unwrap_or(false) || (cfg.prefer_os_auth && password.is_none());
+    if try_os && os_auth_available {
+        // Placeholder for native OS auth integration.
+        let _ = os_auth_method;
+    }
+    if try_os && !os_auth_available && password.is_none() {
+        return Ok(json!({
+            "ok": false,
+            "locked": true,
+            "error": format!("OS authentication is unavailable ({os_auth_method}). Enter your password."),
+            "os_auth_unavailable": true
+        }));
+    }
+    let Some(mut password) = password else {
+        return Ok(json!({ "ok": false, "locked": true, "error": "Password required." }));
+    };
+    let Some(verifier) = &cfg.password else {
+        password.zeroize();
+        return Ok(json!({ "ok": true, "locked": false }));
+    };
+    let ok = verify_password(&password, verifier)?;
+    password.zeroize();
+    if ok {
+        Ok(json!({ "ok": true, "locked": false }))
+    } else {
+        Ok(json!({ "ok": false, "locked": true, "error": "Incorrect password." }))
+    }
 }
 
 async fn watch_daemon(

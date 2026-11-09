@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import appIconUrl from "./assets/icon.svg";
 import { LogViewer, type LogEntry } from "./LogViewer";
 
@@ -35,6 +35,17 @@ interface TobroEvent {
   payload: unknown;
 }
 
+interface AppLockStatus {
+  enabled: boolean;
+  lock_on_idle: boolean;
+  idle_minutes: number;
+  lock_on_close: boolean;
+  prefer_os_auth: boolean;
+  has_password: boolean;
+  os_auth_available: boolean;
+  os_auth_method: string;
+}
+
 function formatStatus(status: DaemonStatus | null, reachable: boolean): string {
   if (!reachable) return "Daemon unavailable";
   if (!status) return "Waiting for status…";
@@ -58,6 +69,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const nextLogId = useRef(1);
+  const [lockStatus, setLockStatus] = useState<AppLockStatus | null>(null);
+  const [locked, setLocked] = useState(false);
+  const [unlockPassword, setUnlockPassword] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const [unlockBusy, setUnlockBusy] = useState(false);
+  const idleTimer = useRef<number | null>(null);
 
   function appendLog(text: string, level: "info" | "error" = "info", source?: string) {
     const entry: LogEntry = {
@@ -144,6 +161,109 @@ export default function App() {
   // start tobrod and connect with a single button (Orbot parity).
   const canConnect = !busy && !isActive && status?.state !== "stopping";
   const canNewIdentity = reachable && !busy && (status?.state === "connected" || status?.state === "serving");
+
+  const refreshLockStatus = useCallback(async (opts?: { lockIfEnabled?: boolean }) => {
+    try {
+      const s = await invoke<AppLockStatus>("get_app_lock_status");
+      setLockStatus(s);
+      const shouldBeLockable = s.enabled && s.has_password;
+      if (!shouldBeLockable) {
+        setLocked(false);
+      } else if (opts?.lockIfEnabled) {
+        setLocked(true);
+      }
+      return s;
+    } catch (e) {
+      appendLog(`app lock status: ${String(e)}`, "error", "ui");
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshLockStatus({ lockIfEnabled: true });
+  }, [refreshLockStatus]);
+
+  useEffect(() => {
+    if (!lockStatus?.enabled || !lockStatus.lock_on_idle || locked) return;
+    const ms = Math.max(1, lockStatus.idle_minutes || 5) * 60_000;
+    const reset = () => {
+      if (idleTimer.current != null) window.clearTimeout(idleTimer.current);
+      idleTimer.current = window.setTimeout(() => {
+        setLocked(true);
+        setUnlockPassword("");
+        setUnlockError("");
+      }, ms);
+    };
+    const events: (keyof WindowEventMap)[] = ["mousemove", "mousedown", "keydown", "touchstart", "scroll"];
+    events.forEach((ev) => window.addEventListener(ev, reset, { passive: true }));
+    reset();
+    return () => {
+      events.forEach((ev) => window.removeEventListener(ev, reset));
+      if (idleTimer.current != null) {
+        window.clearTimeout(idleTimer.current);
+        idleTimer.current = null;
+      }
+    };
+  }, [lockStatus?.enabled, lockStatus?.lock_on_idle, lockStatus?.idle_minutes, locked]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (lockStatus?.enabled && lockStatus.lock_on_close) {
+          setLocked(true);
+          setUnlockPassword("");
+          setUnlockError("");
+        }
+      } else {
+        void refreshLockStatus();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [lockStatus?.enabled, lockStatus?.lock_on_close, refreshLockStatus]);
+
+  async function onUnlock(e?: FormEvent) {
+    e?.preventDefault();
+    setUnlockBusy(true);
+    setUnlockError("");
+    try {
+      const res = await invoke<{ ok?: boolean; locked?: boolean; error?: string }>("unlock_app_lock", {
+        password: unlockPassword || null,
+        useOsAuth: false,
+      });
+      if (res?.ok) {
+        setLocked(false);
+        setUnlockPassword("");
+      } else {
+        setUnlockError(res?.error || "Unlock failed.");
+      }
+    } catch (err) {
+      setUnlockError(String(err));
+    } finally {
+      setUnlockBusy(false);
+    }
+  }
+
+  async function onTryOsAuth() {
+    setUnlockBusy(true);
+    setUnlockError("");
+    try {
+      const res = await invoke<{ ok?: boolean; locked?: boolean; error?: string }>("unlock_app_lock", {
+        password: null,
+        useOsAuth: true,
+      });
+      if (res?.ok) {
+        setLocked(false);
+        setUnlockPassword("");
+      } else {
+        setUnlockError(res?.error || "OS authentication failed. Enter your password.");
+      }
+    } catch (err) {
+      setUnlockError(String(err));
+    } finally {
+      setUnlockBusy(false);
+    }
+  }
 
   async function openSettings() {
     try {
@@ -239,7 +359,44 @@ export default function App() {
   const showProgress = isActive || status?.state === "error";
 
   return (
-    <main className="app">
+    <>
+      {locked ? (
+        <div className="lock-overlay" role="dialog" aria-modal="true" aria-labelledby="lock-title">
+          <form className="lock-card card" onSubmit={(e) => void onUnlock(e)}>
+            <h2 id="lock-title">Tobro is locked</h2>
+            <p className="muted">
+              App lock is enabled. Unlock with your password.
+              {lockStatus?.prefer_os_auth ? " OS authentication is preferred when available." : ""}
+            </p>
+            {lockStatus?.os_auth_available ? (
+              <div className="actions">
+                <button type="button" className="primary" disabled={unlockBusy} onClick={() => void onTryOsAuth()}>
+                  Use OS authentication
+                </button>
+              </div>
+            ) : lockStatus?.prefer_os_auth ? (
+              <p className="muted">OS authentication: {lockStatus.os_auth_method || "unavailable"}. Use your password.</p>
+            ) : null}
+            <label className="field-label" htmlFor="unlock-password">Password</label>
+            <input
+              id="unlock-password"
+              type="password"
+              value={unlockPassword}
+              onChange={(e) => setUnlockPassword(e.target.value)}
+              autoComplete="current-password"
+              autoFocus
+              disabled={unlockBusy}
+            />
+            {unlockError ? <p className="error" role="alert">{unlockError}</p> : null}
+            <div className="actions">
+              <button type="submit" className="primary" disabled={unlockBusy || !unlockPassword}>
+                {unlockBusy ? "Unlocking…" : "Unlock"}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+      <main className={`app${locked ? " app-locked" : ""}`} aria-hidden={locked || undefined}>
       <header className="hero">
         <div className="brand">
           <img src={appIconUrl} alt="" className="app-icon" width={44} height={44} />
@@ -309,6 +466,7 @@ export default function App() {
       </section>
 
       <LogViewer entries={logs} onClear={() => setLogs([])} defaultOpen={false} />
-    </main>
+      </main>
+    </>
   );
 }
