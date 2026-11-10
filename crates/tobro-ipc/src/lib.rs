@@ -82,6 +82,21 @@ pub mod methods {
     /// Delete a hosted onion service.
     pub const ONION_DELETE: &str = "onion.delete";
 
+    /// List client authorization credentials.
+    pub const CLIENT_AUTH_LIST: &str = "client_auth.list";
+    /// Generate a client authorization credential/keypair.
+    pub const CLIENT_AUTH_GENERATE: &str = "client_auth.generate";
+    /// Import a `.auth_private` client authorization credential.
+    pub const CLIENT_AUTH_IMPORT: &str = "client_auth.import";
+    /// Export a `.auth_private` client authorization credential.
+    pub const CLIENT_AUTH_EXPORT: &str = "client_auth.export";
+    /// Delete a client authorization credential.
+    pub const CLIENT_AUTH_DELETE: &str = "client_auth.delete";
+    /// Attach a client authorization credential to an onion service.
+    pub const CLIENT_AUTH_ATTACH: &str = "client_auth.attach";
+    /// Detach a client authorization credential from an onion service.
+    pub const CLIENT_AUTH_DETACH: &str = "client_auth.detach";
+
     /// Methods that may be called without a prior `daemon.hello` handshake.
     pub const PREFLIGHT: &[&str] = &[HELLO];
 }
@@ -104,6 +119,13 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
             | methods::ONION_DELETE
+            | methods::CLIENT_AUTH_LIST
+            | methods::CLIENT_AUTH_GENERATE
+            | methods::CLIENT_AUTH_IMPORT
+            | methods::CLIENT_AUTH_EXPORT
+            | methods::CLIENT_AUTH_DELETE
+            | methods::CLIENT_AUTH_ATTACH
+            | methods::CLIENT_AUTH_DETACH
     )
 }
 
@@ -117,7 +139,8 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::RELOAD_CONFIG
         | methods::NEW_IDENTITY
         | methods::CONFIG_GET
-        | methods::ONION_LIST => validate_no_params(method, params),
+        | methods::ONION_LIST
+        | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
         methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
             let Some(Value::Object(map)) = params else {
                 return Err(RpcError::invalid_params(
@@ -210,6 +233,90 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
                 return Err(RpcError::invalid_params(
                     method,
                     "missing required \"id\" (string)",
+                ));
+            }
+            Ok(())
+        }
+        methods::CLIENT_AUTH_GENERATE => {
+            if let Some(Value::Object(_)) = params {
+                return Ok(());
+            }
+            if params.is_none() {
+                return Ok(());
+            }
+            Err(RpcError::invalid_params(
+                method,
+                "expected optional params object: {\"nickname\"?: \"...\"}",
+            ))
+        }
+        methods::CLIENT_AUTH_IMPORT => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"nickname\": \"...\", \"content\": \"...\"}",
+                ));
+            };
+            if !matches!(map.get("nickname"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"nickname\" (string)",
+                ));
+            }
+            if !matches!(map.get("content"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"content\" (string, .auth_private file contents)",
+                ));
+            }
+            Ok(())
+        }
+        methods::CLIENT_AUTH_EXPORT => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"id\": \"...\", \"onion_address\"?: \"...\"}",
+                ));
+            };
+            if !matches!(map.get("id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"id\" (string)",
+                ));
+            }
+            Ok(())
+        }
+        methods::CLIENT_AUTH_DELETE => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"id\": \"...\"}",
+                ));
+            };
+            if !matches!(map.get("id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"id\" (string)",
+                ));
+            }
+            Ok(())
+        }
+        methods::CLIENT_AUTH_ATTACH | methods::CLIENT_AUTH_DETACH => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"service_id\": \"...\", \"client_auth_id\": \"...\"}",
+                ));
+            };
+            if !matches!(map.get("service_id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"service_id\" (string)",
+                ));
+            }
+            if !matches!(map.get("client_auth_id"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"client_auth_id\" (string)",
                 ));
             }
             Ok(())

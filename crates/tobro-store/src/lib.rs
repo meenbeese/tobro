@@ -131,6 +131,29 @@ pub struct OnionServicePatch {
     pub onion_address: Option<Option<String>>,
 }
 
+/// A client authorization credential (x25519 descriptor keypair metadata).
+/// Secret key material is stored on disk under `key_dir`, not in the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthCredential {
+    pub id: String,
+    pub nickname: String,
+    pub key_dir: String,
+    /// Public key in Tor format: `descriptor:x25519:<base32>`.
+    pub public_key: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Input for creating a client authorization credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewClientAuthCredential {
+    pub id: String,
+    pub nickname: String,
+    pub key_dir: String,
+    /// Public key in Tor format: `descriptor:x25519:<base32>`.
+    pub public_key: String,
+}
+
 /// Embedded libSQL store handle.
 pub struct Db {
     _db: Database,
@@ -460,6 +483,231 @@ impl Db {
             });
         }
         Ok(())
+    }
+
+    fn normalize_client_auth_nickname(nickname: &str) -> Result<String, StoreError> {
+        let nickname = nickname.trim();
+        if nickname.is_empty() {
+            return Err(StoreError::Invalid {
+                field: "nickname",
+                message: "nickname must not be empty".to_owned(),
+            });
+        }
+        if nickname.len() > 64 {
+            return Err(StoreError::Invalid {
+                field: "nickname",
+                message: "nickname must be at most 64 characters".to_owned(),
+            });
+        }
+        if !nickname
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(StoreError::Invalid {
+                field: "nickname",
+                message: "nickname may only contain ASCII letters, digits, '_' and '-'".to_owned(),
+            });
+        }
+        Ok(nickname.to_owned())
+    }
+
+    fn normalize_public_key(public_key: &str) -> Result<String, StoreError> {
+        let pk = public_key.trim();
+        if !pk.starts_with("descriptor:x25519:") {
+            return Err(StoreError::Invalid {
+                field: "public_key",
+                message: "public_key must be in descriptor:x25519:<base32> format".to_owned(),
+            });
+        }
+        Ok(pk.to_owned())
+    }
+
+    /// Create a client authorization credential record.
+    pub async fn create_client_auth(
+        &self,
+        new: NewClientAuthCredential,
+    ) -> Result<ClientAuthCredential, StoreError> {
+        if new.id.trim().is_empty() {
+            return Err(StoreError::Invalid {
+                field: "id",
+                message: "id must not be empty".to_owned(),
+            });
+        }
+        if new.key_dir.trim().is_empty() {
+            return Err(StoreError::Invalid {
+                field: "key_dir",
+                message: "key_dir must not be empty".to_owned(),
+            });
+        }
+        let nickname = Self::normalize_client_auth_nickname(&new.nickname)?;
+        let public_key = Self::normalize_public_key(&new.public_key)?;
+        let now = Self::now_ms();
+        self.conn
+            .execute(
+                "INSERT INTO onion_client_auth (id, nickname, key_dir, public_key, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new.id.as_str(),
+                    nickname.as_str(),
+                    new.key_dir.as_str(),
+                    public_key.as_str(),
+                    now,
+                    now
+                ],
+            )
+            .await?;
+        self.get_client_auth(&new.id).await
+    }
+
+    /// Get a client authorization credential by id.
+    pub async fn get_client_auth(&self, id: &str) -> Result<ClientAuthCredential, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, nickname, key_dir, public_key, created_at, updated_at FROM onion_client_auth WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Err(StoreError::NotFound {
+                kind: "client authorization credential",
+                id: id.to_owned(),
+            });
+        };
+        Ok(ClientAuthCredential {
+            id: row.get(0)?,
+            nickname: row.get(1)?,
+            key_dir: row.get(2)?,
+            public_key: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    }
+
+    /// List client authorization credentials.
+    pub async fn list_client_auth(&self) -> Result<Vec<ClientAuthCredential>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM onion_client_auth ORDER BY created_at ASC, id ASC",
+                params![],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get_client_auth(&id).await?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a client authorization credential.
+    pub async fn delete_client_auth(&self, id: &str) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM onion_client_auth WHERE id = ?1", params![id])
+            .await?;
+        if changed == 0 {
+            return Err(StoreError::NotFound {
+                kind: "client authorization credential",
+                id: id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Attach a client authorization credential to an onion service.
+    pub async fn attach_client_auth(
+        &self,
+        service_id: &str,
+        client_auth_id: &str,
+    ) -> Result<(), StoreError> {
+        self.get_onion_service(service_id).await?;
+        self.get_client_auth(client_auth_id).await?;
+        let now = Self::now_ms();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO onion_service_client_auth (service_id, client_auth_id) VALUES (?1, ?2)",
+                params![service_id, client_auth_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE onion_service SET updated_at = ?2 WHERE id = ?1",
+                params![service_id, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Detach a client authorization credential from an onion service.
+    pub async fn detach_client_auth(
+        &self,
+        service_id: &str,
+        client_auth_id: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM onion_service_client_auth WHERE service_id = ?1 AND client_auth_id = ?2",
+                params![service_id, client_auth_id],
+            )
+            .await?;
+        let now = Self::now_ms();
+        self.conn
+            .execute(
+                "UPDATE onion_service SET updated_at = ?2 WHERE id = ?1",
+                params![service_id, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List client authorization credentials attached to an onion service.
+    pub async fn list_client_auth_for_service(
+        &self,
+        service_id: &str,
+    ) -> Result<Vec<ClientAuthCredential>, StoreError> {
+        self.get_onion_service(service_id).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT client_auth_id FROM onion_service_client_auth WHERE service_id = ?1 ORDER BY client_auth_id ASC",
+                params![service_id],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(cred) = self.get_client_auth(&id).await {
+                out.push(cred);
+            }
+        }
+        Ok(out)
+    }
+
+    /// List onion service ids a credential is attached to.
+    pub async fn list_services_for_client_auth(
+        &self,
+        client_auth_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        self.get_client_auth(client_auth_id).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT service_id FROM onion_service_client_auth WHERE client_auth_id = ?1 ORDER BY service_id ASC",
+                params![client_auth_id],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        Ok(ids)
     }
 }
 

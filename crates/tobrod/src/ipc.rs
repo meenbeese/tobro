@@ -242,6 +242,38 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// List client authorization credentials.
+    fn client_auth_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Generate a client authorization credential.
+    fn client_auth_generate(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Import a client authorization credential.
+    fn client_auth_import(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Export a client authorization credential.
+    fn client_auth_export(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Delete a client authorization credential.
+    fn client_auth_delete(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Attach a client authorization credential to an onion service.
+    fn client_auth_attach(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Detach a client authorization credential from an onion service.
+    fn client_auth_detach(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
 }
@@ -688,6 +720,10 @@ impl SupervisorControl {
         self.state_dir.join("onion-services")
     }
 
+    fn client_auth_dir(&self) -> std::path::PathBuf {
+        self.state_dir.join("client-auth")
+    }
+
     async fn open_store(&self) -> Result<tobro_store::Db, String> {
         let path = self.db_path();
         tobro_store::Db::open(&path)
@@ -722,10 +758,22 @@ impl DaemonControl for SupervisorControl {
             .list_onion_services()
             .await
             .map_err(|e| format!("failed to load onion services: {e}"))?;
-        listeners.onion_services = all
-            .into_iter()
-            .filter(|svc| svc.enabled)
-            .map(|svc| tobro_tor::HostedOnionService {
+        let mut hosted = Vec::new();
+        for svc in all.into_iter().filter(|svc| svc.enabled) {
+            let authorized_clients_dir = match store
+                .list_client_auth_for_service(&svc.id.to_string())
+                .await
+            {
+                Ok(creds) if !creds.is_empty() => {
+                    let dir = std::path::Path::new(&svc.key_dir).join("authorized_clients");
+                    if !dir.is_dir() {
+                        let _ = tokio::fs::create_dir_all(&dir).await;
+                    }
+                    Some(dir.to_string_lossy().to_string())
+                }
+                _ => None,
+            };
+            hosted.push(tobro_tor::HostedOnionService {
                 id: svc.id.to_string(),
                 nickname: svc.nickname.as_str().to_owned(),
                 name: svc.name,
@@ -738,8 +786,10 @@ impl DaemonControl for SupervisorControl {
                         target_port: p.target_port,
                     })
                     .collect(),
-            })
-            .collect();
+                authorized_clients_dir,
+            });
+        }
+        listeners.onion_services = hosted;
 
         if config.outbound_proxy.needs_sslocal() {
             let sidecar = crate::outbound::start_sslocal_and_resolve(
@@ -922,6 +972,61 @@ impl DaemonControl for SupervisorControl {
         crate::onion::delete(&db_path, params).await
     }
 
+    async fn client_auth_list(&self) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::client_auth::list(&db_path).await
+    }
+
+    async fn client_auth_generate(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let root = self.client_auth_dir();
+        crate::client_auth::generate(&db_path, &root, params).await
+    }
+
+    async fn client_auth_import(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let root = self.client_auth_dir();
+        crate::client_auth::import(&db_path, &root, params).await
+    }
+
+    async fn client_auth_export(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::client_auth::export(&db_path, params).await
+    }
+
+    async fn client_auth_delete(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::client_auth::delete(&db_path, params).await
+    }
+
+    async fn client_auth_attach(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::client_auth::attach(&db_path, params).await
+    }
+
+    async fn client_auth_detach(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        crate::client_auth::detach(&db_path, params).await
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
         self.handle.subscribe_events()
     }
@@ -992,6 +1097,52 @@ impl DaemonControl for SupervisorHandle {
 
     async fn onion_delete(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_list(&self) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_generate(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_import(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_export(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_delete(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_attach(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
+    }
+
+    async fn client_auth_detach(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("client auth operations require daemon config/state context".to_owned())
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
@@ -1420,6 +1571,64 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::CLIENT_AUTH_LIST => match control.client_auth_list().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(e)),
+        },
+        methods::CLIENT_AUTH_GENERATE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_generate(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::CLIENT_AUTH_IMPORT => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_import(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::CLIENT_AUTH_EXPORT => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_export(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::CLIENT_AUTH_DELETE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_delete(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::CLIENT_AUTH_ATTACH => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_attach(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::CLIENT_AUTH_DETACH => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.client_auth_detach(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
         other => RpcResponse::error(id, RpcError::method_not_found(other)),
     }
 }
@@ -1601,6 +1810,48 @@ mod daemon_tests {
             params: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "onion.delete", "id": params.get("id").cloned() }))
+        }
+
+        async fn client_auth_list(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.list", "credentials": [] }))
+        }
+        async fn client_auth_generate(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.generate" }))
+        }
+        async fn client_auth_import(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.import" }))
+        }
+        async fn client_auth_export(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(
+                json!({ "ok": true, "action": "client_auth.export", "content": "", "filename": "client.auth_private" }),
+            )
+        }
+        async fn client_auth_delete(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.delete" }))
+        }
+        async fn client_auth_attach(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.attach" }))
+        }
+        async fn client_auth_detach(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "client_auth.detach" }))
         }
 
         fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {

@@ -61,6 +61,31 @@ enum IpcCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    ClientAuthList(oneshot::Sender<Result<Value, String>>),
+    ClientAuthGenerate {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ClientAuthImport {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ClientAuthExport {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ClientAuthDelete {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ClientAuthAttach {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ClientAuthDetach {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -250,6 +275,108 @@ async fn daemon_onion_delete(state: State<'_, AppState>, params: Value) -> Resul
     state
         .commands
         .send(IpcCommand::OnionDelete { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_list(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthList(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_generate(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthGenerate { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_import(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthImport { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_export(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthExport { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_delete(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthDelete { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_attach(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthAttach { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_client_auth_detach(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::ClientAuthDetach { params, reply: tx })
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -515,6 +642,13 @@ fn main() {
             daemon_onion_create,
             daemon_onion_update,
             daemon_onion_delete,
+            daemon_client_auth_list,
+            daemon_client_auth_generate,
+            daemon_client_auth_import,
+            daemon_client_auth_export,
+            daemon_client_auth_delete,
+            daemon_client_auth_attach,
+            daemon_client_auth_detach,
             get_proxy_ports,
             save_proxy_ports
         ])
@@ -1626,7 +1760,8 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::Stop(tx)
         | IpcCommand::NewIdentity(tx)
         | IpcCommand::ConfigGet(tx)
-        | IpcCommand::OnionList(tx) => {
+        | IpcCommand::OnionList(tx)
+        | IpcCommand::ClientAuthList(tx) => {
             let _ = tx.send(err);
         }
         IpcCommand::ConfigValidate { reply, .. }
@@ -1634,7 +1769,13 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::BridgesTest { reply, .. }
         | IpcCommand::OnionCreate { reply, .. }
         | IpcCommand::OnionUpdate { reply, .. }
-        | IpcCommand::OnionDelete { reply, .. } => {
+        | IpcCommand::OnionDelete { reply, .. }
+        | IpcCommand::ClientAuthGenerate { reply, .. }
+        | IpcCommand::ClientAuthImport { reply, .. }
+        | IpcCommand::ClientAuthExport { reply, .. }
+        | IpcCommand::ClientAuthDelete { reply, .. }
+        | IpcCommand::ClientAuthAttach { reply, .. }
+        | IpcCommand::ClientAuthDetach { reply, .. } => {
             let _ = reply.send(err);
         }
     }
@@ -1777,6 +1918,55 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
         IpcCommand::OnionDelete { params, reply } => {
             let result = client
                 .call(methods::ONION_DELETE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthList(tx) => {
+            let result = client
+                .call(methods::CLIENT_AUTH_LIST, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::ClientAuthGenerate { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_GENERATE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthImport { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_IMPORT, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthExport { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_EXPORT, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthDelete { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_DELETE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthAttach { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_ATTACH, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::ClientAuthDetach { params, reply } => {
+            let result = client
+                .call(methods::CLIENT_AUTH_DETACH, Some(params))
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);

@@ -7607,9 +7607,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "data-encoding",
  "directories",
  "futures",
  "hex",
+ "rand 0.8.8",
  "rustix 1.1.6",
  "serde",
  "serde_json",
@@ -7623,6 +7625,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

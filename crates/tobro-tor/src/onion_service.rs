@@ -30,6 +30,10 @@ pub struct HostedOnionService {
     pub name: String,
     /// Port mappings.
     pub ports: Vec<HostedOnionPort>,
+    /// Directory containing `*.auth` files for restricted discovery (client auth).
+    /// When set and non-empty, restricted discovery is enabled for this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_clients_dir: Option<String>,
 }
 
 /// Virtual port -> local target mapping.
@@ -201,6 +205,29 @@ fn build_service_config(
         .parse()
         .with_context(|| format!("invalid onion service nickname {:?}", spec.nickname))?;
     b.nickname(nick);
+
+    if let Some(dir) = spec
+        .authorized_clients_dir
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let auth_dir = std::path::Path::new(dir);
+        if auth_dir.is_dir() {
+            // Enable restricted discovery when an authorized_clients directory is present.
+            let mut dir_provider =
+                tor_hsservice::config::restricted_discovery::DirectoryKeyProviderBuilder::default();
+            dir_provider.path(arti_client::config::CfgPath::new_literal(
+                auth_dir.to_path_buf(),
+            ));
+            b.restricted_discovery().enabled(true);
+            b.restricted_discovery()
+                .key_dirs()
+                .access()
+                .push(dir_provider);
+            // watch_configuration is serde-skipped/defaulted in config; leave default.
+        }
+    }
+
     b.build().context("invalid onion service config")
 }
 

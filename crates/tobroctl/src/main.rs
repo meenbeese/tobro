@@ -50,6 +50,11 @@ enum Command {
         #[command(subcommand)]
         command: OnionCommand,
     },
+    /// Manage client authorization credentials for onion services (.auth_private).
+    ClientAuth {
+        #[command(subcommand)]
+        command: ClientAuthCommand,
+    },
     /// Stream IPC notifications as JSON lines until Ctrl-C.
     Watch,
 }
@@ -187,6 +192,64 @@ enum OnionCommand {
         /// Service id.
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClientAuthCommand {
+    /// List client authorization credentials.
+    List,
+    /// Generate a new x25519 client authorization credential.
+    Generate {
+        /// Human-readable nickname (a unique suffix is appended).
+        #[arg(long)]
+        nickname: Option<String>,
+    },
+    /// Import a `.auth_private` credential file.
+    Import {
+        /// Human-readable nickname.
+        #[arg(long)]
+        nickname: String,
+        /// `.auth_private` file path, or `-` to read from stdin.
+        #[arg(long = "file", value_name = "PATH|-")]
+        file: String,
+    },
+    /// Export a credential as a standard `.auth_private` key file for a client.
+    Export {
+        /// Credential id (see `client-auth list`).
+        #[arg(long)]
+        id: String,
+        /// Target `.onion` address (optional when the credential is attached to
+        /// a service with a published address).
+        #[arg(long)]
+        onion_address: Option<String>,
+        /// Write the key file to this path (0600) instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Delete a credential and its managed key storage.
+    Delete {
+        /// Credential id.
+        #[arg(long)]
+        id: String,
+    },
+    /// Attach a credential to an onion service (restricted discovery).
+    Attach {
+        /// Credential id.
+        #[arg(long)]
+        id: String,
+        /// Onion service id (see `onion list`).
+        #[arg(long)]
+        service: String,
+    },
+    /// Detach a credential from an onion service.
+    Detach {
+        /// Credential id.
+        #[arg(long)]
+        id: String,
+        /// Onion service id.
+        #[arg(long)]
+        service: String,
     },
 }
 
@@ -380,6 +443,71 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 print_json(&result)?;
             }
         },
+        Command::ClientAuth { command } => match command {
+            ClientAuthCommand::List => {
+                let result = client
+                    .call(tobro_ipc::methods::CLIENT_AUTH_LIST, None)
+                    .await?;
+                print_json(&result)?;
+            }
+            ClientAuthCommand::Generate { nickname } => {
+                let params = nickname
+                    .as_deref()
+                    .map(|n| json!({ "nickname": n.trim() }))
+                    .filter(|p| {
+                        !p.get("nickname")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .is_empty()
+                    });
+                let result = client
+                    .call(tobro_ipc::methods::CLIENT_AUTH_GENERATE, params)
+                    .await?;
+                print_json(&result)?;
+            }
+            ClientAuthCommand::Import { nickname, file } => {
+                let content = read_auth_private_file(&file)?;
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CLIENT_AUTH_IMPORT,
+                        Some(json!({ "nickname": nickname, "content": content })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            ClientAuthCommand::Export {
+                id,
+                onion_address,
+                out,
+            } => client_auth_export(&mut client, &id, onion_address.as_deref(), out).await?,
+            ClientAuthCommand::Delete { id } => {
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CLIENT_AUTH_DELETE,
+                        Some(json!({ "id": id })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            ClientAuthCommand::Attach { id, service } => {
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CLIENT_AUTH_ATTACH,
+                        Some(json!({ "service_id": service, "client_auth_id": id })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+            ClientAuthCommand::Detach { id, service } => {
+                let result = client
+                    .call(
+                        tobro_ipc::methods::CLIENT_AUTH_DETACH,
+                        Some(json!({ "service_id": service, "client_auth_id": id })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
+        },
         Command::Watch => watch(&mut client).await?,
     }
 
@@ -421,6 +549,73 @@ fn read_text_input(input: &str) -> anyhow::Result<String> {
     } else {
         Ok(input.to_owned())
     }
+}
+
+/// Read `.auth_private` file contents from a path or stdin (`-`).
+fn read_auth_private_file(input: &str) -> anyhow::Result<String> {
+    if input == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read .auth_private from stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(input)
+            .with_context(|| format!("failed to read .auth_private from {input}"))
+    }
+}
+
+async fn client_auth_export(
+    client: &mut tobro_ipc::Client,
+    id: &str,
+    onion_address: Option<&str>,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut params = serde_json::Map::new();
+    params.insert("id".to_owned(), Value::String(id.to_owned()));
+    if let Some(addr) = onion_address {
+        params.insert("onion_address".to_owned(), Value::String(addr.to_owned()));
+    }
+    let result = client
+        .call(
+            tobro_ipc::methods::CLIENT_AUTH_EXPORT,
+            Some(Value::Object(params)),
+        )
+        .await?;
+    match out {
+        Some(path) => {
+            let content = result
+                .get("content")
+                .and_then(Value::as_str)
+                .context("export response is missing key content")?;
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("failed to set 0600 on {}", path.display()))?;
+            }
+            print_json(&json!({
+                "ok": true,
+                "action": "client_auth.export",
+                "id": result.get("id").cloned().unwrap_or(Value::Null),
+                "nickname": result.get("nickname").cloned().unwrap_or(Value::Null),
+                "filename": result.get("filename").cloned().unwrap_or(Value::Null),
+                "written": path.display().to_string(),
+                "warning": "This file contains a private key. Store and transmit it securely.",
+            }))?;
+        }
+        None => print_json(&result)?,
+    }
+    Ok(())
 }
 
 fn bridges_validate(input: &str) -> anyhow::Result<()> {

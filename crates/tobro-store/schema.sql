@@ -32,3 +32,24 @@ CREATE TABLE IF NOT EXISTS onion_service_port (
 
 CREATE INDEX IF NOT EXISTS onion_service_port_service_id
     ON onion_service_port(service_id);
+
+-- Client authorization credentials (.auth_private keypairs) and attachments to
+-- hosted onion services (restricted discovery). Secret key material is stored on
+-- disk under managed private directories, not in the database.
+CREATE TABLE IF NOT EXISTS onion_client_auth (
+    id          TEXT PRIMARY KEY NOT NULL,
+    nickname    TEXT NOT NULL UNIQUE,
+    key_dir     TEXT NOT NULL,
+    public_key  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS onion_service_client_auth (
+    service_id      TEXT NOT NULL REFERENCES onion_service(id) ON DELETE CASCADE,
+    client_auth_id  TEXT NOT NULL REFERENCES onion_client_auth(id) ON DELETE CASCADE,
+    PRIMARY KEY (service_id, client_auth_id)
+);
+
+CREATE INDEX IF NOT EXISTS onion_service_client_auth_client
+    ON onion_service_client_auth(client_auth_id);

@@ -110,9 +110,12 @@ const BIND_ALL_WARNING =
   "Other hosts may be able to route traffic through Tor from this machine. Only enable on trusted networks, " +
   "and configure your OS/router firewall to restrict access to these ports. Disable bind-all when not needed.";
 
-function downloadJson(filename: string, value: unknown) {
-  const text = `${JSON.stringify(value, null, 2)}\n`;
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+function downloadText(
+  filename: string,
+  text: string,
+  mime = "text/plain;charset=utf-8",
+) {
+  const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -122,6 +125,14 @@ function downloadJson(filename: string, value: unknown) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+function downloadJson(filename: string, value: unknown) {
+  downloadText(
+    filename,
+    `${JSON.stringify(value, null, 2)}\n`,
+    "application/json;charset=utf-8",
+  );
 }
 
 function parsePatch(text: string): unknown {
@@ -188,11 +199,12 @@ export interface SettingsProps {
 
 export type AdvancedSettingsProps = SettingsProps;
 
-type SettingsTab = "general" | "node" | "onion" | "advanced";
+type SettingsTab = "general" | "node" | "onion" | "clientAuth" | "advanced";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "general", label: "General" },
   { id: "node", label: "Node Configuration" },
   { id: "onion", label: "Onion Services" },
+  { id: "clientAuth", label: "Client Authorization" },
   { id: "advanced", label: "Advanced Tor Configuration" },
 ];
 
@@ -241,6 +253,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     general: null,
     node: null,
     onion: null,
+    clientAuth: null,
     advanced: null,
   });
 
@@ -338,6 +351,30 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     emptyOnionPort(),
   ]);
   const [onionEditingId, setOnionEditingId] = useState<string | null>(null);
+
+  // Client authorization (M5): .auth_private credentials + service attachments
+  type ClientAuthView = {
+    id: string;
+    nickname: string;
+    key_dir: string;
+    public_key: string;
+    created_at: number;
+    updated_at: number;
+    attached_service_ids: string[];
+  };
+  const [clientAuthCreds, setClientAuthCreds] = useState<ClientAuthView[]>([]);
+  const [clientAuthBusy, setClientAuthBusy] = useState(false);
+  const [clientAuthError, setClientAuthError] = useState("");
+  const [clientAuthMessage, setClientAuthMessage] = useState("");
+  const [clientAuthNickname, setClientAuthNickname] = useState("");
+  const [clientAuthImportNickname, setClientAuthImportNickname] = useState("");
+  const [clientAuthImportText, setClientAuthImportText] = useState("");
+  const [clientAuthExportId, setClientAuthExportId] = useState("");
+  const [clientAuthExportAddress, setClientAuthExportAddress] = useState("");
+  const clientAuthImportFileRef = useRef<HTMLInputElement | null>(null);
+  const [clientAuthAttach, setClientAuthAttach] = useState<
+    Record<string, string>
+  >({});
 
   function log(text: string, level: "info" | "error" = "info") {
     appendLog?.(text, level, "ui");
@@ -663,6 +700,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
 
   useEffect(() => {
     if (powerUser && tab === "onion") {
+      void loadOnionServices();
+    }
+    if (powerUser && tab === "clientAuth") {
+      void loadClientAuth();
       void loadOnionServices();
     }
   }, [powerUser, tab]);
@@ -1298,6 +1339,230 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  // Client authorization (M5): .auth_private credentials
+  async function loadClientAuth() {
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    try {
+      const result = await invoke<{ credentials?: ClientAuthView[] }>(
+        "daemon_client_auth_list",
+      );
+      setClientAuthCreds(
+        Array.isArray(result?.credentials) ? result.credentials : [],
+      );
+    } catch (e) {
+      setClientAuthError(String(e));
+      log(`client auth: load failed: ${String(e)}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onGenerateClientAuth(e?: FormEvent) {
+    e?.preventDefault();
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      const nickname = clientAuthNickname.trim();
+      const result = await invoke<{
+        credential?: ClientAuthView;
+        note?: string;
+      }>("daemon_client_auth_generate", {
+        params: nickname ? { nickname } : {},
+      });
+      setClientAuthMessage(
+        `Credential "${result?.credential?.nickname ?? "generated"}" created. Use Export to save a .auth_private file for a client, then Attach it to an onion service.`,
+      );
+      log(
+        `client auth credential generated: ${result?.credential?.nickname ?? ""}`,
+      );
+      setClientAuthNickname("");
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setClientAuthError(msg);
+      log(`client auth generate failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onImportClientAuth(e?: FormEvent) {
+    e?.preventDefault();
+    const nickname = clientAuthImportNickname.trim();
+    if (!nickname) {
+      setClientAuthError("Nickname is required to import a credential.");
+      return;
+    }
+    if (!clientAuthImportText.trim()) {
+      setClientAuthError(
+        "Paste .auth_private file contents or load a file first.",
+      );
+      return;
+    }
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      const result = await invoke<{ credential?: ClientAuthView }>(
+        "daemon_client_auth_import",
+        {
+          params: { nickname, content: clientAuthImportText },
+        },
+      );
+      setClientAuthMessage(
+        `Credential "${result?.credential?.nickname ?? nickname}" imported.`,
+      );
+      log(
+        `client auth credential imported: ${result?.credential?.nickname ?? nickname}`,
+      );
+      setClientAuthImportNickname("");
+      setClientAuthImportText("");
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setClientAuthError(msg);
+      log(`client auth import failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onPickAuthPrivateFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setClientAuthImportText(text);
+      setClientAuthError("");
+      setClientAuthMessage(
+        `Loaded ${file.name}. Review, then Import. The contents are not displayed.`,
+      );
+      if (!clientAuthImportNickname.trim())
+        setClientAuthImportNickname(
+          file.name.replace(/\.auth_private$/i, "").slice(0, 48) || "client",
+        );
+    } catch (err) {
+      setClientAuthError(`Could not read file: ${String(err)}`);
+    } finally {
+      e.target.value = "";
+    }
+  }
+
+  async function onExportClientAuth(e?: FormEvent) {
+    e?.preventDefault();
+    const id = clientAuthExportId;
+    if (!id) {
+      setClientAuthError("Select a credential to export.");
+      return;
+    }
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      const address = clientAuthExportAddress.trim();
+      const result = await invoke<{
+        filename?: string;
+        content?: string;
+        warning?: string;
+      }>("daemon_client_auth_export", {
+        params: address ? { id, onion_address: address } : { id },
+      });
+      if (!result?.content) throw new Error("Export returned no key content.");
+      const filename = result.filename || "client.auth_private";
+      downloadText(filename, result.content);
+      setClientAuthMessage(
+        `Exported ${filename} as a download. This file contains a private key — store and transmit it securely.`,
+      );
+      log(`client auth credential exported: ${filename}`);
+      setClientAuthExportAddress("");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setClientAuthError(msg);
+      log(`client auth export failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onAttachClientAuth(cred: ClientAuthView) {
+    const serviceId = clientAuthAttach[cred.id];
+    if (!serviceId) {
+      setClientAuthError("Choose an onion service to attach.");
+      return;
+    }
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      await invoke("daemon_client_auth_attach", {
+        params: { service_id: serviceId, client_auth_id: cred.id },
+      });
+      const svc = onionServices.find((s) => s.id === serviceId);
+      setClientAuthMessage(
+        `Client "${cred.nickname}" attached to "${svc?.name ?? serviceId}". Reconnect/restart Tor to apply to a running service.`,
+      );
+      log(`client auth attached: ${cred.nickname} -> ${serviceId}`);
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setClientAuthError(msg);
+      log(`client auth attach failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onDetachClientAuth(cred: ClientAuthView, serviceId: string) {
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      await invoke("daemon_client_auth_detach", {
+        params: { service_id: serviceId, client_auth_id: cred.id },
+      });
+      setClientAuthMessage(
+        `Client "${cred.nickname}" detached from ${serviceId}. Reconnect/restart Tor to apply to a running service.`,
+      );
+      log(`client auth detached: ${cred.nickname} from ${serviceId}`);
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setClientAuthError(msg);
+      log(`client auth detach failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
+  async function onDeleteClientAuth(cred: ClientAuthView) {
+    if (
+      !window.confirm(
+        `Delete client authorization credential "${cred.nickname}"?\n\nThis removes the credential, its key material, and all service attachments. Clients still holding the exported .auth_private file will lose access once the service rekeys or restarts without this client.`,
+      )
+    ) {
+      return;
+    }
+    setClientAuthBusy(true);
+    setClientAuthError("");
+    setClientAuthMessage("");
+    try {
+      await invoke("daemon_client_auth_delete", {
+        params: { id: cred.id },
+      });
+      setClientAuthMessage(`Credential "${cred.nickname}" deleted.`);
+      log(`client auth credential deleted: ${cred.id}`);
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setClientAuthError(msg);
+      log(`client auth delete failed: ${msg}`, "error");
+    } finally {
+      setClientAuthBusy(false);
+    }
+  }
+
   function onNetworkExitCountryChange(value: string) {
     setNetwork((prev) => ({ ...prev, exit_country: value }));
     setNetworkDirty(true);
@@ -1350,6 +1615,11 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
             <li>
               Config exports are redacted and contain no secrets; secrets remain
               in the OS keychain/store.
+            </li>
+            <li>
+              Client authorization credentials are private keys; an explicit
+              export downloads a sensitive <code>.auth_private</code> file —
+              share it only with trusted clients.
             </li>
           </ul>
           <div className="actions">
@@ -2784,6 +3054,364 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </div>
               </form>
             </details>
+          </div>
+
+          <div
+            id="settings-panel-clientAuth"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-clientAuth"
+            hidden={tab !== "clientAuth"}
+          >
+            <div className="settings-section-head">
+              <p className="muted">
+                Restricted discovery for hosted onion services: generate or
+                import x25519 client credentials (<code>.auth_private</code>)
+                and attach them to a service. Only authorized clients can reach
+                an attached service. Attaching/detaching requires a
+                reconnect/restart of Tor to apply to a running service.
+              </p>
+            </div>
+
+            <details className="settings-section client-auth-credentials" open>
+              <summary>
+                <h3>Credentials</h3>
+              </summary>
+              <p className="muted">
+                Public keys are shown below. Private key material is stored on
+                disk with private permissions and is never displayed in the UI
+                or logs; it is only included in an explicit export.
+              </p>
+              <div className="config-actions">
+                <button
+                  type="button"
+                  disabled={clientAuthBusy}
+                  onClick={() => void loadClientAuth()}
+                >
+                  {clientAuthBusy ? "Loading…" : "Reload credentials"}
+                </button>
+              </div>
+              {clientAuthError ? (
+                <p className="error" role="alert">
+                  {clientAuthError}
+                </p>
+              ) : null}
+              {clientAuthMessage ? (
+                <p className="muted" aria-live="polite">
+                  {clientAuthMessage}
+                </p>
+              ) : null}
+
+              {clientAuthCreds.length ? (
+                <ul
+                  className="onion-service-list"
+                  aria-label="Client credentials"
+                >
+                  {clientAuthCreds.map((cred) => {
+                    const attached = new Set(cred.attached_service_ids || []);
+                    const candidates = onionServices.filter(
+                      (s) => !attached.has(s.id),
+                    );
+                    return (
+                      <li
+                        key={cred.id}
+                        className="onion-service-item"
+                        aria-label={`Client credential ${cred.nickname}`}
+                      >
+                        <div className="onion-service-header">
+                          <strong>{cred.nickname}</strong>
+                          <span className="status-badge status-badge-stopped">
+                            {attached.size
+                              ? `attached to ${attached.size}`
+                              : "unattached"}
+                          </span>
+                        </div>
+                        <p className="muted">
+                          Public key: <code>{cred.public_key}</code>
+                        </p>
+                        <p className="muted">
+                          Created:{" "}
+                          {cred.created_at
+                            ? new Date(cred.created_at).toLocaleString()
+                            : "unknown"}
+                        </p>
+                        {attached.size ? (
+                          <div>
+                            <p className="muted">Attached services:</p>
+                            <ul className="muted">
+                              {cred.attached_service_ids.map((sid) => (
+                                <li key={sid}>
+                                  <code>{sid}</code>{" "}
+                                  {(() => {
+                                    const svc = onionServices.find(
+                                      (s) => s.id === sid,
+                                    );
+                                    return svc ? `(${svc.name})` : "";
+                                  })()}
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    disabled={clientAuthBusy}
+                                    onClick={() =>
+                                      void onDetachClientAuth(cred, sid)
+                                    }
+                                    aria-label={`Detach from ${sid}`}
+                                  >
+                                    Detach
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : (
+                          <p className="muted">
+                            Not attached to any onion service.
+                          </p>
+                        )}
+                        {candidates.length ? (
+                          <div className="field-row">
+                            <label
+                              htmlFor={`client-auth-attach-${cred.id}`}
+                              className="sr-only"
+                            >
+                              Attach to onion service
+                            </label>
+                            <select
+                              id={`client-auth-attach-${cred.id}`}
+                              value={clientAuthAttach[cred.id] ?? ""}
+                              disabled={clientAuthBusy}
+                              onChange={(e) =>
+                                setClientAuthAttach((prev) => ({
+                                  ...prev,
+                                  [cred.id]: e.target.value,
+                                }))
+                              }
+                            >
+                              <option value="">Choose service…</option>
+                              {candidates.map((svc) => (
+                                <option key={svc.id} value={svc.id}>
+                                  {svc.name}
+                                  {svc.onion_address
+                                    ? ` (${svc.onion_address})`
+                                    : ""}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              disabled={
+                                clientAuthBusy || !clientAuthAttach[cred.id]
+                              }
+                              onClick={() => void onAttachClientAuth(cred)}
+                            >
+                              Attach
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="muted">
+                            No unattached onion services available. Create one
+                            in the Onion Services tab first.
+                          </p>
+                        )}
+                        <div className="actions">
+                          <button
+                            type="button"
+                            className="danger"
+                            disabled={clientAuthBusy}
+                            onClick={() => void onDeleteClientAuth(cred)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="muted">
+                  No client authorization credentials yet. Generate one below,
+                  or import an existing <code>.auth_private</code> file.
+                </p>
+              )}
+            </details>
+
+            <form
+              className="settings-section"
+              onSubmit={(e) => void onGenerateClientAuth(e)}
+            >
+              <details open>
+                <summary>
+                  <h3>Generate credential</h3>
+                </summary>
+                <p className="muted">
+                  Creates a fresh x25519 client credential. A unique suffix is
+                  appended to the nickname. After generating, use{" "}
+                  <strong>Export</strong> to save a <code>.auth_private</code>{" "}
+                  file for the client and <strong>Attach</strong> it to an onion
+                  service to enable restricted discovery.
+                </p>
+                <div className="field-row">
+                  <label htmlFor="client-auth-generate-nickname">
+                    Nickname (optional)
+                  </label>
+                  <input
+                    id="client-auth-generate-nickname"
+                    type="text"
+                    value={clientAuthNickname}
+                    onChange={(e) => {
+                      setClientAuthNickname(e.target.value);
+                      setClientAuthError("");
+                    }}
+                    placeholder="alice-laptop"
+                    disabled={clientAuthBusy}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="actions">
+                  <button
+                    className="primary"
+                    type="submit"
+                    disabled={clientAuthBusy}
+                  >
+                    {clientAuthBusy ? "Working…" : "Generate credential"}
+                  </button>
+                </div>
+              </details>
+            </form>
+
+            <form
+              className="settings-section"
+              onSubmit={(e) => void onImportClientAuth(e)}
+            >
+              <details open>
+                <summary>
+                  <h3>Import credential</h3>
+                </summary>
+                <p className="muted">
+                  Import an existing <code>.auth_private</code> file so this
+                  service host can attach the same client key. Accepts the
+                  standard format:{" "}
+                  <code>
+                    [1:][&lt;hsid&gt;:]descriptor:x25519:&lt;base32 key&gt;
+                  </code>
+                  . Contents are validated and stored with private permissions;
+                  they are never displayed.
+                </p>
+                <div className="field-row">
+                  <label htmlFor="client-auth-import-nickname">Nickname</label>
+                  <input
+                    id="client-auth-import-nickname"
+                    type="text"
+                    value={clientAuthImportNickname}
+                    onChange={(e) =>
+                      setClientAuthImportNickname(e.target.value)
+                    }
+                    placeholder="bob-phone"
+                    disabled={clientAuthBusy}
+                    required
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="config-actions">
+                  <button
+                    type="button"
+                    disabled={clientAuthBusy}
+                    onClick={() => clientAuthImportFileRef.current?.click()}
+                  >
+                    Load file…
+                  </button>
+                  <input
+                    ref={clientAuthImportFileRef}
+                    type="file"
+                    accept=".auth_private,.txt,text/plain"
+                    className="sr-only"
+                    onChange={(e) => void onPickAuthPrivateFile(e)}
+                  />
+                </div>
+                <label className="sr-only" htmlFor="client-auth-import-text">
+                  .auth_private contents
+                </label>
+                <textarea
+                  id="client-auth-import-text"
+                  className="config-textarea"
+                  value={clientAuthImportText}
+                  onChange={(e) => setClientAuthImportText(e.target.value)}
+                  placeholder="Paste .auth_private file contents (never shown again after import)"
+                  spellCheck={false}
+                  rows={3}
+                />
+                <div className="actions">
+                  <button
+                    className="primary"
+                    type="submit"
+                    disabled={clientAuthBusy}
+                  >
+                    {clientAuthBusy ? "Working…" : "Import credential"}
+                  </button>
+                </div>
+              </details>
+            </form>
+
+            <form
+              className="settings-section"
+              onSubmit={(e) => void onExportClientAuth(e)}
+            >
+              <details open>
+                <summary>
+                  <h3>Export .auth_private</h3>
+                </summary>
+                <p className="muted">
+                  Saves a standard <code>.auth_private</code> key file (
+                  <code>&lt;hsid&gt;:descriptor:x25519:&lt;key&gt;</code>) as a
+                  download for the client. The target <code>.onion</code>{" "}
+                  address can be omitted only when the credential is attached to
+                  a service with a published address.
+                </p>
+                <div className="field-row">
+                  <label htmlFor="client-auth-export-id">Credential</label>
+                  <select
+                    id="client-auth-export-id"
+                    value={clientAuthExportId}
+                    disabled={clientAuthBusy}
+                    onChange={(e) => setClientAuthExportId(e.target.value)}
+                    required
+                  >
+                    <option value="">Choose credential…</option>
+                    {clientAuthCreds.map((cred) => (
+                      <option key={cred.id} value={cred.id}>
+                        {cred.nickname}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field-row">
+                  <label htmlFor="client-auth-export-address">
+                    Target .onion address (optional)
+                  </label>
+                  <input
+                    id="client-auth-export-address"
+                    type="text"
+                    value={clientAuthExportAddress}
+                    onChange={(e) => setClientAuthExportAddress(e.target.value)}
+                    placeholder="example….onion"
+                    disabled={clientAuthBusy}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="actions">
+                  <button
+                    className="primary"
+                    type="submit"
+                    disabled={clientAuthBusy}
+                  >
+                    {clientAuthBusy ? "Working…" : "Export .auth_private"}
+                  </button>
+                </div>
+              </details>
+            </form>
           </div>
 
           <div
