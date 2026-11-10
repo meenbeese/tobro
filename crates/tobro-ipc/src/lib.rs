@@ -82,6 +82,12 @@ pub mod methods {
     /// Delete a hosted onion service.
     pub const ONION_DELETE: &str = "onion.delete";
 
+    /// Create an encrypted backup bundle of onion services + client auth.
+    pub const ONION_BACKUP: &str = "onion.backup";
+
+    /// Restore an encrypted backup bundle produced by `onion.backup`.
+    pub const ONION_RESTORE: &str = "onion.restore";
+
     /// List client authorization credentials.
     pub const CLIENT_AUTH_LIST: &str = "client_auth.list";
     /// Generate a client authorization credential/keypair.
@@ -119,6 +125,8 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
             | methods::ONION_DELETE
+            | methods::ONION_BACKUP
+            | methods::ONION_RESTORE
             | methods::CLIENT_AUTH_LIST
             | methods::CLIENT_AUTH_GENERATE
             | methods::CLIENT_AUTH_IMPORT
@@ -317,6 +325,29 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
                 return Err(RpcError::invalid_params(
                     method,
                     "missing required \"client_auth_id\" (string)",
+                ));
+            }
+            Ok(())
+        }
+        methods::ONION_BACKUP | methods::ONION_RESTORE => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"passphrase\": \"...\"}",
+                ));
+            };
+            if !matches!(map.get("passphrase"), Some(Value::String(_))) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"passphrase\" (string)",
+                ));
+            }
+            if method == methods::ONION_RESTORE
+                && !matches!(map.get("bundle"), Some(Value::Object(_)))
+            {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"bundle\" (object, envelope from onion.backup)",
                 ));
             }
             Ok(())
@@ -929,5 +960,34 @@ mod tests {
             }
             other => assert!(other.is_err(), "expected a response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validates_backup_restore_params() {
+        let ph = || Some(serde_json::json!({ "passphrase": "pw" }));
+
+        // Backup requires a string passphrase; restore additionally requires
+        // the bundle envelope object.
+        assert!(validate_params(methods::ONION_BACKUP, &ph()).is_ok());
+        assert!(validate_params(methods::ONION_BACKUP, &None).is_err());
+        assert!(
+            validate_params(
+                methods::ONION_BACKUP,
+                &Some(serde_json::json!({ "passphrase": 9 }))
+            )
+            .is_err()
+        );
+
+        assert!(validate_params(methods::ONION_RESTORE, &ph()).is_err());
+        assert!(
+            validate_params(
+                methods::ONION_RESTORE,
+                &Some(serde_json::json!({
+                    "passphrase": "pw",
+                    "bundle": { "format": "tobro-backup", "version": 1 }
+                }))
+            )
+            .is_ok()
+        );
     }
 }

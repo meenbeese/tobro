@@ -4,6 +4,7 @@
 //! over Tor, and serves SOCKS/HTTP + DNS until shutdown. The JSON-RPC server,
 //! lifecycle state machine, and configuration layer arrive in M1.
 
+mod backup;
 mod client_auth;
 mod ipc;
 mod lifecycle;

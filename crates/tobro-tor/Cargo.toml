@@ -33,6 +33,14 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+arti-client = { workspace = true, features = [
+    "experimental-api",
+    "keymgr",
+    "onion-service-client",
+] }
+tor-hscrypto = "=0.48.0"
+tor-keymgr = "=0.48.0"
+tor-llcrypto = { version = "=0.48.0", features = ["experimental"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 

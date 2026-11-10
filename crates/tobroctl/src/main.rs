@@ -1,6 +1,6 @@
 //! `tobroctl` — command-line client for `tobrod`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -192,6 +192,29 @@ enum OnionCommand {
         /// Service id.
         #[arg(long)]
         id: String,
+    },
+    /// Create an encrypted backup bundle (onion services + client auth keys).
+    ///
+    /// The bundle contains private keys protected only by its passphrase.
+    Backup {
+        /// Write the bundle JSON to this path (0600) instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Encryption passphrase (prompted interactively when omitted).
+        #[arg(long, value_name = "PASSPHRASE")]
+        passphrase: Option<String>,
+        /// Restrict the backup to these service ids (repeatable).
+        #[arg(long = "id", value_name = "SERVICE_ID")]
+        ids: Vec<String>,
+    },
+    /// Restore an encrypted backup bundle produced by `onion backup`.
+    Restore {
+        /// Bundle file path, or `-` to read from stdin.
+        #[arg(long = "file", value_name = "PATH|-")]
+        file: String,
+        /// Decryption passphrase (prompted interactively when omitted).
+        #[arg(long, value_name = "PASSPHRASE")]
+        passphrase: Option<String>,
     },
 }
 
@@ -442,6 +465,57 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await?;
                 print_json(&result)?;
             }
+            OnionCommand::Backup {
+                out,
+                passphrase,
+                ids,
+            } => {
+                let passphrase = read_passphrase(passphrase, "backup")?;
+                let mut params = serde_json::Map::new();
+                params.insert("passphrase".to_owned(), Value::String(passphrase));
+                if !ids.is_empty() {
+                    params.insert(
+                        "service_ids".to_owned(),
+                        Value::Array(ids.into_iter().map(Value::String).collect()),
+                    );
+                }
+                let result = client
+                    .call(
+                        tobro_ipc::methods::ONION_BACKUP,
+                        Some(Value::Object(params)),
+                    )
+                    .await?;
+                match out {
+                    Some(path) => {
+                        let bundle = result
+                            .get("bundle")
+                            .cloned()
+                            .context("backup response is missing the bundle envelope")?;
+                        write_bundle_file(&path, &serde_json::to_vec_pretty(&bundle)?)?;
+                        print_json(&json!({
+                            "ok": true,
+                            "action": "onion.backup",
+                            "counts": result.get("counts").cloned().unwrap_or(Value::Null),
+                            "written": path.display().to_string(),
+                            "warning": result.get("warning").cloned().unwrap_or(Value::Null),
+                        }))?;
+                    }
+                    None => print_json(&result)?,
+                }
+            }
+            OnionCommand::Restore { file, passphrase } => {
+                let passphrase = read_passphrase(passphrase, "restore")?;
+                let text = read_bundle_file(&file)?;
+                let bundle: Value =
+                    serde_json::from_str(&text).context("bundle file is not valid JSON")?;
+                let result = client
+                    .call(
+                        tobro_ipc::methods::ONION_RESTORE,
+                        Some(json!({ "passphrase": passphrase, "bundle": bundle })),
+                    )
+                    .await?;
+                print_json(&result)?;
+            }
         },
         Command::ClientAuth { command } => match command {
             ClientAuthCommand::List => {
@@ -564,6 +638,48 @@ fn read_auth_private_file(input: &str) -> anyhow::Result<String> {
         std::fs::read_to_string(input)
             .with_context(|| format!("failed to read .auth_private from {input}"))
     }
+}
+
+/// Prompt for a hidden passphrase when not supplied on the command line.
+fn read_passphrase(flag: Option<String>, action: &str) -> anyhow::Result<String> {
+    if let Some(passphrase) = flag {
+        return Ok(passphrase);
+    }
+    rpassword::prompt_password(format!("{action} passphrase: "))
+        .context("failed to read passphrase")
+}
+
+/// Read a backup bundle from a file path, or `-` for stdin.
+fn read_bundle_file(input: &str) -> anyhow::Result<String> {
+    if input == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read bundle from stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(input)
+            .with_context(|| format!("failed to read bundle from {input}"))
+    }
+}
+
+/// Write a bundle file with private-key-safe permissions (0600 on Unix).
+fn write_bundle_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set 0600 on {}", path.display()))?;
+    }
+    Ok(())
 }
 
 async fn client_auth_export(

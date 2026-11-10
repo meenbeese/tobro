@@ -110,6 +110,17 @@ const BIND_ALL_WARNING =
   "Other hosts may be able to route traffic through Tor from this machine. Only enable on trusted networks, " +
   "and configure your OS/router firewall to restrict access to these ports. Disable bind-all when not needed.";
 
+const TOR_BROWSER_DOWNLOAD_URL = "https://www.torproject.org/download/";
+
+const ONION_BACKUP_WARNING =
+  "This bundle contains the private keys of your onion services and client credentials. " +
+  "It is protected only by its passphrase: use a strong passphrase, keep the file secure, " +
+  "and delete copies you no longer need.";
+
+const ONION_RESTORE_WARNING =
+  "Restore adds key material to this machine and requires a restart/reconnect of Tor to apply it to running services. " +
+  "Restoring client credentials re-enables access for anyone still holding the exported .auth_private files.";
+
 function downloadText(
   filename: string,
   text: string,
@@ -351,6 +362,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     emptyOnionPort(),
   ]);
   const [onionEditingId, setOnionEditingId] = useState<string | null>(null);
+  const [onionBackupBusy, setOnionBackupBusy] = useState(false);
+  const [onionBackupPass, setOnionBackupPass] = useState("");
 
   // Client authorization (M5): .auth_private credentials + service attachments
   type ClientAuthView = {
@@ -1336,6 +1349,119 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       log(`onion service delete failed: ${msg}`, "error");
     } finally {
       setOnionBusy(false);
+    }
+  }
+
+  async function onCopyOnionAddress(svc: OnionServiceView) {
+    if (!svc.onion_address) {
+      setOnionError(
+        `Service "${svc.name}" has no published address yet. Enable it and connect Tor first.`,
+      );
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(svc.onion_address);
+      setOnionMessage(
+        `Copied the .onion address of "${svc.name}" to the clipboard.`,
+      );
+      log(`onion service address copied: ${svc.id}`);
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion service copy address failed: ${msg}`, "error");
+    }
+  }
+
+  async function onBackupOnionServices() {
+    const passphrase = onionBackupPass;
+    if (!passphrase) {
+      setOnionError("Enter a passphrase to encrypt the backup bundle.");
+      return;
+    }
+    setOnionBackupBusy(true);
+    setOnionError("");
+    setOnionMessage("");
+    try {
+      const result = await invoke<{
+        bundle?: unknown;
+        filename?: string;
+        counts?: Record<string, number>;
+        warning?: string;
+      }>("daemon_onion_backup", { params: { passphrase } });
+      if (!result?.bundle)
+        throw new Error("backup response is missing the bundle");
+      downloadJson(result.filename || "tobro-onion-backup.json", result.bundle);
+      const counts = result.counts || {};
+      setOnionMessage(
+        `Backup bundle downloaded (${counts.services ?? 0} service(s), ` +
+          `${counts.client_auth ?? 0} credential(s), ` +
+          `${counts.keystore_files ?? 0} key file(s)). ` +
+          (result.warning || ONION_BACKUP_WARNING),
+      );
+      log(`onion backup bundle downloaded: ${counts.services ?? 0} service(s)`);
+      setOnionBackupPass("");
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion backup failed: ${msg}`, "error");
+    } finally {
+      setOnionBackupBusy(false);
+    }
+  }
+
+  async function onRestoreOnionBundle(file: File) {
+    const passphrase = onionBackupPass;
+    if (!passphrase) {
+      setOnionError("Enter the bundle passphrase to decrypt it for restore.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `Restore onion services and client authorization keys from "${file.name}"?\n\n` +
+          ONION_RESTORE_WARNING +
+          "\n\nExisting services/credentials with the same id are never overwritten.",
+      )
+    ) {
+      return;
+    }
+    setOnionBackupBusy(true);
+    setOnionError("");
+    setOnionMessage("");
+    try {
+      const text = await file.text();
+      const bundle = JSON.parse(text) as unknown;
+      const result = await invoke<{
+        restored?: Record<string, number>;
+        skipped?: { services?: string[]; client_auth?: string[] };
+        restart_required?: boolean;
+        warning?: string;
+      }>("daemon_onion_restore", {
+        params: { passphrase, bundle },
+      });
+      const restored = result?.restored || {};
+      const skipped = result?.skipped || {};
+      setOnionMessage(
+        `Restore complete: ${restored.services ?? 0} service(s), ` +
+          `${restored.client_auth ?? 0} credential(s), ` +
+          `${restored.attachments ?? 0} attachment(s) added` +
+          (skipped.services?.length || skipped.client_auth?.length
+            ? " (existing ids skipped)"
+            : "") +
+          `. ${result?.restart_required ? "Restart/reconnect Tor to apply it to running services. " : ""}` +
+          (result?.warning || ""),
+      );
+      log(
+        `onion bundle restored: ${restored.services ?? 0} service(s), ${restored.client_auth ?? 0} credential(s)`,
+      );
+      setOnionBackupPass("");
+      await loadOnionServices();
+      await loadClientAuth();
+    } catch (err) {
+      const msg = String(err);
+      setOnionError(msg);
+      log(`onion restore failed: ${msg}`, "error");
+    } finally {
+      setOnionBackupBusy(false);
     }
   }
 
@@ -2886,6 +3012,15 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         >
                           Edit
                         </button>
+                        {svc.onion_address ? (
+                          <button
+                            type="button"
+                            disabled={onionBusy}
+                            onClick={() => void onCopyOnionAddress(svc)}
+                          >
+                            Copy address
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           disabled={onionBusy}
@@ -3053,6 +3188,103 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   ) : null}
                 </div>
               </form>
+            </details>
+
+            <details className="settings-section onion-browser-guidance" open>
+              <summary>
+                <h3>Sharing addresses (Tor Browser)</h3>
+              </summary>
+              <p className="muted">
+                Copy a service&rsquo;s <code>.onion</code> address with
+                &ldquo;Copy address&rdquo; above, then share it over a trusted
+                channel. Visitors open the address in Tor Browser:
+              </p>
+              <ol className="muted">
+                <li>
+                  Install and open{" "}
+                  <a
+                    href="#tor-browser-download"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void invoke("open_external_url", {
+                        url: TOR_BROWSER_DOWNLOAD_URL,
+                      }).catch(() => undefined);
+                    }}
+                  >
+                    Tor Browser
+                  </a>{" "}
+                  (desktop or mobile).
+                </li>
+                <li>
+                  Paste the <code>.onion</code> address into the address bar.
+                </li>
+                <li>
+                  Press Enter — Tor Browser routes the connection through the
+                  Tor network; no other browser can reach <code>.onion</code>{" "}
+                  sites.
+                </li>
+              </ol>
+              <p className="muted">
+                If the service is authorized (restricted discovery), a visitor
+                also needs the matching <code>.auth_private</code> file from the
+                Client Authorization tab.
+              </p>
+            </details>
+
+            <details className="settings-section onion-backup" open>
+              <summary>
+                <h3>Backup &amp; restore (encrypted bundle)</h3>
+              </summary>
+              <p className="muted">
+                Back up onion services and client authorization credentials
+                (including their private keys) as a single encrypted JSON
+                bundle. Restore moves them to another machine or recovers from
+                accidental deletion. Existing services/credentials with the same
+                id are never overwritten.
+              </p>
+              <p className="muted warning" role="note">
+                {ONION_BACKUP_WARNING}
+              </p>
+              <label>
+                Bundle passphrase
+                <input
+                  type="password"
+                  value={onionBackupPass}
+                  onChange={(e) => {
+                    setOnionBackupPass(e.target.value);
+                    setOnionError("");
+                  }}
+                  placeholder="Passphrase for encryption/decryption"
+                  disabled={onionBackupBusy}
+                  autoComplete="off"
+                />
+              </label>
+              <div className="actions">
+                <button
+                  type="button"
+                  disabled={onionBackupBusy}
+                  onClick={() => void onBackupOnionServices()}
+                >
+                  {onionBackupBusy ? "Working…" : "Download encrypted backup"}
+                </button>
+                <label className="file-input-label">
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    disabled={onionBackupBusy}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = "";
+                      if (file) void onRestoreOnionBundle(file);
+                    }}
+                    aria-label="Restore bundle from file"
+                  />
+                </label>
+              </div>
+              <p className="muted">
+                Restoring requires a restart/reconnect of Tor to apply to
+                running services. {ONION_RESTORE_WARNING}
+              </p>
             </details>
           </div>
 

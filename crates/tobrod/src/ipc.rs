@@ -242,6 +242,16 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Create an encrypted backup bundle (onion services + client auth keys).
+    fn onion_backup(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Restore an encrypted backup bundle.
+    fn onion_restore(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// List client authorization credentials.
     fn client_auth_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Generate a client authorization credential.
@@ -972,6 +982,19 @@ impl DaemonControl for SupervisorControl {
         crate::onion::delete(&db_path, params).await
     }
 
+    async fn onion_backup(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let state_dir = self.state_dir.clone();
+        crate::backup::backup(&db_path, &state_dir, params).await
+    }
+
+    async fn onion_restore(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let db_path = self.db_path();
+        let state_dir = self.state_dir.clone();
+        let runtime_active = is_runtime_active(&self.snapshot().state);
+        crate::backup::restore(&db_path, &state_dir, params, runtime_active).await
+    }
+
     async fn client_auth_list(&self) -> Result<serde_json::Value, String> {
         let db_path = self.db_path();
         crate::client_auth::list(&db_path).await
@@ -1096,6 +1119,14 @@ impl DaemonControl for SupervisorHandle {
     }
 
     async fn onion_delete(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn onion_backup(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("onion operations require daemon config/state context".to_owned())
+    }
+
+    async fn onion_restore(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("onion operations require daemon config/state context".to_owned())
     }
 
@@ -1571,6 +1602,24 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::ONION_BACKUP => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.onion_backup(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::ONION_RESTORE => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.onion_restore(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
         methods::CLIENT_AUTH_LIST => match control.client_auth_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(e)),
@@ -1810,6 +1859,20 @@ mod daemon_tests {
             params: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "onion.delete", "id": params.get("id").cloned() }))
+        }
+
+        async fn onion_backup(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.backup", "mock": true }))
+        }
+
+        async fn onion_restore(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "onion.restore", "mock": true }))
         }
 
         async fn client_auth_list(&self) -> Result<serde_json::Value, String> {

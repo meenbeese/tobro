@@ -204,7 +204,9 @@ async fn read_secret_b32(key_dir: &Path) -> Result<String, String> {
     Ok(BASE32_NOPAD.encode(&bytes))
 }
 
-async fn sync_service_authorized_clients(
+/// Re-write the `authorized_clients/<nickname>.auth` files for a service from
+/// its DB attachments. Used by attach/detach and by bundle restore.
+pub async fn sync_service_authorized_clients(
     db: &tobro_store::Db,
     service_id: &str,
 ) -> Result<(), String> {

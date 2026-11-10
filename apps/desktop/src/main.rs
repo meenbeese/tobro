@@ -61,6 +61,14 @@ enum IpcCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OnionBackup {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    OnionRestore {
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     ClientAuthList(oneshot::Sender<Result<Value, String>>),
     ClientAuthGenerate {
         params: Value,
@@ -275,6 +283,30 @@ async fn daemon_onion_delete(state: State<'_, AppState>, params: Value) -> Resul
     state
         .commands
         .send(IpcCommand::OnionDelete { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_backup(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionBackup { params, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_onion_restore(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::OnionRestore { params, reply: tx })
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -642,6 +674,8 @@ fn main() {
             daemon_onion_create,
             daemon_onion_update,
             daemon_onion_delete,
+            daemon_onion_backup,
+            daemon_onion_restore,
             daemon_client_auth_list,
             daemon_client_auth_generate,
             daemon_client_auth_import,
@@ -1770,6 +1804,8 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::OnionCreate { reply, .. }
         | IpcCommand::OnionUpdate { reply, .. }
         | IpcCommand::OnionDelete { reply, .. }
+        | IpcCommand::OnionBackup { reply, .. }
+        | IpcCommand::OnionRestore { reply, .. }
         | IpcCommand::ClientAuthGenerate { reply, .. }
         | IpcCommand::ClientAuthImport { reply, .. }
         | IpcCommand::ClientAuthExport { reply, .. }
@@ -1918,6 +1954,20 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
         IpcCommand::OnionDelete { params, reply } => {
             let result = client
                 .call(methods::ONION_DELETE, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::OnionBackup { params, reply } => {
+            let result = client
+                .call(methods::ONION_BACKUP, Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = reply.send(result);
+        }
+        IpcCommand::OnionRestore { params, reply } => {
+            let result = client
+                .call(methods::ONION_RESTORE, Some(params))
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);
