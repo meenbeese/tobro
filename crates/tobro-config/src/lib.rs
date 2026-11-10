@@ -69,6 +69,8 @@ pub struct Config {
     /// Onion service hosting settings (M5). Dynamic services are managed via IPC/DB;
     /// this section reserves config compatibility.
     pub onion_services: OnionServicesConfig,
+    /// Kindness Mode settings (M6, F-60): run a snowflake-proxy sidecar.
+    pub kindness: KindnessConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -84,6 +86,7 @@ impl Default for Config {
             stream: StreamConfig::default(),
             bridges: BridgesConfig::default(),
             onion_services: OnionServicesConfig::default(),
+            kindness: KindnessConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
@@ -640,6 +643,130 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Kindness Mode configuration (M6, §4.9, F-60).
+///
+/// Runs the upstream `snowflake-proxy` sidecar (not the client) so this
+/// computer can serve as a Snowflake proxy for censored users. The proxy
+/// speaks the WebSocket/WebRTC rendezvous protocol to a broker, not the Tor
+/// PT line protocol, so supervisor readiness is simply "process started".
+///
+/// Overrides fall back to the binary's own defaults; tobro passes only the
+/// flags explicitly configured, and unknown behaviors can be reached with
+/// `extra_args`. See upstream `snowflake/proxy` (broker
+/// `https://snowflake-broker.torproject.net/`, relay `wss://snowflake.torproject.net/`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KindnessConfig {
+    /// Run `snowflake-proxy` while the daemon runs.
+    pub enabled: bool,
+    /// Broker URL override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_url: Option<String>,
+    /// Relay (server) URL override used when the broker does not specify one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Comma-separated STUN URLs used for NAT discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_url: Option<String>,
+    /// Maximum concurrent clients to serve. Only forwarded as `-capacity`
+    /// when set: current upstream releases derive capacity from the broker,
+    /// while older releases accept the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+    /// Report the NAT type as unrestricted without probing.
+    #[serde(default)]
+    pub nat_type_force_unrestricted: bool,
+    /// Increase proxy log verbosity.
+    #[serde(default)]
+    pub verbose: bool,
+    /// Expected SHA-256 of the `snowflake-proxy` binary (lowercase hex).
+    /// When set, startup refuses to launch a binary that does not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_hex: Option<String>,
+    /// Explicit `snowflake-proxy` binary path override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_path: Option<String>,
+    /// Extra directory to search for `snowflake-proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_dir: Option<String>,
+    /// Extra raw arguments passed through to the proxy (power users only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
+impl KindnessConfig {
+    /// True when the snowflake-proxy sidecar should run.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    fn normalized_url(name: &str, value: Option<&str>) -> Result<Option<String>, ConfigError> {
+        let Some(raw) = value else {
+            return Ok(None);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "kindness.{name} must not be empty when set (omit the key to use the binary default)"
+            )));
+        }
+        if trimmed.chars().any(char::is_whitespace) {
+            return Err(ConfigError::Invalid(format!(
+                "kindness.{name} must not contain whitespace: {trimmed:?}"
+            )));
+        }
+        Ok(Some(trimmed.to_owned()))
+    }
+
+    /// Validate kindness settings.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(capacity) = self.capacity
+            && capacity == 0
+        {
+            return Err(ConfigError::Invalid(
+                "kindness.capacity must be greater than zero when set".to_owned(),
+            ));
+        }
+        Self::normalized_url("broker_url", self.broker_url.as_deref())?;
+        Self::normalized_url("relay_url", self.relay_url.as_deref())?;
+        Self::normalized_url("stun_url", self.stun_url.as_deref())?;
+        if let Some(hex) = &self.sha256_hex {
+            let hex = hex.trim();
+            if hex.len() != 64
+                || !hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
+                return Err(ConfigError::Invalid(
+                    "kindness.sha256_hex must be 64 lowercase hex characters".to_owned(),
+                ));
+            }
+        }
+        if let Some(p) = &self.proxy_path
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "kindness.proxy_path must not be empty when set".to_owned(),
+            ));
+        }
+        if let Some(p) = &self.proxy_dir
+            && p.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "kindness.proxy_dir must not be empty when set".to_owned(),
+            ));
+        }
+        for (i, arg) in self.extra_args.iter().enumerate() {
+            if arg.contains('\0') {
+                return Err(ConfigError::Invalid(format!(
+                    "kindness.extra_args[{i}] must not contain NUL"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Resolve the default config file path.
 pub fn default_path() -> Result<PathBuf, ConfigError> {
     let project = ProjectDirs::from("", "", "tobro").ok_or(ConfigError::NoConfigDir)?;
@@ -766,6 +893,7 @@ impl Config {
                 )));
             }
         }
+        self.kindness.validate()?;
         self.outbound_proxy.validate()?;
         Ok(())
     }
@@ -1124,6 +1252,70 @@ mod tests {
         let loaded = Config::load_or_default(&path)?;
         assert_eq!(loaded, Config::default());
         Ok(())
+    }
+
+    #[test]
+    fn kindness_defaults_are_disabled_and_validate() {
+        let kindness = KindnessConfig::default();
+        assert!(!kindness.is_active());
+        assert!(kindness.validate().is_ok());
+    }
+
+    #[test]
+    fn kindness_parses_section_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = 1
+[kindness]
+enabled = true
+relay_url = "wss://relay.example.com/"
+capacity = 5
+verbose = true
+extra_args = ["-allow-non-tls-relay"]
+"#,
+        )?;
+        let config = Config::load(&path)?;
+        assert!(config.kindness.is_active());
+        assert_eq!(
+            config.kindness.relay_url.as_deref(),
+            Some("wss://relay.example.com/")
+        );
+        assert_eq!(config.kindness.capacity, Some(5));
+        assert!(config.kindness.verbose);
+        assert_eq!(config.kindness.extra_args, vec!["-allow-non-tls-relay"]);
+        config.validate()?;
+        // Section without `kindness` keys still loads (older configs).
+        std::fs::write(&path, "version = 1\n")?;
+        let minimal = Config::load(&path)?;
+        assert!(!minimal.kindness.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn kindness_validates_capacity_and_digest_and_urls() {
+        let mut config = Config::default();
+        config.kindness.enabled = true;
+        config.kindness.capacity = Some(0);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.kindness.sha256_hex = Some("abc".to_owned());
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.kindness.sha256_hex = Some("ABC".repeat(21) + "d"); // 64 uppercase hex
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.kindness.relay_url = Some("wss://relay with space.example/".to_owned());
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.kindness.broker_url = Some(" ".to_owned());
+        assert!(config.validate().is_err());
     }
 
     #[test]

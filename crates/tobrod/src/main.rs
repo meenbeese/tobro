@@ -7,6 +7,7 @@
 mod backup;
 mod client_auth;
 mod ipc;
+pub(crate) mod kindness;
 mod lifecycle;
 pub(crate) mod onion;
 pub(crate) mod outbound;
@@ -130,6 +131,28 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     let bridge_settings = resolve_bridge_settings(&config.bridges, Some(&state_dir));
     let outbound_proxy = outbound::resolve_static_outbound_proxy(&config.outbound_proxy)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Kindness mode (M6, F-60): run the snowflake-proxy sidecar when enabled.
+    // A missing/unverifiable binary logs a warning and the daemon continues
+    // without it; crash restarts and shutdown are handled by the supervisor.
+    let kindness = if config.kindness.is_active() {
+        match crate::kindness::spawn_supervised(&config.kindness, &state_dir) {
+            Ok(supervisor) => {
+                let events = supervisor.spawn_event_logger();
+                supervisor.start().await;
+                Some((supervisor, events))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "kindness mode enabled but snowflake-proxy could not be prepared; continuing without it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
@@ -195,6 +218,10 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     tracing::info!("shutdown requested");
     let _ = handle.disconnect().await;
     let _ = handle.shutdown().await;
+    if let Some((kindness, _kindness_events)) = kindness {
+        tracing::info!("stopping kindness proxy");
+        kindness.shutdown().await;
+    }
     ipc_task.abort();
     let _ = supervisor_task.await;
     Ok(())
