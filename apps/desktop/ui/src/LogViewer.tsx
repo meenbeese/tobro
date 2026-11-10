@@ -240,7 +240,7 @@ export function LogViewer({
           {collapsible ? (
             <button
               type="button"
-              className="logs-toggle"
+              className="small-button"
               aria-expanded={open}
               aria-controls="event-log-panel"
               onClick={() => setOpen((v) => !v)}

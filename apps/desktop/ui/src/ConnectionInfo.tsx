@@ -108,12 +108,6 @@ export function ConnectionInfo({
               <span className="connection-value">{duration}</span>
             </div>
           ) : null}
-          <div className="connection-row">
-            <span className="connection-label">Exit</span>
-            <span className="connection-value connection-value-muted">
-              Unknown
-            </span>
-          </div>
           <div className="connection-section">
             <div className="connection-section-title">Proxy endpoints</div>
             <div className="connection-endpoint">
@@ -152,12 +146,32 @@ export function ConnectionInfo({
           </div>
         </>
       ) : (
-        <div className="connection-row">
-          <span className="connection-label">Proxies</span>
-          <span className="connection-value connection-value-muted">
-            {socksHost}:{socksPort} (SOCKS) • {socksHost}:{httpPort} (HTTP) •{" "}
-            {socksHost}:{dnsPort} (DNS)
-          </span>
+        <div className="connection-section">
+          <div className="connection-section-title">Proxy endpoints</div>
+          <div className="connection-endpoint">
+            <div className="connection-endpoint-info">
+              <div className="connection-endpoint-label">SOCKS5</div>
+              <code className="connection-endpoint-value connection-value-muted">
+                {socksHost}:{socksPort}
+              </code>
+            </div>
+          </div>
+          <div className="connection-endpoint">
+            <div className="connection-endpoint-info">
+              <div className="connection-endpoint-label">HTTP</div>
+              <code className="connection-endpoint-value connection-value-muted">
+                {socksHost}:{httpPort}
+              </code>
+            </div>
+          </div>
+          <div className="connection-endpoint">
+            <div className="connection-endpoint-info">
+              <div className="connection-endpoint-label">DNS</div>
+              <code className="connection-endpoint-value connection-value-muted">
+                {socksHost}:{dnsPort}
+              </code>
+            </div>
+          </div>
         </div>
       )}
     </div>

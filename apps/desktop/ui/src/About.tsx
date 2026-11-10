@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
+import { readDaemonInfo } from "./daemonInfo";
 
 export interface AboutProps {
   onClose: () => void;
@@ -89,37 +90,26 @@ export function About({ onClose }: AboutProps) {
 
   useEffect(() => {
     let cancelled = false;
+    setRuntime(
+      readDaemonInfo() ??
+        "Runtime details appear here after the daemon reports hello.",
+    );
     (async () => {
       try {
         const s = await invoke<DaemonStatus>("status");
         if (cancelled) return;
         const bind = s?.bind_all_interfaces ? "0.0.0.0" : "127.0.0.1";
-        const ports =
-          typeof s?.socks_port === "number"
-            ? `SOCKS ${bind}:${s.socks_port}, HTTP ${bind}:${s.http_port ?? s.socks_port}, DNS ${bind}:${s.dns_port ?? "—"}`
-            : "ports unavailable";
-        setStatus(`State: ${s?.state ?? "unknown"} · ${ports}`);
-      } catch (e) {
-        if (!cancelled) setStatus(`Daemon status unavailable: ${String(e)}`);
-      }
-      try {
-        // Best-effort: some builds expose daemon hello/status details via status/events;
-        // show what we can from status command context without requiring a new API.
-        const s = await invoke<Record<string, unknown>>("status");
-        if (cancelled) return;
-        const dv =
-          typeof s?.daemon_version === "string" ? s.daemon_version : null;
-        const av = typeof s?.arti_version === "string" ? s.arti_version : null;
-        if (dv || av) {
-          setRuntime(`daemon ${dv ?? "?"} · Arti ${av ?? "?"}`);
-        } else {
-          setRuntime(
-            "Runtime version details are shown in the main window when the daemon reports hello/status.",
+        const parts = [`State: ${s?.state ?? "unknown"}`];
+        if (typeof s?.socks_port === "number") {
+          parts.push(
+            `SOCKS ${bind}:${s.socks_port}`,
+            `HTTP ${bind}:${s.http_port ?? s.socks_port}`,
+            `DNS ${bind}:${s.dns_port ?? "unknown"}`,
           );
         }
-      } catch {
-        if (!cancelled)
-          setRuntime("Daemon not reachable (runtime details unavailable).");
+        setStatus(parts.join(". "));
+      } catch (e) {
+        if (!cancelled) setStatus(`Daemon status unavailable: ${String(e)}`);
       }
     })();
     return () => {
@@ -140,7 +130,7 @@ export function About({ onClose }: AboutProps) {
             shell.
           </p>
         </div>
-        <button type="button" className="logs-toggle" onClick={onClose}>
+        <button type="button" className="small-button" onClick={onClose}>
           Close
         </button>
       </div>
@@ -175,7 +165,7 @@ export function About({ onClose }: AboutProps) {
         </div>
 
         <div className="settings-section">
-          <h3>Runtime (best effort)</h3>
+          <h3>Runtime</h3>
           <p className="muted">{runtime}</p>
           {status ? <p className="muted">{status}</p> : null}
         </div>
@@ -194,7 +184,7 @@ export function About({ onClose }: AboutProps) {
                 >
                   {l.label}
                 </a>
-                {l.note ? <span> — {l.note}</span> : null}
+                {l.note ? <div className="muted">{l.note}</div> : null}
               </li>
             ))}
           </ul>

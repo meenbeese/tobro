@@ -1,6 +1,7 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 import { LogViewer, type LogEntry } from "./LogViewer";
+import { readDaemonInfo } from "./daemonInfo";
 
 interface TobroEvent {
   kind: string;
@@ -91,13 +92,13 @@ export function Logs({ onClose }: LogsProps) {
           if (e.method === "bootstrap.progress") {
             const b = (e.params ?? {}) as BootstrapProgress;
             appendLog(
-              `bootstrap ${typeof b.percent === "number" ? `${b.percent}%` : ""}${b.detail ? ` — ${b.detail}` : ""}`.trim(),
+              `bootstrap ${typeof b.percent === "number" ? `${b.percent}%` : ""}${b.detail ? ` (${b.detail})` : ""}`.trim(),
               "info",
               "daemon",
             );
           } else if (e.method === "daemon.state_changed") {
             const s = (e.params ?? {}) as { state?: string; message?: string };
-            const detail = s.message ? ` — ${s.message}` : "";
+            const detail = s.message ? ` (${s.message})` : "";
             appendLog(
               `state → ${s.state ?? "?"}${detail}`,
               s.state === "error" ? "error" : "info",
@@ -109,6 +110,10 @@ export function Logs({ onClose }: LogsProps) {
         }
       });
     })();
+    const storedDaemonInfo = readDaemonInfo();
+    if (storedDaemonInfo) {
+      appendLog(storedDaemonInfo, "info", "daemon");
+    }
     appendLog(
       "Log window opened. Live daemon events will appear here.",
       "info",

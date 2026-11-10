@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { GearSix, Info } from "@phosphor-icons/react";
+import { GearSix, Info, ListBullets } from "@phosphor-icons/react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   useCallback,
@@ -13,6 +13,7 @@ import {
 import appIconUrl from "./assets/icon.svg";
 import { StatusIcon } from "./StatusIcon";
 import { ConnectionInfo } from "./ConnectionInfo";
+import { storeDaemonInfo } from "./daemonInfo";
 
 type DaemonState =
   | "starting"
@@ -61,7 +62,7 @@ function formatStatus(status: DaemonStatus | null, reachable: boolean): string {
   const bootstrap = status.bootstrap;
   const percent =
     typeof bootstrap?.percent === "number" ? `${bootstrap.percent}%` : "";
-  const detail = bootstrap?.detail ? ` — ${bootstrap.detail}` : "";
+  const detail = bootstrap?.detail ? ` (${bootstrap.detail})` : "";
   if (status.state === "bootstrapping")
     return `Bootstrapping ${percent}${detail}`.trim();
   if (status.state === "connected" || status.state === "serving") {
@@ -76,7 +77,6 @@ function formatStatus(status: DaemonStatus | null, reachable: boolean): string {
 export default function App() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [reachable, setReachable] = useState(false);
-  const [daemonInfo, setDaemonInfo] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [lockStatus, setLockStatus] = useState<AppLockStatus | null>(null);
   const [locked, setLocked] = useState(false);
@@ -126,12 +126,6 @@ export default function App() {
           }
           return;
         }
-        if (kind === "reachable") {
-          setReachable(true);
-          const p = payload as { socket?: string };
-          if (p?.socket) setDaemonInfo(`socket: ${p.socket}`);
-          return;
-        }
         if (kind === "hello") {
           const h = payload as {
             daemon_version?: string;
@@ -139,9 +133,13 @@ export default function App() {
             platform?: string;
             arti_version?: string;
           };
-          setDaemonInfo(
+          storeDaemonInfo(
             `daemon ${h.daemon_version ?? "?"} (rpc v${h.rpc_version ?? "?"}, ${h.platform ?? "?"}, arti ${h.arti_version ?? "?"})`,
           );
+          return;
+        }
+        if (kind === "reachable") {
+          setReachable(true);
           return;
         }
         if (kind === "unreachable") {
@@ -157,13 +155,13 @@ export default function App() {
           if (e.method === "bootstrap.progress") {
             const b = (e.params ?? {}) as BootstrapProgress;
             appendLog(
-              `bootstrap ${typeof b.percent === "number" ? `${b.percent}%` : ""}${b.detail ? ` — ${b.detail}` : ""}`.trim(),
+              `bootstrap ${typeof b.percent === "number" ? `${b.percent}%` : ""}${b.detail ? ` (${b.detail})` : ""}`.trim(),
               "info",
               "daemon",
             );
           } else if (e.method === "daemon.state_changed") {
             const s = (e.params ?? {}) as { state?: string; message?: string };
-            const detail = s.message ? ` — ${s.message}` : "";
+            const detail = s.message ? ` (${s.message})` : "";
             appendLog(
               `state → ${s.state ?? "?"}${detail}`,
               s.state === "error" ? "error" : "info",
@@ -349,7 +347,7 @@ export default function App() {
       }
       const settings = new WebviewWindow("settings", {
         url: "index.html?window=settings",
-        title: "Settings — Tobro",
+        title: "Settings",
         width: 820,
         height: 720,
         minWidth: 560,
@@ -379,7 +377,7 @@ export default function App() {
       }
       const about = new WebviewWindow("about", {
         url: "index.html?window=about",
-        title: "About — Tobro",
+        title: "About",
         width: 760,
         height: 680,
         minWidth: 520,
@@ -409,7 +407,7 @@ export default function App() {
       }
       const logsWindow = new WebviewWindow("logs", {
         url: "index.html?window=logs",
-        title: "Logs — Tobro",
+        title: "Logs",
         width: 980,
         height: 640,
         minWidth: 640,
@@ -547,14 +545,22 @@ export default function App() {
                 width={44}
                 height={44}
               />
-              <div>
-                <h1>Tobro</h1>
-                <p className="muted">
-                  {daemonInfo || "Connecting to local daemon…"}
-                </p>
-              </div>
+              <h1>Tobro</h1>
             </div>
-            <div className="hero-utilities" aria-label="Settings and about">
+            <div
+              className="hero-utilities"
+              aria-label="Settings, logs, and about"
+            >
+              <button
+                type="button"
+                className="toolbar-icon-button"
+                onClick={() => void openLogs()}
+                aria-haspopup="dialog"
+                aria-label="Logs"
+                title="Logs"
+              >
+                <ListBullets size={20} aria-hidden="true" />
+              </button>
               <button
                 type="button"
                 className="toolbar-icon-button"
@@ -577,31 +583,6 @@ export default function App() {
               </button>
             </div>
           </div>
-          <nav className="toolbar" aria-label="App actions">
-            <button
-              type="button"
-              onClick={onNewIdentity}
-              disabled={!canNewIdentity}
-              title="Request new circuits (implemented). Guard state preserved."
-            >
-              New identity
-            </button>
-            <button
-              type="button"
-              disabled
-              title="Change exit country (coming soon)"
-            >
-              Change exit
-            </button>
-            <button
-              type="button"
-              onClick={() => void openLogs()}
-              aria-haspopup="dialog"
-              title="Logs"
-            >
-              Logs
-            </button>
-          </nav>
         </header>
 
         <section
@@ -611,44 +592,6 @@ export default function App() {
             <StatusIcon state={status?.state} reachable={reachable} size={28} />
             <div className="status-title-group">
               <p className="headline">{headline}</p>
-              {reachable ? (
-                (() => {
-                  const badgeLabel =
-                    status?.state === "connected" || status?.state === "serving"
-                      ? "Connected"
-                      : status?.state === "bootstrapping"
-                        ? "Bootstrapping"
-                        : status?.state === "starting"
-                          ? "Starting"
-                          : status?.state === "stopping"
-                            ? "Stopping"
-                            : status?.state === "stopped"
-                              ? "Stopped"
-                              : status?.state === "error"
-                                ? "Error"
-                                : "Unknown";
-                  const headlineLower = headline.toLowerCase();
-                  const badgeLower = badgeLabel.toLowerCase();
-                  if (
-                    headlineLower === badgeLower ||
-                    headlineLower === `${badgeLower}…` ||
-                    headlineLower.startsWith(badgeLower)
-                  ) {
-                    return null;
-                  }
-                  return (
-                    <span
-                      className={`status-badge status-badge-${status?.state ?? "unknown"}`}
-                    >
-                      {badgeLabel}
-                    </span>
-                  );
-                })()
-              ) : (
-                <span className="status-badge status-badge-unreachable">
-                  Offline
-                </span>
-              )}
             </div>
           </div>
           {!reachable ? (

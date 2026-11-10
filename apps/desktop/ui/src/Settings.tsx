@@ -169,6 +169,11 @@ function parsePatch(text: string): unknown {
   return parsed;
 }
 
+function DirtyNote({ dirty }: { dirty: boolean }) {
+  if (!dirty) return null;
+  return <span className="dirty-note">Unsaved changes</span>;
+}
+
 function parsePort(value: string): number | null {
   if (!/^\d+$/.test(value)) return null;
   const port = Number(value);
@@ -232,6 +237,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [globalShortcutMessage, setGlobalShortcutMessage] =
     useState<string>("");
   const [globalShortcutError, setGlobalShortcutError] = useState<string>("");
+  const [globalShortcutDirty, setGlobalShortcutDirty] = useState(false);
   const [autostart, setAutostart] = useState<{
     enabled: boolean;
     start_minimized: boolean;
@@ -244,6 +250,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartMessage, setAutostartMessage] = useState("");
   const [autostartError, setAutostartError] = useState("");
+  const [autostartDirty, setAutostartDirty] = useState(false);
   const [appLock, setAppLock] = useState<{
     enabled: boolean;
     lock_on_idle: boolean;
@@ -257,6 +264,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [appLockBusy, setAppLockBusy] = useState(false);
   const [appLockMessage, setAppLockMessage] = useState("");
   const [appLockError, setAppLockError] = useState("");
+  const [appLockDirty, setAppLockDirty] = useState(false);
   const [lockPassword, setLockPassword] = useState("");
   const [lockPasswordConfirm, setLockPasswordConfirm] = useState("");
   const [lockCurrentPassword, setLockCurrentPassword] = useState("");
@@ -520,6 +528,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
         details: s.details,
       });
       setAutostartError("");
+      setAutostartDirty(false);
     } catch (e) {
       setAutostartError(e instanceof Error ? e.message : String(e));
     }
@@ -553,6 +562,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
           ? `Autostart enabled (${s.method}).${s.start_minimized ? " Will start minimized." : ""}`
           : "Autostart disabled.",
       );
+      setAutostartDirty(false);
       log(
         `autostart ${s.enabled ? "enabled" : "disabled"}${s.start_minimized ? " (start minimized)" : ""}`,
       );
@@ -580,6 +590,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       }>("get_app_lock_status");
       setAppLock(s);
       setAppLockError("");
+      setAppLockDirty(false);
     } catch (e) {
       setAppLockError(e instanceof Error ? e.message : String(e));
     }
@@ -609,6 +620,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
         preferOsAuth: appLock.prefer_os_auth,
       });
       setAppLock(s);
+      setAppLockDirty(false);
       setAppLockMessage(
         s.enabled
           ? "App lock enabled."
@@ -750,6 +762,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     setGlobalShortcutMessage("");
     try {
       await applyGlobalShortcut(globalShortcut);
+      setGlobalShortcutDirty(false);
       const v = globalShortcut.trim();
       setGlobalShortcutMessage(
         v
@@ -1170,7 +1183,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       setBridgeTestResult(result);
       const r = result as { ok?: boolean; summary?: string };
       log(
-        `bridge test: ${r?.ok ? "ok" : "issues found"}${r?.summary ? ` — ${r.summary}` : ""}`,
+        `bridge test: ${r?.ok ? "ok" : "issues found"}${r?.summary ? ` (${r.summary})` : ""}`,
         r?.ok ? "info" : "error",
       );
     } catch (e) {
@@ -1712,7 +1725,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
         <div>
           <h2>Settings</h2>
         </div>
-        <button type="button" className="logs-toggle" onClick={onClose}>
+        <button type="button" className="small-button" onClick={onClose}>
           Close
         </button>
       </div>
@@ -1798,17 +1811,15 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               </p>
               <button
                 type="button"
-                className="logs-toggle"
+                className="small-button"
                 onClick={disablePowerUser}
               >
                 Lock settings
               </button>
             </div>
 
-            <details className="settings-section" open>
-              <summary>
-                <h3>Appearance</h3>
-              </summary>
+            <div className="settings-section">
+              <h3>Appearance</h3>
               <div className="field-row">
                 <label htmlFor="settings-theme">Theme</label>
                 <select
@@ -1826,12 +1837,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               <p className="muted">
                 Theme applies to app windows (main, Settings, About).
               </p>
-            </details>
+            </div>
 
-            <details className="settings-section" open>
-              <summary>
-                <h3>Privacy</h3>
-              </summary>
+            <div className="settings-section">
+              <h3>Privacy</h3>
               <label
                 className="checkbox-label"
                 htmlFor="settings-capture-protection"
@@ -1860,170 +1869,165 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 out-of-band recording). Turning it off makes window contents
                 easier to capture.
               </p>
-            </details>
+            </div>
 
             <form
               className="settings-section"
               onSubmit={(e) => void onSaveGlobalShortcut(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Global shortcut</h3>
-                </summary>
-                <p className="muted">
-                  Configurable system-wide shortcut to{" "}
-                  <strong>toggle the Tor connection</strong> (connect/stop).{" "}
-                  <strong>Default: off</strong>. Leave empty and save to
-                  disable. Example: <code>CommandOrControl+Shift+T</code>{" "}
-                  (macOS/Windows/Linux) or <code>Cmd+Shift+T</code> on macOS.
-                  Registration can fail if the shortcut is invalid or already
-                  used by another app.
-                </p>
-                <div className="field-row">
-                  <label htmlFor="settings-global-shortcut">Shortcut</label>
-                  <input
-                    id="settings-global-shortcut"
-                    type="text"
-                    value={globalShortcut}
-                    onChange={(e) => {
-                      setGlobalShortcut(e.target.value);
-                      setGlobalShortcutMessage("");
-                      setGlobalShortcutError("");
-                    }}
-                    placeholder="Disabled (e.g. CommandOrControl+Shift+T)"
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-                {globalShortcutError ? (
-                  <p className="error">{globalShortcutError}</p>
-                ) : null}
-                {globalShortcutMessage ? (
-                  <p className="muted">{globalShortcutMessage}</p>
-                ) : null}
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={globalShortcutBusy}
-                  >
-                    {globalShortcutBusy ? "Saving…" : "Save shortcut"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={globalShortcutBusy}
-                    onClick={() => {
-                      setGlobalShortcut("");
-                      setGlobalShortcutMessage("");
-                      setGlobalShortcutError("");
-                    }}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </details>
+              <h3>Global shortcut</h3>
+              <p className="muted">
+                Configurable system-wide shortcut to{" "}
+                <strong>toggle the Tor connection</strong> (connect/stop).{" "}
+                <strong>Default: off</strong>. Leave empty and save to disable.
+                Example: <code>CommandOrControl+Shift+T</code>{" "}
+                (macOS/Windows/Linux) or <code>Cmd+Shift+T</code> on macOS.
+                Registration can fail if the shortcut is invalid or already used
+                by another app.
+              </p>
+              <div className="field-row">
+                <label htmlFor="settings-global-shortcut">Shortcut</label>
+                <input
+                  id="settings-global-shortcut"
+                  type="text"
+                  value={globalShortcut}
+                  onChange={(e) => {
+                    setGlobalShortcut(e.target.value);
+                    setGlobalShortcutDirty(true);
+                    setGlobalShortcutMessage("");
+                    setGlobalShortcutError("");
+                  }}
+                  placeholder="Disabled (e.g. CommandOrControl+Shift+T)"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              {globalShortcutError ? (
+                <p className="error">{globalShortcutError}</p>
+              ) : null}
+              {globalShortcutMessage ? (
+                <p className="muted">{globalShortcutMessage}</p>
+              ) : null}
+              <div className="actions">
+                <DirtyNote dirty={globalShortcutDirty} />
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={globalShortcutBusy || !globalShortcutDirty}
+                >
+                  {globalShortcutBusy ? "Saving…" : "Save shortcut"}
+                </button>
+                <button
+                  type="button"
+                  disabled={globalShortcutBusy}
+                  onClick={() => {
+                    setGlobalShortcut("");
+                    setGlobalShortcutDirty(false);
+                    setGlobalShortcutMessage("");
+                    setGlobalShortcutError("");
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
             </form>
 
             <form
               className="settings-section"
               onSubmit={(e) => void onSaveAutostart(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Startup</h3>
-                </summary>
+              <h3>Startup</h3>
+              <p className="muted">
+                Start Tobro automatically when you sign in (platform-specific):{" "}
+                <strong>LaunchAgent</strong> on macOS, <strong>Run key</strong>{" "}
+                (HKCU) on Windows, <strong>systemd user unit</strong> on Linux.
+                Changes apply to the OS autostart configuration.{" "}
+                <strong>Start minimized</strong> launches Tobro hidden to the
+                tray (<code>--minimized</code>).
+              </p>
+              {!autostartInfo?.supported ? (
                 <p className="muted">
-                  Start Tobro automatically when you sign in
-                  (platform-specific): <strong>LaunchAgent</strong> on macOS,{" "}
-                  <strong>Run key</strong> (HKCU) on Windows,{" "}
-                  <strong>systemd user unit</strong> on Linux. Changes apply to
-                  the OS autostart configuration.{" "}
-                  <strong>Start minimized</strong> launches Tobro hidden to the
-                  tray (<code>--minimized</code>).
+                  Autostart is not available on this platform.
                 </p>
-                {!autostartInfo?.supported ? (
-                  <p className="muted">
-                    Autostart is not available on this platform.
-                  </p>
-                ) : (
-                  <>
-                    <label
-                      className="checkbox-label"
-                      htmlFor="settings-autostart-enabled"
+              ) : (
+                <>
+                  <label
+                    className="checkbox-label"
+                    htmlFor="settings-autostart-enabled"
+                  >
+                    <input
+                      id="settings-autostart-enabled"
+                      type="checkbox"
+                      checked={autostart?.enabled ?? false}
+                      disabled={autostartBusy || !autostart}
+                      onChange={(e) => {
+                        setAutostartDirty(true);
+                        setAutostart((prev) => ({
+                          enabled: e.target.checked,
+                          start_minimized: prev?.start_minimized ?? false,
+                        }));
+                      }}
+                    />
+                    <span>
+                      <strong>Start at login</strong>
+                    </span>
+                  </label>
+                  <label
+                    className="checkbox-label"
+                    htmlFor="settings-autostart-minimized"
+                  >
+                    <input
+                      id="settings-autostart-minimized"
+                      type="checkbox"
+                      checked={autostart?.start_minimized ?? false}
+                      disabled={autostartBusy || !autostart?.enabled}
+                      onChange={(e) => {
+                        setAutostartDirty(true);
+                        setAutostart((prev) => ({
+                          enabled: prev?.enabled ?? false,
+                          start_minimized: e.target.checked,
+                        }));
+                      }}
+                    />
+                    <span>
+                      <strong>Start minimized</strong> (tray)
+                    </span>
+                  </label>
+                  {autostartInfo ? (
+                    <p className="muted">
+                      Method: {autostartInfo.method}.{" "}
+                      <span className="muted">{autostartInfo.details}</span>
+                    </p>
+                  ) : null}
+                  {autostartError ? (
+                    <p className="error">{autostartError}</p>
+                  ) : null}
+                  {autostartMessage ? (
+                    <p className="muted">{autostartMessage}</p>
+                  ) : null}
+                  <div className="actions">
+                    <DirtyNote dirty={autostartDirty} />
+                    <button
+                      className="primary"
+                      type="submit"
+                      disabled={autostartBusy || !autostart || !autostartDirty}
                     >
-                      <input
-                        id="settings-autostart-enabled"
-                        type="checkbox"
-                        checked={autostart?.enabled ?? false}
-                        disabled={autostartBusy || !autostart}
-                        onChange={(e) =>
-                          setAutostart((prev) => ({
-                            enabled: e.target.checked,
-                            start_minimized: prev?.start_minimized ?? false,
-                          }))
-                        }
-                      />
-                      <span>
-                        <strong>Start at login</strong>
-                      </span>
-                    </label>
-                    <label
-                      className="checkbox-label"
-                      htmlFor="settings-autostart-minimized"
+                      {autostartBusy ? "Saving…" : "Save startup settings"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={autostartBusy}
+                      onClick={() => void loadAutostart()}
                     >
-                      <input
-                        id="settings-autostart-minimized"
-                        type="checkbox"
-                        checked={autostart?.start_minimized ?? false}
-                        disabled={autostartBusy || !autostart?.enabled}
-                        onChange={(e) =>
-                          setAutostart((prev) => ({
-                            enabled: prev?.enabled ?? false,
-                            start_minimized: e.target.checked,
-                          }))
-                        }
-                      />
-                      <span>
-                        <strong>Start minimized</strong> (tray)
-                      </span>
-                    </label>
-                    {autostartInfo ? (
-                      <p className="muted">
-                        Method: {autostartInfo.method}.{" "}
-                        <span className="muted">{autostartInfo.details}</span>
-                      </p>
-                    ) : null}
-                    {autostartError ? (
-                      <p className="error">{autostartError}</p>
-                    ) : null}
-                    {autostartMessage ? (
-                      <p className="muted">{autostartMessage}</p>
-                    ) : null}
-                    <div className="actions">
-                      <button
-                        className="primary"
-                        type="submit"
-                        disabled={autostartBusy || !autostart}
-                      >
-                        {autostartBusy ? "Applying…" : "Apply startup settings"}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={autostartBusy}
-                        onClick={() => void loadAutostart()}
-                      >
-                        Reload
-                      </button>
-                    </div>
-                  </>
-                )}
-              </details>
+                      Reload
+                    </button>
+                  </div>
+                </>
+              )}
             </form>
 
-            <details className="settings-section" open>
-              <summary>
-                <h3>App lock</h3>
-              </summary>
+            <div className="settings-section">
+              <h3>App lock</h3>
               <p className="muted">
                 Lock Tobro to prevent casual access to the UI. Unlock with{" "}
                 <strong>OS authentication</strong> (when supported/integrated)
@@ -2042,9 +2046,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         type="checkbox"
                         checked={appLock.enabled}
                         disabled={appLockBusy || !appLock.has_password}
-                        onChange={(e) =>
-                          setAppLock({ ...appLock, enabled: e.target.checked })
-                        }
+                        onChange={(e) => {
+                          setAppLockDirty(true);
+                          setAppLock({ ...appLock, enabled: e.target.checked });
+                        }}
                       />
                       <span>
                         <strong>Enable app lock</strong>
@@ -2056,12 +2061,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         type="checkbox"
                         checked={appLock.lock_on_idle}
                         disabled={appLockBusy}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setAppLockDirty(true);
                           setAppLock({
                             ...appLock,
                             lock_on_idle: e.target.checked,
-                          })
-                        }
+                          });
+                        }}
                       />
                       <span>Lock on idle</span>
                     </label>
@@ -2076,12 +2082,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         max={240}
                         value={appLock.idle_minutes}
                         disabled={appLockBusy || !appLock.lock_on_idle}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setAppLockDirty(true);
                           setAppLock({
                             ...appLock,
                             idle_minutes: Number(e.target.value) || 5,
-                          })
-                        }
+                          });
+                        }}
                       />
                     </div>
                     <label className="checkbox-label">
@@ -2089,12 +2096,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         type="checkbox"
                         checked={appLock.lock_on_close}
                         disabled={appLockBusy}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setAppLockDirty(true);
                           setAppLock({
                             ...appLock,
                             lock_on_close: e.target.checked,
-                          })
-                        }
+                          });
+                        }}
                       />
                       <span>Lock when window is closed/hidden to tray</span>
                     </label>
@@ -2103,12 +2111,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                         type="checkbox"
                         checked={appLock.prefer_os_auth}
                         disabled={appLockBusy}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setAppLockDirty(true);
                           setAppLock({
                             ...appLock,
                             prefer_os_auth: e.target.checked,
-                          })
-                        }
+                          });
+                        }}
                       />
                       <span>Prefer OS authentication when available</span>
                     </label>
@@ -2116,16 +2125,17 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                       OS auth:{" "}
                       {appLock.os_auth_available
                         ? "available"
-                        : `not available — ${appLock.os_auth_method}`}
+                        : `not available (${appLock.os_auth_method})`}
                       . Password fallback is used when OS auth is unavailable.
                     </p>
                     <div className="actions">
+                      <DirtyNote dirty={appLockDirty} />
                       <button
                         className="primary"
                         type="submit"
-                        disabled={appLockBusy}
+                        disabled={appLockBusy || !appLockDirty}
                       >
-                        Save app lock settings
+                        {appLockBusy ? "Saving…" : "Save app lock settings"}
                       </button>
                       <button
                         type="button"
@@ -2216,327 +2226,309 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               ) : (
                 <p className="muted">Loading app lock settings…</p>
               )}
-            </details>
+            </div>
 
             <form
               className="settings-section port-editor"
               onSubmit={onSavePorts}
             >
-              <details open>
-                <summary>
-                  <h3>Proxy / listener settings</h3>
-                </summary>
-                <p className="muted">
-                  Configure local SOCKS/HTTP and DNS ports. With the current
-                  Arti backend, SOCKS and HTTP share one listener, so HTTP
-                  should match SOCKS (use <code>0</code> to follow SOCKS). By
-                  default listeners bind to loopback only. Active listener
-                  changes require stop/connect.
-                </p>
-                <div className="port-grid">
-                  <label>
-                    SOCKS
-                    <input
-                      type="number"
-                      min={1}
-                      max={65535}
-                      inputMode="numeric"
-                      value={portInputs.socks_port}
-                      onChange={(e) => updatePort("socks_port", e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    HTTP
-                    <input
-                      type="number"
-                      min={0}
-                      max={65535}
-                      inputMode="numeric"
-                      value={portInputs.http_port}
-                      onChange={(e) => updatePort("http_port", e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    DNS
-                    <input
-                      type="number"
-                      min={1}
-                      max={65535}
-                      inputMode="numeric"
-                      value={portInputs.dns_port}
-                      onChange={(e) => updatePort("dns_port", e.target.value)}
-                    />
-                  </label>
-                </div>
-                <div className="bind-all-setting">
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={bindAllInterfaces}
-                      onChange={(e) => onBindAllChange(e.target.checked)}
-                      disabled={portsBusy}
-                    />
-                    Bind listeners to all interfaces (opt-in, dangerous)
-                  </label>
-                  {bindAllInterfaces ? (
-                    <div className="error bind-all-warning" role="alert">
-                      <strong>Security warning / firewall guidance:</strong>{" "}
-                      {BIND_ALL_WARNING}
-                    </div>
-                  ) : (
-                    <p className="muted bind-all-guidance">
-                      Off by default. Enable only if you need other devices on a
-                      trusted network to use this Tor proxy, and restrict access
-                      with firewall rules.
-                    </p>
-                  )}
-                </div>
-                {configPath ? (
-                  <p className="muted config-hint">
-                    Config: <code>{configPath}</code>
-                  </p>
-                ) : null}
-                {portsError ? <p className="error">{portsError}</p> : null}
-                {portsMessage ? <p className="muted">{portsMessage}</p> : null}
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={portsBusy || !portsDirty}
-                  >
-                    {portsBusy ? "Saving…" : "Save proxy settings"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void loadPorts()}
+              <h3>Proxy / listener settings</h3>
+              <p className="muted">
+                Configure local SOCKS/HTTP and DNS ports. With the current Arti
+                backend, SOCKS and HTTP share one listener, so HTTP should match
+                SOCKS (use <code>0</code> to follow SOCKS). By default listeners
+                bind to loopback only. Active listener changes require
+                stop/connect.
+              </p>
+              <div className="port-grid">
+                <label>
+                  SOCKS
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    inputMode="numeric"
+                    value={portInputs.socks_port}
+                    onChange={(e) => updatePort("socks_port", e.target.value)}
+                  />
+                </label>
+                <label>
+                  HTTP
+                  <input
+                    type="number"
+                    min={0}
+                    max={65535}
+                    inputMode="numeric"
+                    value={portInputs.http_port}
+                    onChange={(e) => updatePort("http_port", e.target.value)}
+                  />
+                </label>
+                <label>
+                  DNS
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    inputMode="numeric"
+                    value={portInputs.dns_port}
+                    onChange={(e) => updatePort("dns_port", e.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="bind-all-setting">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={bindAllInterfaces}
+                    onChange={(e) => onBindAllChange(e.target.checked)}
                     disabled={portsBusy}
-                  >
-                    Reload
-                  </button>
-                </div>
-              </details>
+                  />
+                  Bind listeners to all interfaces (opt-in, dangerous)
+                </label>
+                {bindAllInterfaces ? (
+                  <div className="error bind-all-warning" role="alert">
+                    <strong>Security warning / firewall guidance:</strong>{" "}
+                    {BIND_ALL_WARNING}
+                  </div>
+                ) : (
+                  <p className="muted bind-all-guidance">
+                    Off by default. Enable only if you need other devices on a
+                    trusted network to use this Tor proxy, and restrict access
+                    with firewall rules.
+                  </p>
+                )}
+              </div>
+              {configPath ? (
+                <p className="muted config-hint">
+                  Config: <code>{configPath}</code>
+                </p>
+              ) : null}
+              {portsError ? <p className="error">{portsError}</p> : null}
+              {portsMessage ? <p className="muted">{portsMessage}</p> : null}
+              <div className="actions">
+                <DirtyNote dirty={portsDirty} />
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={portsBusy || !portsDirty}
+                >
+                  {portsBusy ? "Saving…" : "Save proxy settings"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void loadPorts()}
+                  disabled={portsBusy}
+                >
+                  Reload
+                </button>
+              </div>
             </form>
 
             <form
               className="settings-section outbound-proxy"
               onSubmit={(e) => void onSaveOutbound(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Outbound proxy (upstream)</h3>
-                </summary>
-                <p className="muted">
-                  Route Tor’s network connections through an upstream proxy.{" "}
-                  <strong>HTTP</strong> (CONNECT) and{" "}
-                  <strong>SOCKS4/SOCKS5</strong> are applied directly to Arti
-                  channels (host must be an IP address with the current
-                  backend). <strong>Shadowsocks</strong> starts a local{" "}
-                  <code>sslocal</code> sidecar and uses it as a local SOCKS5
-                  outbound proxy. Changes require Stop → Connect while Tor is
-                  running.
-                </p>
-                <div className="field-row">
-                  <label htmlFor="outbound-proxy-type">Type</label>
-                  <select
-                    id="outbound-proxy-type"
-                    value={outbound.proxy_type}
-                    disabled={outboundBusy}
-                    onChange={(e) =>
-                      onOutboundChange(
-                        "proxy_type",
-                        e.target.value as OutboundProxyType,
-                      )
-                    }
-                  >
-                    <option value="none">None (direct)</option>
-                    <option value="http">HTTP CONNECT</option>
-                    <option value="https">HTTPS (HTTP CONNECT alias)</option>
-                    <option value="socks4">SOCKS4</option>
-                    <option value="socks5">SOCKS5</option>
-                    <option value="shadowsocks">
-                      Shadowsocks (via sslocal)
-                    </option>
-                  </select>
-                </div>
-                {outbound.proxy_type !== "none" ? (
-                  <>
-                    <div className="field-row">
-                      <label htmlFor="outbound-proxy-host">
-                        {outbound.proxy_type === "shadowsocks"
-                          ? "Shadowsocks server host"
-                          : "Proxy host (IP address)"}
-                      </label>
-                      <input
-                        id="outbound-proxy-host"
-                        type="text"
-                        value={outbound.host}
-                        disabled={outboundBusy}
-                        onChange={(e) =>
-                          onOutboundChange("host", e.target.value)
-                        }
-                        placeholder={
-                          outbound.proxy_type === "shadowsocks"
-                            ? "ss.example.com or 203.0.113.1"
-                            : "127.0.0.1"
-                        }
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                    </div>
-                    <div className="field-row">
-                      <label htmlFor="outbound-proxy-port">
-                        {outbound.proxy_type === "shadowsocks"
-                          ? "Shadowsocks server port"
-                          : "Proxy port"}
-                      </label>
-                      <input
-                        id="outbound-proxy-port"
-                        type="number"
-                        min={1}
-                        max={65535}
-                        inputMode="numeric"
-                        value={outbound.port}
-                        disabled={outboundBusy}
-                        onChange={(e) =>
-                          onOutboundChange("port", e.target.value)
-                        }
-                      />
-                    </div>
-                    {outbound.proxy_type !== "shadowsocks" ? (
-                      <>
+              <h3>Outbound proxy (upstream)</h3>
+              <p className="muted">
+                Route Tor’s network connections through an upstream proxy.{" "}
+                <strong>HTTP</strong> (CONNECT) and{" "}
+                <strong>SOCKS4/SOCKS5</strong> are applied directly to Arti
+                channels (host must be an IP address with the current backend).{" "}
+                <strong>Shadowsocks</strong> starts a local <code>sslocal</code>{" "}
+                sidecar and uses it as a local SOCKS5 outbound proxy. Changes
+                require Stop → Connect while Tor is running.
+              </p>
+              <div className="field-row">
+                <label htmlFor="outbound-proxy-type">Type</label>
+                <select
+                  id="outbound-proxy-type"
+                  value={outbound.proxy_type}
+                  disabled={outboundBusy}
+                  onChange={(e) =>
+                    onOutboundChange(
+                      "proxy_type",
+                      e.target.value as OutboundProxyType,
+                    )
+                  }
+                >
+                  <option value="none">None (direct)</option>
+                  <option value="http">HTTP CONNECT</option>
+                  <option value="https">HTTPS (HTTP CONNECT alias)</option>
+                  <option value="socks4">SOCKS4</option>
+                  <option value="socks5">SOCKS5</option>
+                  <option value="shadowsocks">Shadowsocks (via sslocal)</option>
+                </select>
+              </div>
+              {outbound.proxy_type !== "none" ? (
+                <>
+                  <div className="field-row">
+                    <label htmlFor="outbound-proxy-host">
+                      {outbound.proxy_type === "shadowsocks"
+                        ? "Shadowsocks server host"
+                        : "Proxy host (IP address)"}
+                    </label>
+                    <input
+                      id="outbound-proxy-host"
+                      type="text"
+                      value={outbound.host}
+                      disabled={outboundBusy}
+                      onChange={(e) => onOutboundChange("host", e.target.value)}
+                      placeholder={
+                        outbound.proxy_type === "shadowsocks"
+                          ? "ss.example.com or 203.0.113.1"
+                          : "127.0.0.1"
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="field-row">
+                    <label htmlFor="outbound-proxy-port">
+                      {outbound.proxy_type === "shadowsocks"
+                        ? "Shadowsocks server port"
+                        : "Proxy port"}
+                    </label>
+                    <input
+                      id="outbound-proxy-port"
+                      type="number"
+                      min={1}
+                      max={65535}
+                      inputMode="numeric"
+                      value={outbound.port}
+                      disabled={outboundBusy}
+                      onChange={(e) => onOutboundChange("port", e.target.value)}
+                    />
+                  </div>
+                  {outbound.proxy_type !== "shadowsocks" ? (
+                    <>
+                      <div className="field-row">
+                        <label htmlFor="outbound-proxy-user">
+                          Username (optional)
+                        </label>
+                        <input
+                          id="outbound-proxy-user"
+                          type="text"
+                          value={outbound.username}
+                          disabled={outboundBusy}
+                          onChange={(e) =>
+                            onOutboundChange("username", e.target.value)
+                          }
+                          autoComplete="off"
+                        />
+                      </div>
+                      {outbound.proxy_type !== "socks4" ? (
                         <div className="field-row">
-                          <label htmlFor="outbound-proxy-user">
-                            Username (optional)
+                          <label htmlFor="outbound-proxy-pass">
+                            Password (optional, sensitive)
                           </label>
                           <input
-                            id="outbound-proxy-user"
-                            type="text"
-                            value={outbound.username}
-                            disabled={outboundBusy}
-                            onChange={(e) =>
-                              onOutboundChange("username", e.target.value)
-                            }
-                            autoComplete="off"
-                          />
-                        </div>
-                        {outbound.proxy_type !== "socks4" ? (
-                          <div className="field-row">
-                            <label htmlFor="outbound-proxy-pass">
-                              Password (optional, sensitive)
-                            </label>
-                            <input
-                              id="outbound-proxy-pass"
-                              type="password"
-                              value={outbound.password}
-                              disabled={outboundBusy}
-                              onChange={(e) =>
-                                onOutboundChange("password", e.target.value)
-                              }
-                              autoComplete="new-password"
-                            />
-                          </div>
-                        ) : (
-                          <p className="muted">
-                            SOCKS4 supports a user ID (username) but not
-                            password authentication.
-                          </p>
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        <div className="field-row">
-                          <label htmlFor="outbound-ss-method">
-                            Shadowsocks method
-                          </label>
-                          <input
-                            id="outbound-ss-method"
-                            type="text"
-                            value={outbound.shadowsocks_method}
-                            disabled={outboundBusy}
-                            onChange={(e) =>
-                              onOutboundChange(
-                                "shadowsocks_method",
-                                e.target.value,
-                              )
-                            }
-                            placeholder="aes-256-gcm"
-                            autoComplete="off"
-                            spellCheck={false}
-                          />
-                        </div>
-                        <div className="field-row">
-                          <label htmlFor="outbound-ss-pass">
-                            Shadowsocks password (sensitive)
-                          </label>
-                          <input
-                            id="outbound-ss-pass"
+                            id="outbound-proxy-pass"
                             type="password"
-                            value={outbound.shadowsocks_password}
+                            value={outbound.password}
                             disabled={outboundBusy}
                             onChange={(e) =>
-                              onOutboundChange(
-                                "shadowsocks_password",
-                                e.target.value,
-                              )
+                              onOutboundChange("password", e.target.value)
                             }
                             autoComplete="new-password"
                           />
                         </div>
-                        <div className="field-row">
-                          <label htmlFor="outbound-sslocal-path">
-                            sslocal path (optional)
-                          </label>
-                          <input
-                            id="outbound-sslocal-path"
-                            type="text"
-                            value={outbound.sslocal_path}
-                            disabled={outboundBusy}
-                            onChange={(e) =>
-                              onOutboundChange("sslocal_path", e.target.value)
-                            }
-                            placeholder="Auto-detect (or /path/to/sslocal)"
-                            autoComplete="off"
-                            spellCheck={false}
-                          />
-                        </div>
+                      ) : (
                         <p className="muted">
-                          Requires <code>sslocal</code> from shadowsocks-rust.
-                          The sidecar starts on Connect and is stopped on
-                          Disconnect.
+                          SOCKS4 supports a user ID (username) but not password
+                          authentication.
                         </p>
-                      </>
-                    )}
-                  </>
-                ) : null}
-                {outboundError ? (
-                  <p className="error">{outboundError}</p>
-                ) : null}
-                {outboundMessage ? (
-                  <p className="muted">{outboundMessage}</p>
-                ) : null}
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={outboundBusy || !outboundDirty}
-                  >
-                    {outboundBusy ? "Saving…" : "Save outbound proxy"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={outboundBusy}
-                    onClick={() => void loadConfigState()}
-                  >
-                    Reload
-                  </button>
-                </div>
-              </details>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="field-row">
+                        <label htmlFor="outbound-ss-method">
+                          Shadowsocks method
+                        </label>
+                        <input
+                          id="outbound-ss-method"
+                          type="text"
+                          value={outbound.shadowsocks_method}
+                          disabled={outboundBusy}
+                          onChange={(e) =>
+                            onOutboundChange(
+                              "shadowsocks_method",
+                              e.target.value,
+                            )
+                          }
+                          placeholder="aes-256-gcm"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                      <div className="field-row">
+                        <label htmlFor="outbound-ss-pass">
+                          Shadowsocks password (sensitive)
+                        </label>
+                        <input
+                          id="outbound-ss-pass"
+                          type="password"
+                          value={outbound.shadowsocks_password}
+                          disabled={outboundBusy}
+                          onChange={(e) =>
+                            onOutboundChange(
+                              "shadowsocks_password",
+                              e.target.value,
+                            )
+                          }
+                          autoComplete="new-password"
+                        />
+                      </div>
+                      <div className="field-row">
+                        <label htmlFor="outbound-sslocal-path">
+                          sslocal path (optional)
+                        </label>
+                        <input
+                          id="outbound-sslocal-path"
+                          type="text"
+                          value={outbound.sslocal_path}
+                          disabled={outboundBusy}
+                          onChange={(e) =>
+                            onOutboundChange("sslocal_path", e.target.value)
+                          }
+                          placeholder="Auto-detect (or /path/to/sslocal)"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                      <p className="muted">
+                        Requires <code>sslocal</code> from shadowsocks-rust. The
+                        sidecar starts on Connect and is stopped on Disconnect.
+                      </p>
+                    </>
+                  )}
+                </>
+              ) : null}
+              {outboundError ? <p className="error">{outboundError}</p> : null}
+              {outboundMessage ? (
+                <p className="muted">{outboundMessage}</p>
+              ) : null}
+              <div className="actions">
+                <DirtyNote dirty={outboundDirty} />
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={outboundBusy || !outboundDirty}
+                >
+                  {outboundBusy ? "Saving…" : "Save outbound proxy"}
+                </button>
+                <button
+                  type="button"
+                  disabled={outboundBusy}
+                  onClick={() => void loadConfigState()}
+                >
+                  Reload
+                </button>
+              </div>
             </form>
 
-            <details className="settings-section config-import" open>
-              <summary>
-                <h3>Config import/export (no secrets)</h3>
-              </summary>
+            <div className="settings-section config-import">
+              <h3>Config import/export (no secrets)</h3>
               <p className="muted">
                 Uses the daemon config API. Exports are{" "}
                 <strong>redacted</strong> and contain{" "}
@@ -2628,7 +2620,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </ul>
               ) : null}
               {configError ? <p className="error">{configError}</p> : null}
-            </details>
+            </div>
           </div>
 
           <div
@@ -2645,10 +2637,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               </p>
             </div>
 
-            <details className="settings-section network-prefs" open>
-              <summary>
-                <h3>Exit country / IP version (M2)</h3>
-              </summary>
+            <div className="settings-section network-prefs">
+              <h3>Exit country / IP version (M2)</h3>
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -2703,12 +2693,13 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   <p className="muted">{networkMessage}</p>
                 ) : null}
                 <div className="actions">
+                  <DirtyNote dirty={networkDirty} />
                   <button
                     className="primary"
                     type="submit"
                     disabled={networkBusy || !networkDirty}
                   >
-                    {networkBusy ? "Saving…" : "Save network prefs"}
+                    {networkBusy ? "Saving…" : "Save network settings"}
                   </button>
                   <button
                     type="button"
@@ -2719,12 +2710,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </button>
                 </div>
               </form>
-            </details>
+            </div>
 
-            <details className="settings-section bridge-test" open>
-              <summary>
-                <h3>Transport test &amp; diagnostics</h3>
-              </summary>
+            <div className="settings-section bridge-test">
+              <h3>Transport test &amp; diagnostics</h3>
               <p className="muted">
                 Test a bridge/pluggable transport line before connecting. This
                 runs <strong>local validation</strong> and{" "}
@@ -2889,12 +2878,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   })()}
                 </div>
               ) : null}
-            </details>
+            </div>
 
-            <details className="settings-section node-restrictions" open>
-              <summary>
-                <h3>Unsupported restrictions (hidden)</h3>
-              </summary>
+            <div className="settings-section node-restrictions">
+              <h3>Unsupported restrictions (hidden)</h3>
               <ul className="muted">
                 <li>
                   <strong>Bridges/circumvention:</strong> supported here in Node
@@ -2921,7 +2908,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   configurable in Advanced Tor Configuration.
                 </li>
               </ul>
-            </details>
+            </div>
           </div>
 
           <div
@@ -2938,10 +2925,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 services are loaded when you connect.
               </p>
             </div>
-            <details className="settings-section onion-services" open>
-              <summary>
-                <h3>Onion services</h3>
-              </summary>
+            <div className="settings-section onion-services">
+              <h3>Onion services</h3>
               <p className="muted">
                 Host v3 onion services with local port mappings (
                 <code>virtual port → target host:port</code>). Services and
@@ -3188,12 +3173,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   ) : null}
                 </div>
               </form>
-            </details>
+            </div>
 
-            <details className="settings-section onion-browser-guidance" open>
-              <summary>
-                <h3>Sharing addresses (Tor Browser)</h3>
-              </summary>
+            <div className="settings-section onion-browser-guidance">
+              <h3>Sharing addresses (Tor Browser)</h3>
               <p className="muted">
                 Copy a service&rsquo;s <code>.onion</code> address with
                 &ldquo;Copy address&rdquo; above, then share it over a trusted
@@ -3229,12 +3212,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 also needs the matching <code>.auth_private</code> file from the
                 Client Authorization tab.
               </p>
-            </details>
+            </div>
 
-            <details className="settings-section onion-backup" open>
-              <summary>
-                <h3>Backup &amp; restore (encrypted bundle)</h3>
-              </summary>
+            <div className="settings-section onion-backup">
+              <h3>Backup &amp; restore (encrypted bundle)</h3>
               <p className="muted">
                 Back up onion services and client authorization credentials
                 (including their private keys) as a single encrypted JSON
@@ -3285,7 +3266,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 Restoring requires a restart/reconnect of Tor to apply to
                 running services. {ONION_RESTORE_WARNING}
               </p>
-            </details>
+            </div>
           </div>
 
           <div
@@ -3305,10 +3286,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               </p>
             </div>
 
-            <details className="settings-section client-auth-credentials" open>
-              <summary>
-                <h3>Credentials</h3>
-              </summary>
+            <div className="settings-section client-auth-credentials">
+              <h3>Credentials</h3>
               <p className="muted">
                 Public keys are shown below. Private key material is stored on
                 disk with private permissions and is never displayed in the UI
@@ -3465,184 +3444,170 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   or import an existing <code>.auth_private</code> file.
                 </p>
               )}
-            </details>
+            </div>
 
             <form
               className="settings-section"
               onSubmit={(e) => void onGenerateClientAuth(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Generate credential</h3>
-                </summary>
-                <p className="muted">
-                  Creates a fresh x25519 client credential. A unique suffix is
-                  appended to the nickname. After generating, use{" "}
-                  <strong>Export</strong> to save a <code>.auth_private</code>{" "}
-                  file for the client and <strong>Attach</strong> it to an onion
-                  service to enable restricted discovery.
-                </p>
-                <div className="field-row">
-                  <label htmlFor="client-auth-generate-nickname">
-                    Nickname (optional)
-                  </label>
-                  <input
-                    id="client-auth-generate-nickname"
-                    type="text"
-                    value={clientAuthNickname}
-                    onChange={(e) => {
-                      setClientAuthNickname(e.target.value);
-                      setClientAuthError("");
-                    }}
-                    placeholder="alice-laptop"
-                    disabled={clientAuthBusy}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={clientAuthBusy}
-                  >
-                    {clientAuthBusy ? "Working…" : "Generate credential"}
-                  </button>
-                </div>
-              </details>
+              <h3>Generate credential</h3>
+              <p className="muted">
+                Creates a fresh x25519 client credential. A unique suffix is
+                appended to the nickname. After generating, use{" "}
+                <strong>Export</strong> to save a <code>.auth_private</code>{" "}
+                file for the client and <strong>Attach</strong> it to an onion
+                service to enable restricted discovery.
+              </p>
+              <div className="field-row">
+                <label htmlFor="client-auth-generate-nickname">
+                  Nickname (optional)
+                </label>
+                <input
+                  id="client-auth-generate-nickname"
+                  type="text"
+                  value={clientAuthNickname}
+                  onChange={(e) => {
+                    setClientAuthNickname(e.target.value);
+                    setClientAuthError("");
+                  }}
+                  placeholder="alice-laptop"
+                  disabled={clientAuthBusy}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="actions">
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={clientAuthBusy}
+                >
+                  {clientAuthBusy ? "Working…" : "Generate credential"}
+                </button>
+              </div>
             </form>
 
             <form
               className="settings-section"
               onSubmit={(e) => void onImportClientAuth(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Import credential</h3>
-                </summary>
-                <p className="muted">
-                  Import an existing <code>.auth_private</code> file so this
-                  service host can attach the same client key. Accepts the
-                  standard format:{" "}
-                  <code>
-                    [1:][&lt;hsid&gt;:]descriptor:x25519:&lt;base32 key&gt;
-                  </code>
-                  . Contents are validated and stored with private permissions;
-                  they are never displayed.
-                </p>
-                <div className="field-row">
-                  <label htmlFor="client-auth-import-nickname">Nickname</label>
-                  <input
-                    id="client-auth-import-nickname"
-                    type="text"
-                    value={clientAuthImportNickname}
-                    onChange={(e) =>
-                      setClientAuthImportNickname(e.target.value)
-                    }
-                    placeholder="bob-phone"
-                    disabled={clientAuthBusy}
-                    required
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-                <div className="config-actions">
-                  <button
-                    type="button"
-                    disabled={clientAuthBusy}
-                    onClick={() => clientAuthImportFileRef.current?.click()}
-                  >
-                    Load file…
-                  </button>
-                  <input
-                    ref={clientAuthImportFileRef}
-                    type="file"
-                    accept=".auth_private,.txt,text/plain"
-                    className="sr-only"
-                    onChange={(e) => void onPickAuthPrivateFile(e)}
-                  />
-                </div>
-                <label className="sr-only" htmlFor="client-auth-import-text">
-                  .auth_private contents
-                </label>
-                <textarea
-                  id="client-auth-import-text"
-                  className="config-textarea"
-                  value={clientAuthImportText}
-                  onChange={(e) => setClientAuthImportText(e.target.value)}
-                  placeholder="Paste .auth_private file contents (never shown again after import)"
+              <h3>Import credential</h3>
+              <p className="muted">
+                Import an existing <code>.auth_private</code> file so this
+                service host can attach the same client key. Accepts the
+                standard format:{" "}
+                <code>
+                  [1:][&lt;hsid&gt;:]descriptor:x25519:&lt;base32 key&gt;
+                </code>
+                . Contents are validated and stored with private permissions;
+                they are never displayed.
+              </p>
+              <div className="field-row">
+                <label htmlFor="client-auth-import-nickname">Nickname</label>
+                <input
+                  id="client-auth-import-nickname"
+                  type="text"
+                  value={clientAuthImportNickname}
+                  onChange={(e) => setClientAuthImportNickname(e.target.value)}
+                  placeholder="bob-phone"
+                  disabled={clientAuthBusy}
+                  required
+                  autoComplete="off"
                   spellCheck={false}
-                  rows={3}
                 />
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={clientAuthBusy}
-                  >
-                    {clientAuthBusy ? "Working…" : "Import credential"}
-                  </button>
-                </div>
-              </details>
+              </div>
+              <div className="config-actions">
+                <button
+                  type="button"
+                  disabled={clientAuthBusy}
+                  onClick={() => clientAuthImportFileRef.current?.click()}
+                >
+                  Load file…
+                </button>
+                <input
+                  ref={clientAuthImportFileRef}
+                  type="file"
+                  accept=".auth_private,.txt,text/plain"
+                  className="sr-only"
+                  onChange={(e) => void onPickAuthPrivateFile(e)}
+                />
+              </div>
+              <label className="sr-only" htmlFor="client-auth-import-text">
+                .auth_private contents
+              </label>
+              <textarea
+                id="client-auth-import-text"
+                className="config-textarea"
+                value={clientAuthImportText}
+                onChange={(e) => setClientAuthImportText(e.target.value)}
+                placeholder="Paste .auth_private file contents (never shown again after import)"
+                spellCheck={false}
+                rows={3}
+              />
+              <div className="actions">
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={clientAuthBusy}
+                >
+                  {clientAuthBusy ? "Working…" : "Import credential"}
+                </button>
+              </div>
             </form>
 
             <form
               className="settings-section"
               onSubmit={(e) => void onExportClientAuth(e)}
             >
-              <details open>
-                <summary>
-                  <h3>Export .auth_private</h3>
-                </summary>
-                <p className="muted">
-                  Saves a standard <code>.auth_private</code> key file (
-                  <code>&lt;hsid&gt;:descriptor:x25519:&lt;key&gt;</code>) as a
-                  download for the client. The target <code>.onion</code>{" "}
-                  address can be omitted only when the credential is attached to
-                  a service with a published address.
-                </p>
-                <div className="field-row">
-                  <label htmlFor="client-auth-export-id">Credential</label>
-                  <select
-                    id="client-auth-export-id"
-                    value={clientAuthExportId}
-                    disabled={clientAuthBusy}
-                    onChange={(e) => setClientAuthExportId(e.target.value)}
-                    required
-                  >
-                    <option value="">Choose credential…</option>
-                    {clientAuthCreds.map((cred) => (
-                      <option key={cred.id} value={cred.id}>
-                        {cred.nickname}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field-row">
-                  <label htmlFor="client-auth-export-address">
-                    Target .onion address (optional)
-                  </label>
-                  <input
-                    id="client-auth-export-address"
-                    type="text"
-                    value={clientAuthExportAddress}
-                    onChange={(e) => setClientAuthExportAddress(e.target.value)}
-                    placeholder="example….onion"
-                    disabled={clientAuthBusy}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="submit"
-                    disabled={clientAuthBusy}
-                  >
-                    {clientAuthBusy ? "Working…" : "Export .auth_private"}
-                  </button>
-                </div>
-              </details>
+              <h3>Export .auth_private</h3>
+              <p className="muted">
+                Saves a standard <code>.auth_private</code> key file (
+                <code>&lt;hsid&gt;:descriptor:x25519:&lt;key&gt;</code>) as a
+                download for the client. The target <code>.onion</code> address
+                can be omitted only when the credential is attached to a service
+                with a published address.
+              </p>
+              <div className="field-row">
+                <label htmlFor="client-auth-export-id">Credential</label>
+                <select
+                  id="client-auth-export-id"
+                  value={clientAuthExportId}
+                  disabled={clientAuthBusy}
+                  onChange={(e) => setClientAuthExportId(e.target.value)}
+                  required
+                >
+                  <option value="">Choose credential…</option>
+                  {clientAuthCreds.map((cred) => (
+                    <option key={cred.id} value={cred.id}>
+                      {cred.nickname}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field-row">
+                <label htmlFor="client-auth-export-address">
+                  Target .onion address (optional)
+                </label>
+                <input
+                  id="client-auth-export-address"
+                  type="text"
+                  value={clientAuthExportAddress}
+                  onChange={(e) => setClientAuthExportAddress(e.target.value)}
+                  placeholder="example….onion"
+                  disabled={clientAuthBusy}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="actions">
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={clientAuthBusy}
+                >
+                  {clientAuthBusy ? "Working…" : "Export .auth_private"}
+                </button>
+              </div>
             </form>
           </div>
 
@@ -3659,10 +3624,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               </p>
             </div>
 
-            <details className="settings-section stream-isolation" open>
-              <summary>
-                <h3>Stream isolation (F-42/F-43)</h3>
-              </summary>
+            <div className="settings-section stream-isolation">
+              <h3>Stream isolation (F-42/F-43)</h3>
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -3739,6 +3702,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   <p className="muted">{streamMessage}</p>
                 ) : null}
                 <div className="actions">
+                  <DirtyNote dirty={streamDirty} />
                   <button
                     className="primary"
                     type="submit"
@@ -3755,7 +3719,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   </button>
                 </div>
               </form>
-            </details>
+            </div>
           </div>
         </div>
       )}
