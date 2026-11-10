@@ -11,6 +11,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 use tobro_config::{OutboundProxyConfig, OutboundProxyType};
+use tobro_store::SecretStore;
 use tobro_tor::adapter::OutboundProxySettings;
 
 use crate::pt_supervisor;
@@ -63,6 +64,74 @@ impl Drop for SslocalHandle {
             wait.abort();
         }
     }
+}
+
+/// Keychain keys under which the daemon stores outbound proxy secrets.
+pub(crate) const KEYCHAIN_KEY_OUTBOUND_PASSWORD: &str = "outbound_proxy/password";
+pub(crate) const KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD: &str = "outbound_proxy/shadowsocks_password";
+
+/// Overlay OS-keychain secrets onto an outbound proxy config.
+///
+/// Returns the config unchanged when `outbound_proxy.password_keychain` is
+/// false. When keychain mode is on, this produces the *effective* config view
+/// for backend consumption: the plaintext password fields are filled from the
+/// keychain (missing entries stay empty) and `password_keychain` is cleared,
+/// so downstream validation (e.g. inside `sslocal` startup) operates on the
+/// same plaintext secret view the file-based config would have had. A
+/// configured-but-missing Shadowsocks secret fails loudly: config validation
+/// deliberately skips the plaintext-required check in keychain mode, so the
+/// loss of the keychain entry must surface at resolution time. Callers must
+/// keep this merged view out of IPC/logs; only the on-disk marker config is
+/// secretless.
+pub(crate) fn overlay_keychain_secrets(
+    cfg: &OutboundProxyConfig,
+    secrets: Option<&dyn SecretStore>,
+) -> Result<OutboundProxyConfig, String> {
+    if !cfg.password_keychain {
+        return Ok(cfg.clone());
+    }
+    let Some(store) = secrets else {
+        return Err(
+            "outbound_proxy.password_keychain is enabled but this daemon has no OS keychain support"
+                .to_owned(),
+        );
+    };
+    let mut merged = cfg.clone();
+    let password = store
+        .get(KEYCHAIN_KEY_OUTBOUND_PASSWORD)
+        .map_err(|e| format!("OS keychain read failed: {e}"))?;
+    if let Some(value) = password {
+        merged.password = value.to_string();
+    }
+    let ss_password = store
+        .get(KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD)
+        .map_err(|e| format!("OS keychain read failed: {e}"))?;
+    if let Some(value) = ss_password {
+        merged.shadowsocks_password = value.to_string();
+    }
+    if merged.needs_sslocal() && merged.effective_shadowsocks_password().is_empty() {
+        return Err(
+            "outbound_proxy.password_keychain is enabled but the OS keychain has no Shadowsocks password; set it via outbound_proxy.set_password"
+                .to_owned(),
+        );
+    }
+    // The merged view is "what a plaintext file would have contained", so the
+    // keychain marker is cleared for backend-facing validation and use.
+    merged.password_keychain = false;
+    Ok(merged)
+}
+
+/// [`resolve_static_outbound_proxy`] with OS-keychain secret overlay.
+///
+/// `secrets` should carry the daemon's `SecretStore`; `None` (as in some
+/// tests/tools) means keychain mode cannot be resolved and errors when the
+/// config requests it.
+pub(crate) fn resolve_static_outbound_proxy_with_secrets(
+    cfg: &OutboundProxyConfig,
+    secrets: Option<&dyn SecretStore>,
+) -> Result<OutboundProxySettings, String> {
+    let cfg = overlay_keychain_secrets(cfg, secrets)?;
+    resolve_static_outbound_proxy(&cfg)
 }
 
 /// Resolve an outbound proxy that can be determined from config alone (HTTP/SOCKS/direct).
@@ -282,4 +351,99 @@ fn locate_sslocal(
     pt_supervisor::locate(&opts)
         .map(|f| f.path)
         .context("could not locate sslocal for Shadowsocks outbound proxy (set outbound_proxy.sslocal_path/sslocal_dir or install shadowsocks-rust)")
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tobro_store::MemorySecretStore;
+
+    fn keychain_free() -> OutboundProxyConfig {
+        OutboundProxyConfig {
+            proxy_type: OutboundProxyType::Socks5,
+            host: "10.20.30.40".to_owned(),
+            port: 1080,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            ..OutboundProxyConfig::default()
+        }
+    }
+
+    fn keychain_mode() -> OutboundProxyConfig {
+        OutboundProxyConfig {
+            proxy_type: OutboundProxyType::Socks5,
+            host: "10.20.30.40".to_owned(),
+            port: 1080,
+            username: "user".to_owned(),
+            password_keychain: true,
+            ..OutboundProxyConfig::default()
+        }
+    }
+
+    #[test]
+    fn overlay_leaves_plaintext_configs_untouched() {
+        let cfg = keychain_free();
+        let merged = overlay_keychain_secrets(&cfg, None).expect("overlay");
+        assert_eq!(merged.password, "pass");
+        assert!(!merged.password_keychain);
+    }
+
+    #[test]
+    fn overlay_fills_secrets_from_keychain() {
+        let store = MemorySecretStore::default();
+        store
+            .set(KEYCHAIN_KEY_OUTBOUND_PASSWORD, "keychain-pass")
+            .expect("set");
+        let cfg = keychain_mode();
+        let merged = overlay_keychain_secrets(&cfg, Some(&store)).expect("overlay");
+        assert_eq!(merged.password, "keychain-pass");
+        assert!(!merged.password_keychain);
+        let settings =
+            resolve_static_outbound_proxy_with_secrets(&cfg, Some(&store)).expect("resolve");
+        assert!(settings.proxy.is_some());
+        assert_eq!(
+            settings.summary.as_deref(),
+            Some("socks5://<auth>@10.20.30.40:1080"),
+            "resolved settings must use the keychain secret (masked summary)"
+        );
+    }
+
+    #[test]
+    fn resolve_without_store_fails_loudly_in_keychain_mode() {
+        let cfg = keychain_mode();
+        let err = resolve_static_outbound_proxy_with_secrets(&cfg, None).expect_err("must fail");
+        assert!(
+            err.contains("no OS keychain support"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_reports_missing_shadowsocks_keychain_secret() {
+        let store = MemorySecretStore::default();
+        let cfg = OutboundProxyConfig {
+            proxy_type: OutboundProxyType::Shadowsocks,
+            host: "10.20.30.40".to_owned(),
+            port: 8388,
+            password_keychain: true,
+            ..OutboundProxyConfig::default()
+        };
+        // Config-level validation must accept the missing plaintext secret.
+        assert!(cfg.validate().is_ok());
+        let err = overlay_keychain_secrets(&cfg, Some(&store)).expect_err("must fail");
+        assert!(
+            err.contains("no Shadowsocks password"),
+            "unexpected error: {err}"
+        );
+        // And validation after the overlay cleared the marker passes on the
+        // merged view when the secret is present.
+        store
+            .set(KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD, "ss-pass")
+            .expect("set");
+        let merged = overlay_keychain_secrets(&cfg, Some(&store)).expect("overlay");
+        assert!(!merged.password_keychain);
+        assert_eq!(merged.effective_shadowsocks_password(), "ss-pass");
+        assert!(merged.validate().is_ok());
+    }
 }

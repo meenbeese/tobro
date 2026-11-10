@@ -73,6 +73,14 @@ pub mod methods {
     /// Test a bridge/pluggable transport line and return diagnostics (no bridge material leaked).
     pub const BRIDGES_TEST: &str = "bridges.test";
 
+    /// Store an outbound proxy secret in the OS keychain (`outbound_proxy.set_password`):
+    /// `{"kind": "proxy"|"shadowsocks", "password": "..."}`. Also flips the
+    /// config to keychain mode; the config file never receives the secret.
+    pub const OUTBOUND_PROXY_SET_PASSWORD: &str = "outbound_proxy.set_password";
+    /// Remove an outbound proxy secret from the OS keychain. Disables keychain
+    /// mode when no keychain secret remains.
+    pub const OUTBOUND_PROXY_CLEAR_PASSWORD: &str = "outbound_proxy.clear_password";
+
     /// List hosted onion services.
     pub const ONION_LIST: &str = "onion.list";
     /// Create a hosted onion service.
@@ -121,6 +129,8 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::CONFIG_VALIDATE
             | methods::CONFIG_APPLY
             | methods::BRIDGES_TEST
+            | methods::OUTBOUND_PROXY_SET_PASSWORD
+            | methods::OUTBOUND_PROXY_CLEAR_PASSWORD
             | methods::ONION_LIST
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
@@ -167,6 +177,35 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
                     "missing required \"patch\" object",
                 )),
             }
+        }
+        methods::OUTBOUND_PROXY_SET_PASSWORD => {
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected params object: {\"password\": \"...\", \"kind\": \"proxy\"|\"shadowsocks\"}",
+                ));
+            };
+            if !matches!(map.get("password"), Some(Value::String(p)) if !p.is_empty()) {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "missing required \"password\" (non-empty string)",
+                ));
+            }
+            validate_outbound_key_kind(method, map.get("kind"))?;
+            Ok(())
+        }
+        methods::OUTBOUND_PROXY_CLEAR_PASSWORD => {
+            if params.is_none() {
+                return Ok(());
+            }
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected optional params object: {\"kind\": \"proxy\"|\"shadowsocks\"}",
+                ));
+            };
+            validate_outbound_key_kind(method, map.get("kind"))?;
+            Ok(())
         }
         methods::BRIDGES_TEST => {
             let Some(Value::Object(map)) = params else {
@@ -353,6 +392,25 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Validate the optional `kind` selector ("proxy" | "shadowsocks") used by
+/// the outbound proxy secret methods.
+fn validate_outbound_key_kind(method: &str, kind: Option<&Value>) -> Result<(), RpcError> {
+    match kind {
+        None => Ok(()),
+        Some(Value::String(s)) if s == "proxy" || s == "shadowsocks" => Ok(()),
+        Some(Value::String(s)) => Err(RpcError::invalid_params(
+            method,
+            format!(
+                "unknown outbound proxy secret kind {s:?}; expected \"proxy\" or \"shadowsocks\""
+            ),
+        )),
+        Some(_) => Err(RpcError::invalid_params(
+            method,
+            "\"kind\" must be a string: \"proxy\" or \"shadowsocks\"",
+        )),
     }
 }
 

@@ -129,8 +129,13 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         .with_context(|| format!("failed to bind IPC at {}", socket_path.display()))?;
 
     let bridge_settings = resolve_bridge_settings(&config.bridges, Some(&state_dir));
-    let outbound_proxy = outbound::resolve_static_outbound_proxy(&config.outbound_proxy)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let secrets: std::sync::Arc<dyn tobro_store::SecretStore> =
+        std::sync::Arc::new(tobro_store::KeychainStore::default());
+    let outbound_proxy = outbound::resolve_static_outbound_proxy_with_secrets(
+        &config.outbound_proxy,
+        Some(secrets.as_ref()),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // Kindness mode (M6, F-60): run the snowflake-proxy sidecar when enabled.
     // A missing/unverifiable binary logs a warning and the daemon continues
@@ -191,6 +196,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         config_path.clone(),
         state_dir.clone(),
         std::sync::Arc::clone(&listeners),
+        secrets,
     );
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();

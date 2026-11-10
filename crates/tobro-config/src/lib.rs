@@ -412,9 +412,16 @@ pub struct OutboundProxyConfig {
     #[serde(default = "default_shadowsocks_method")]
     pub shadowsocks_method: String,
     /// Shadowsocks remote password. Sensitive. Falls back to `password` when empty
-    /// for compatibility with simple clients.
+    /// (`effective_shadowsocks_password`) for compatibility with simple clients.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub shadowsocks_password: String,
+    /// When true, outbound proxy secrets (`password`, `shadowsocks_password`)
+    /// live in the OS keychain instead of this config file. The on-disk
+    /// password fields must be empty when enabled; the secret itself is set
+    /// or cleared over IPC (`outbound_proxy.set_password` /
+    /// `outbound_proxy.clear_password`), never included in config patches.
+    #[serde(default)]
+    pub password_keychain: bool,
     /// Optional `sslocal` binary path override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sslocal_path: Option<String>,
@@ -435,6 +442,7 @@ impl Default for OutboundProxyConfig {
             port: 0,
             username: String::new(),
             password: String::new(),
+            password_keychain: false,
             shadowsocks_method: default_shadowsocks_method(),
             shadowsocks_password: String::new(),
             sslocal_path: None,
@@ -528,6 +536,13 @@ impl OutboundProxyConfig {
                 "outbound_proxy.sslocal_dir must not be empty when set".to_owned(),
             ));
         }
+        if self.password_keychain
+            && (!self.password.trim().is_empty() || !self.shadowsocks_password.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "outbound_proxy.password_keychain is enabled: remove the plaintext outbound_proxy.password/shadowsocks_password from the config; secrets live in the OS keychain and are set via outbound_proxy.set_password".to_owned(),
+            ));
+        }
         match self.normalized_proxy_type() {
             OutboundProxyType::None => {}
             OutboundProxyType::Http | OutboundProxyType::Socks4 | OutboundProxyType::Socks5 => {
@@ -559,7 +574,7 @@ impl OutboundProxyConfig {
                             .to_owned(),
                     ));
                 }
-                if self.effective_shadowsocks_password().is_empty() {
+                if self.effective_shadowsocks_password().is_empty() && !self.password_keychain {
                     return Err(ConfigError::Invalid(
                         "outbound_proxy.shadowsocks_password (or password) must be set for Shadowsocks"
                             .to_owned(),
@@ -1251,6 +1266,40 @@ mod tests {
         let path = dir.path().join("missing.toml");
         let loaded = Config::load_or_default(&path)?;
         assert_eq!(loaded, Config::default());
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_keychain_mode_validates() {
+        let mut config = Config::default();
+        config.outbound_proxy.proxy_type = OutboundProxyType::Shadowsocks;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 8388;
+        // Shadowsocks without plaintext secret and without keychain → error.
+        assert!(config.validate().is_err());
+        // Keychain mode may omit the plaintext secret.
+        config.outbound_proxy.password_keychain = true;
+        assert!(config.validate().is_ok());
+        // Keychain mode must not coexist with a plaintext secret.
+        config.outbound_proxy.shadowsocks_password = "ss-pass".to_owned();
+        assert!(config.validate().is_err());
+        config.outbound_proxy.shadowsocks_password = String::new();
+        config.outbound_proxy.password = "proxy-pass".to_owned();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn outbound_keychain_marker_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.outbound_proxy.proxy_type = OutboundProxyType::Socks5;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 1080;
+        config.outbound_proxy.password_keychain = true;
+        config.save(&path)?;
+        let loaded = Config::load(&path)?;
+        assert!(loaded.outbound_proxy.password_keychain);
         Ok(())
     }
 

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tobro_store::SecretStore;
 use tokio::sync::broadcast;
 
 use tobro_ipc::{
@@ -222,6 +223,16 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     fn reload_config(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Test bridge/pluggable transport line(s) and return safe diagnostics.
     fn bridges_test(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Store an outbound proxy secret in the OS keychain (keychain mode on).
+    fn outbound_set_password(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Remove an outbound proxy secret from the OS keychain.
+    fn outbound_clear_password(
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
@@ -444,12 +455,32 @@ fn config_apply_patch(
     patch: &serde_json::Value,
     running: bool,
     listeners: &Arc<RwLock<ListenerConfig>>,
+    secrets: Option<&dyn SecretStore>,
 ) -> Result<serde_json::Value, String> {
     let (current, next) = merged_config(path, patch)?;
     let effects = config_effects(&current, &next, running);
+    // Keychain lifecycle: leaving keychain mode removes the stored secrets.
+    if current.outbound_proxy.password_keychain
+        && !next.outbound_proxy.password_keychain
+        && let Some(store) = secrets
+    {
+        for key in [
+            crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD,
+            crate::outbound::KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD,
+        ] {
+            if let Err(error) = store.delete(key) {
+                tracing::warn!(
+                    %error,
+                    key,
+                    "could not remove outbound proxy secret from the OS keychain"
+                );
+            }
+        }
+    }
     next.save(path)
         .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
-    let outbound_proxy = crate::outbound::resolve_static_outbound_proxy(&next.outbound_proxy)?;
+    let outbound_proxy =
+        crate::outbound::resolve_static_outbound_proxy_with_secrets(&next.outbound_proxy, secrets)?;
     let next_listeners = ListenerConfig {
         socks_port: next.proxy.socks_port,
         http_port: next.proxy.effective_http_port(),
@@ -511,6 +542,144 @@ fn config_apply_patch(
             "summary": next.stream.isolation_summary(),
         },
         "effects": effects,
+    }))
+}
+
+/// The optional `kind` selector shared by the outbound secret IPC methods.
+fn outbound_secret_kind(params: &serde_json::Value) -> Result<&'static str, String> {
+    match params.get("kind") {
+        None | Some(Value::Null) => Ok("proxy"),
+        Some(Value::String(s)) if s == "proxy" => Ok("proxy"),
+        Some(Value::String(s)) if s == "shadowsocks" => Ok("shadowsocks"),
+        Some(other) => Err(format!(
+            "\"kind\" must be \"proxy\" or \"shadowsocks\", got {other}"
+        )),
+    }
+}
+
+fn outbound_keychain_key(kind: &str) -> &'static str {
+    if kind == "shadowsocks" {
+        crate::outbound::KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD
+    } else {
+        crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD
+    }
+}
+
+fn outbound_set_password_at(
+    path: &std::path::Path,
+    secrets: &dyn SecretStore,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let kind = outbound_secret_kind(params)?;
+    let key = outbound_keychain_key(kind);
+    let Some(Value::String(secret)) = params.get("password") else {
+        return Err("missing required \"password\" (string)".to_owned());
+    };
+    if secret.is_empty() {
+        return Err(
+            "\"password\" must be non-empty; use outbound_proxy.clear_password to remove a secret"
+                .to_owned(),
+        );
+    }
+    const MAX_SECRET_LEN: usize = 2048;
+    if secret.len() > MAX_SECRET_LEN {
+        return Err(format!(
+            "\"password\" is too long ({MAX_SECRET_LEN} character limit)"
+        ));
+    }
+    if kind == "proxy" {
+        // Ensure the effective config would actually use an auth password
+        // (SOCKS4 ignores passwords by design; validation excludes it).
+        let config = load_current_config(path)?;
+        match config.outbound_proxy.normalized_proxy_type() {
+            tobro_config::OutboundProxyType::Socks4 => {
+                return Err("outbound_proxy.password is not supported for SOCKS4; use SOCKS5 or HTTP if authentication is required".to_owned());
+            }
+            tobro_config::OutboundProxyType::None => {
+                return Err("no outbound proxy is configured; set outbound_proxy.proxy_type/host/port before storing a password".to_owned());
+            }
+            _ => {}
+        }
+    }
+    if let Err(error) = secrets.set(key, secret) {
+        return Err(format!(
+            "could not store the secret in the OS keychain: {error}"
+        ));
+    }
+
+    // Flip keychain mode in the on-disk config. The plaintext fields must be
+    // empty or the save is rejected (fail loud: legacy plaintext must be
+    // removed from config.toml by the user, not silently overwritten).
+    let mut config = load_current_config(path)?;
+    if !config.outbound_proxy.password.trim().is_empty()
+        || !config.outbound_proxy.shadowsocks_password.trim().is_empty()
+    {
+        tracing::info!(
+            "outbound proxy secret stored in the OS keychain; existing plaintext password still present in config"
+        );
+    }
+    config.outbound_proxy.password_keychain = true;
+    config
+        .validate()
+        .map_err(|e| format!("config is invalid with keychain mode enabled: {e} (remove the plaintext outbound_proxy.password/shadowsocks_password from config.toml); the keychain secret was stored"))?;
+    config
+        .save(path)
+        .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
+    tracing::info!(
+        kind,
+        "outbound proxy secret stored in the OS keychain (keychain mode enabled)"
+    );
+    Ok(json!({
+        "ok": true,
+        "action": "outbound_proxy.set_password",
+        "kind": kind,
+        "path": path.display().to_string(),
+        "keychain": true,
+        "config": redacted_config_value(&config)?,
+    }))
+}
+
+fn outbound_clear_password_at(
+    path: &std::path::Path,
+    secrets: &dyn SecretStore,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let kind = outbound_secret_kind(params)?;
+    if let Err(error) = secrets.delete(outbound_keychain_key(kind)) {
+        return Err(format!(
+            "could not remove the secret from the OS keychain: {error}"
+        ));
+    }
+    let mut config = load_current_config(path)?;
+    // Keychain mode remains on while any other keychain secret is still in use.
+    let other_key = if kind == "shadowsocks" {
+        crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD
+    } else {
+        crate::outbound::KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD
+    };
+    let still_stored = secrets
+        .get(other_key)
+        .map_err(|e| format!("OS keychain read failed: {e}"))?
+        .is_some();
+    config.outbound_proxy.password_keychain = still_stored;
+    config
+        .validate()
+        .map_err(|e| format!("config is invalid after clearing the keychain secret: {e}"))?;
+    config
+        .save(path)
+        .map_err(|e| format!("failed to save {}: {e}", path.display()))?;
+    tracing::info!(
+        kind,
+        kind_still_stored = still_stored,
+        "outbound proxy secret removed from the OS keychain"
+    );
+    Ok(json!({
+        "ok": true,
+        "action": "outbound_proxy.clear_password",
+        "kind": kind,
+        "path": path.display().to_string(),
+        "keychain": still_stored,
+        "config": redacted_config_value(&config)?,
     }))
 }
 
@@ -687,6 +856,7 @@ pub struct SupervisorControl {
     state_dir: std::path::PathBuf,
     listeners: Arc<RwLock<ListenerConfig>>,
     outbound_sidecar: Arc<tokio::sync::Mutex<Option<crate::outbound::SslocalHandle>>>,
+    secrets: Arc<dyn SecretStore>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -705,6 +875,7 @@ impl SupervisorControl {
         config_path: std::path::PathBuf,
         state_dir: std::path::PathBuf,
         listeners: Arc<RwLock<ListenerConfig>>,
+        secrets: Arc<dyn SecretStore>,
     ) -> Self {
         Self {
             handle,
@@ -712,6 +883,7 @@ impl SupervisorControl {
             state_dir,
             listeners,
             outbound_sidecar: Arc::new(tokio::sync::Mutex::new(None)),
+            secrets,
         }
     }
 
@@ -803,7 +975,10 @@ impl DaemonControl for SupervisorControl {
 
         if config.outbound_proxy.needs_sslocal() {
             let sidecar = crate::outbound::start_sslocal_and_resolve(
-                &config.outbound_proxy,
+                &crate::outbound::overlay_keychain_secrets(
+                    &config.outbound_proxy,
+                    Some(self.secrets.as_ref()),
+                )?,
                 Some(&state_dir),
             )
             .await
@@ -811,8 +986,10 @@ impl DaemonControl for SupervisorControl {
             listeners.outbound_proxy = sidecar.outbound_settings().map_err(|e| e.to_string())?;
             *self.outbound_sidecar.lock().await = Some(sidecar);
         } else {
-            listeners.outbound_proxy =
-                crate::outbound::resolve_static_outbound_proxy(&config.outbound_proxy)?;
+            listeners.outbound_proxy = crate::outbound::resolve_static_outbound_proxy_with_secrets(
+                &config.outbound_proxy,
+                Some(self.secrets.as_ref()),
+            )?;
         }
 
         match self
@@ -858,16 +1035,20 @@ impl DaemonControl for SupervisorControl {
     async fn config_apply(&self, patch: serde_json::Value) -> Result<serde_json::Value, String> {
         let path = self.config_path.clone();
         let listeners = Arc::clone(&self.listeners);
+        let secrets = Arc::clone(&self.secrets);
         let snapshot = self.handle.snapshot();
         let running = is_runtime_active(&snapshot.state);
-        tokio::task::spawn_blocking(move || config_apply_patch(&path, &patch, running, &listeners))
-            .await
-            .map_err(|e| format!("config task failed: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            config_apply_patch(&path, &patch, running, &listeners, Some(secrets.as_ref()))
+        })
+        .await
+        .map_err(|e| format!("config task failed: {e}"))?
     }
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
         let path = self.config_path.clone();
         let listeners = Arc::clone(&self.listeners);
+        let secrets = Arc::clone(&self.secrets);
         let snapshot = self.handle.snapshot();
         let running = !matches!(
             snapshot.state,
@@ -880,7 +1061,11 @@ impl DaemonControl for SupervisorControl {
                 .validate()
                 .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
             let warnings = tobro_config::proxy_warnings(&config.proxy);
-            let outbound_proxy = crate::outbound::resolve_static_outbound_proxy(&config.outbound_proxy)
+            let outbound_proxy =
+                crate::outbound::resolve_static_outbound_proxy_with_secrets(
+                    &config.outbound_proxy,
+                    Some(secrets.as_ref()),
+                )
                 .map_err(|e| format!("invalid outbound proxy: {e}"))?;
             let next = ListenerConfig {
                 socks_port: config.proxy.socks_port,
@@ -956,6 +1141,32 @@ impl DaemonControl for SupervisorControl {
         tokio::task::spawn_blocking(move || bridges_test_at(&path, &state_dir, running, &params))
             .await
             .map_err(|e| format!("bridge test task failed: {e}"))?
+    }
+
+    async fn outbound_set_password(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let secrets = Arc::clone(&self.secrets);
+        tokio::task::spawn_blocking(move || {
+            outbound_set_password_at(&path, secrets.as_ref(), &params)
+        })
+        .await
+        .map_err(|e| format!("outbound secret task failed: {e}"))?
+    }
+
+    async fn outbound_clear_password(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let secrets = Arc::clone(&self.secrets);
+        tokio::task::spawn_blocking(move || {
+            outbound_clear_password_at(&path, secrets.as_ref(), &params)
+        })
+        .await
+        .map_err(|e| format!("outbound secret task failed: {e}"))?
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -1104,6 +1315,20 @@ impl DaemonControl for SupervisorHandle {
 
     async fn bridges_test(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("bridge testing requires daemon config/state context".to_owned())
+    }
+
+    async fn outbound_set_password(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("outbound proxy secrets require daemon config context".to_owned())
+    }
+
+    async fn outbound_clear_password(
+        &self,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("outbound proxy secrets require daemon config context".to_owned())
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -1571,6 +1796,24 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::OUTBOUND_PROXY_SET_PASSWORD => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.outbound_set_password(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
+        methods::OUTBOUND_PROXY_CLEAR_PASSWORD => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.outbound_clear_password(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::new(tobro_ipc::codes::INVALID_PARAMS, e))
+                }
+            }
+        }
         methods::ONION_LIST => match control.onion_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
@@ -1834,6 +2077,20 @@ mod daemon_tests {
             _params: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "bridges.test", "mock": true, "diagnostics": [] }))
+        }
+
+        async fn outbound_set_password(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "outbound_proxy.set_password", "mock": true }))
+        }
+
+        async fn outbound_clear_password(
+            &self,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "outbound_proxy.clear_password", "mock": true }))
         }
 
         async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -2137,6 +2394,7 @@ mod config_tests {
             &json!({ "proxy": { "socks_port": 19050, "http_port": 0, "dns_port": 19053 } }),
             false,
             &listeners,
+            None,
         )
         .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
@@ -2146,6 +2404,147 @@ mod config_tests {
         let loaded = tobro_config::Config::load(&path)?;
         assert_eq!(loaded.proxy.socks_port, 19050);
         assert_eq!(listeners.read().unwrap().socks_port, 19050);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_set_and_clear_keychain_password_lifecycle() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = tobro_config::Config::default();
+        config.outbound_proxy.proxy_type = tobro_config::OutboundProxyType::Socks5;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 1080;
+        config.save(&path)?;
+        let store = tobro_store::MemorySecretStore::default();
+
+        // Setting a secret flips keychain mode in the config without ever
+        // writing the secret into the file/patch.
+        let result = outbound_set_password_at(&path, &store, &json!({ "password": "top-secret" }))
+            .map_err(|e| e.to_string())?;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["keychain"], true);
+        let loaded = tobro_config::Config::load(&path)?;
+        assert!(loaded.outbound_proxy.password_keychain);
+        assert!(loaded.outbound_proxy.password.is_empty());
+        assert!(
+            store
+                .get(crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD)?
+                .is_some(),
+            "keychain entry must exist"
+        );
+
+        let result = outbound_set_password_at(
+            &path,
+            &store,
+            &json!({ "kind": "shadowsocks", "password": "ss-secret" }),
+        )
+        .map_err(|e| e.to_string())?;
+        assert_eq!(result["keychain"], true);
+
+        // Clearing one kind keeps keychain mode while the other remains.
+        let result =
+            outbound_clear_password_at(&path, &store, &json!({})).map_err(|e| e.to_string())?;
+        assert_eq!(result["keychain"], true);
+        assert!(
+            store
+                .get(crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD)?
+                .is_none(),
+        );
+        assert!(
+            store
+                .get(crate::outbound::KEYCHAIN_KEY_SHADOWSOCKS_PASSWORD)?
+                .is_some(),
+        );
+
+        // Clearing the last secret disables keychain mode.
+        let result = outbound_clear_password_at(&path, &store, &json!({ "kind": "shadowsocks" }))
+            .map_err(|e| e.to_string())?;
+        assert_eq!(result["keychain"], false);
+        let loaded = tobro_config::Config::load(&path)?;
+        assert!(!loaded.outbound_proxy.password_keychain);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_keychain_toggle_off_clears_keychain_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = tobro_config::Config::default();
+        config.outbound_proxy.proxy_type = tobro_config::OutboundProxyType::Socks5;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 1080;
+        config.outbound_proxy.password_keychain = true;
+        config.save(&path)?;
+        let store = tobro_store::MemorySecretStore::default();
+        let result = outbound_set_password_at(&path, &store, &json!({ "password": "x" }))
+            .map_err(|e| e.to_string())?;
+        assert_eq!(result["ok"], true);
+
+        let listeners = Arc::new(RwLock::new(ListenerConfig::default()));
+        let result = config_apply_patch(
+            &path,
+            &json!({ "outbound_proxy": { "password_keychain": false } }),
+            false,
+            &listeners,
+            Some(&store),
+        )
+        .map_err(|e| e.to_string())?;
+        assert_eq!(result["ok"], true);
+        assert!(
+            store
+                .get(crate::outbound::KEYCHAIN_KEY_OUTBOUND_PASSWORD)?
+                .is_none(),
+            "leaving keychain mode must remove stored secrets"
+        );
+        assert!(!outbound_keychain_marker(&path)?);
+        Ok(())
+    }
+
+    fn outbound_keychain_marker(
+        path: &std::path::Path,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(tobro_config::Config::load(path)?
+            .outbound_proxy
+            .password_keychain)
+    }
+
+    #[test]
+    fn outbound_set_password_rejects_bad_input() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        let mut config = tobro_config::Config::default();
+        config.outbound_proxy.proxy_type = tobro_config::OutboundProxyType::Socks4;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 1080;
+        config.save(&path)?;
+        let store = tobro_store::MemorySecretStore::default();
+
+        // Empty secret is rejected (clear_password is the removal path).
+        let err = outbound_set_password_at(&path, &store, &json!({ "password": "" }))
+            .expect_err("empty password");
+        assert!(err.contains("non-empty"), "{err}");
+
+        // SOCKS4 ignores auth passwords; store must reject up front.
+        let err = outbound_set_password_at(&path, &store, &json!({ "password": "x" }))
+            .expect_err("socks4");
+        assert!(err.contains("SOCKS4"), "{err}");
+
+        // A legacy plaintext password left in the config is not silently
+        // overwritten with the keychain secret.
+        let mut config = tobro_config::Config::default();
+        config.outbound_proxy.proxy_type = tobro_config::OutboundProxyType::Socks5;
+        config.outbound_proxy.host = "10.20.30.40".to_owned();
+        config.outbound_proxy.port = 1080;
+        config.outbound_proxy.password = "plaintext".to_owned();
+        config.save(&path)?;
+        let err = outbound_set_password_at(&path, &store, &json!({ "password": "x" }))
+            .expect_err("plaintext conflict");
+        assert!(err.contains("plaintext"), "{err}");
+        let loaded = tobro_config::Config::load(&path)?;
+        assert!(!loaded.outbound_proxy.password_keychain);
         Ok(())
     }
 
@@ -2172,6 +2571,7 @@ mod config_tests {
             &json!({ "stream": { "isolate_destination": true, "isolate_port": true } }),
             true,
             &listeners,
+            None,
         )
         .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
@@ -2197,6 +2597,7 @@ mod config_tests {
             &json!({ "network": { "exit_country": "US", "ip_version": "ipv6_only" } }),
             true,
             &listeners,
+            None,
         )
         .map_err(|e| e.to_string())?;
         assert_eq!(result["ok"], true);
