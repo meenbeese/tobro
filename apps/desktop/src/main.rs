@@ -69,6 +69,8 @@ enum IpcCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    KindnessStatus(oneshot::Sender<Result<Value, String>>),
+    KindnessCheck(oneshot::Sender<Result<Value, String>>),
     ClientAuthList(oneshot::Sender<Result<Value, String>>),
     ClientAuthGenerate {
         params: Value,
@@ -247,6 +249,30 @@ async fn daemon_onion_list(state: State<'_, AppState>) -> Result<Value, String> 
     state
         .commands
         .send(IpcCommand::OnionList(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_kindness_status(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::KindnessStatus(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_kindness_check(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::KindnessCheck(tx))
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -670,6 +696,8 @@ fn main() {
             daemon_validate_config,
             daemon_apply_config,
             daemon_test_bridges,
+            daemon_kindness_status,
+            daemon_kindness_check,
             daemon_onion_list,
             daemon_onion_create,
             daemon_onion_update,
@@ -1794,6 +1822,8 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::Stop(tx)
         | IpcCommand::NewIdentity(tx)
         | IpcCommand::ConfigGet(tx)
+        | IpcCommand::KindnessStatus(tx)
+        | IpcCommand::KindnessCheck(tx)
         | IpcCommand::OnionList(tx)
         | IpcCommand::ClientAuthList(tx) => {
             let _ = tx.send(err);
@@ -1929,6 +1959,21 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);
+        }
+        IpcCommand::KindnessStatus(tx) => {
+            let result = client
+                .call(methods::KINDNESS_STATUS, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::KindnessCheck(tx) => {
+            // Network-touching (STUN/UPnP/broker); no params, may take seconds.
+            let result = client
+                .call(methods::KINDNESS_CHECK, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
         }
         IpcCommand::OnionList(tx) => {
             let result = client

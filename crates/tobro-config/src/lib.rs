@@ -688,6 +688,11 @@ pub struct KindnessConfig {
     /// while older releases accept the flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u32>,
+    /// UDP port range for client connections, upstream format `<min>:<max>`
+    /// (passed to the proxy as `-ephemeral-ports-range`). Optional: when
+    /// unset the proxy picks ephemeral ports automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ports: Option<String>,
     /// Report the NAT type as unrestricted without probing.
     #[serde(default)]
     pub nat_type_force_unrestricted: bool,
@@ -713,6 +718,12 @@ impl KindnessConfig {
     /// True when the snowflake-proxy sidecar should run.
     pub fn is_active(&self) -> bool {
         self.enabled
+    }
+
+    /// Parse `ephemeral_ports` in the upstream `<min>:<max>` format.
+    /// Returns the inclusive port bounds.
+    pub fn parse_ephemeral_ports(&self) -> Result<(u16, u16), String> {
+        parse_ephemeral_ports(self.ephemeral_ports.as_deref())
     }
 
     fn normalized_url(name: &str, value: Option<&str>) -> Result<Option<String>, ConfigError> {
@@ -745,6 +756,11 @@ impl KindnessConfig {
         Self::normalized_url("broker_url", self.broker_url.as_deref())?;
         Self::normalized_url("relay_url", self.relay_url.as_deref())?;
         Self::normalized_url("stun_url", self.stun_url.as_deref())?;
+        if let Some(raw) = self.ephemeral_ports.as_deref()
+            && let Err(reason) = parse_ephemeral_ports(Some(raw))
+        {
+            return Err(ConfigError::Invalid(reason));
+        }
         if let Some(hex) = &self.sha256_hex {
             let hex = hex.trim();
             if hex.len() != 64
@@ -780,6 +796,37 @@ impl KindnessConfig {
         }
         Ok(())
     }
+}
+
+/// Parse an `-ephemeral-ports-range` value in the upstream `<min>:<max>`
+/// format. Shared by config validation and the Kindness diagnostics.
+pub fn parse_ephemeral_ports(raw: Option<&str>) -> Result<(u16, u16), String> {
+    let Some(raw) = raw else {
+        return Err("ephemeral_ports is not set".to_owned());
+    };
+    let raw = raw.trim();
+    let Some((min_raw, max_raw)) = raw.split_once(':') else {
+        return Err(format!(
+            "ephemeral_ports must use the upstream `<min>:<max>` format (for example \"30000:40000\"), got {raw:?}"
+        ));
+    };
+    let parse_bound = |bound: &str| -> Result<u16, String> {
+        bound
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("ephemeral_ports bounds must be integers 1–65535, got {bound:?}"))
+    };
+    let min = parse_bound(min_raw)?;
+    let max = parse_bound(max_raw)?;
+    if min == 0 || max == 0 {
+        return Err("ephemeral_ports bounds must be at least 1".to_owned());
+    }
+    if min > max {
+        return Err(format!(
+            "ephemeral_ports min ({min}) must not exceed max ({max})"
+        ));
+    }
+    Ok((min, max))
 }
 
 /// Resolve the default config file path.
@@ -1340,6 +1387,44 @@ extra_args = ["-allow-non-tls-relay"]
         std::fs::write(&path, "version = 1\n")?;
         let minimal = Config::load(&path)?;
         assert!(!minimal.kindness.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn kindness_ephemeral_ports_validate_and_round_trip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[kindness]\nephemeral_ports = \"30000:30999\"\n",
+        )?;
+        let config = Config::load(&path)?;
+        assert_eq!(config.kindness.parse_ephemeral_ports(), Ok((30000, 30999)));
+        config.validate()?;
+
+        // Invalid values are rejected with the upstream format in the message.
+        for bad in [
+            "30000",
+            "31000:30000",
+            "abc:40000",
+            "30000:abc",
+            "0:40000",
+            " ",
+            "30000::40000",
+        ] {
+            let mut config = Config::default();
+            config.kindness.ephemeral_ports = Some(bad.to_owned());
+            let err = config
+                .validate()
+                .expect_err("invalid ephemeral_ports must be rejected");
+            assert!(err.to_string().contains("ephemeral_ports"), "{bad}: {err}");
+        }
+        // Whitespace around bounds is accepted (trimmed upstream passthrough).
+        let mut config = Config::default();
+        config.kindness.ephemeral_ports = Some(" 30000 : 31000 ".to_owned());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.kindness.parse_ephemeral_ports(), Ok((30000, 31000)));
         Ok(())
     }
 

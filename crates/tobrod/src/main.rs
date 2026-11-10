@@ -8,6 +8,7 @@ mod backup;
 mod client_auth;
 mod ipc;
 pub(crate) mod kindness;
+pub(crate) mod kindness_diag;
 mod lifecycle;
 pub(crate) mod onion;
 pub(crate) mod outbound;
@@ -197,6 +198,9 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         state_dir.clone(),
         std::sync::Arc::clone(&listeners),
         secrets,
+        kindness
+            .as_ref()
+            .map(|(supervisor, _events)| supervisor.control_handle()),
     );
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();

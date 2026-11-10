@@ -114,6 +114,12 @@ pub(crate) fn build_args(cfg: &tobro_config::KindnessConfig) -> Vec<OsString> {
         args.push("-capacity".into());
         args.push(capacity.to_string().into());
     }
+    // Upstream `<min>:<max>` passthrough; normalize the stored value so the
+    // flag always gets exactly one form (validation rejects invalid values).
+    if let Ok((min, max)) = cfg.parse_ephemeral_ports() {
+        args.push("-ephemeral-ports-range".into());
+        args.push(format!("{min}:{max}").into());
+    }
     if cfg.verbose {
         args.push("-verbose".into());
     }
@@ -184,6 +190,11 @@ impl KindnessSupervisor {
     #[allow(dead_code)]
     pub(crate) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<SidecarEvent> {
         self.handle.subscribe_events()
+    }
+
+    /// Clonable control handle for the IPC surface (`kindness.status`).
+    pub(crate) fn control_handle(&self) -> PtSidecarHandle {
+        self.handle.clone()
     }
 
     /// Spawn a task that forwards sidecar events into `tracing` so the proxy
@@ -336,6 +347,7 @@ mod tests {
             c.capacity = Some(7);
             c.verbose = true;
             c.nat_type_force_unrestricted = true;
+            c.ephemeral_ports = Some("30000 : 31000".to_owned());
         });
         let args = build_args(&cfg);
         assert_eq!(
@@ -349,6 +361,8 @@ mod tests {
                 OsStr::new("stun:stun.example.com:3478"),
                 OsStr::new("-capacity"),
                 OsStr::new("7"),
+                OsStr::new("-ephemeral-ports-range"),
+                OsStr::new("30000:31000"),
                 OsStr::new("-verbose"),
                 OsStr::new("-nat-type-force-unrestricted"),
             ]

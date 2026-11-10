@@ -85,6 +85,72 @@ const EMPTY_OUTBOUND: OutboundProxySettings = {
   sslocal_path: "",
 };
 
+interface KindnessSettings {
+  enabled: boolean;
+  capacity: string;
+  ephemeral_ports: string;
+}
+
+const EMPTY_KINDNESS: KindnessSettings = {
+  enabled: false,
+  capacity: "",
+  ephemeral_ports: "",
+};
+
+interface KindnessStatusView {
+  enabled?: boolean;
+  sidecar?: {
+    state?: string;
+    pid?: number | null;
+    last_error?: string | null;
+  };
+  config?: {
+    capacity?: number | null;
+    ephemeral_ports?: string | null;
+    nat_type_force_unrestricted?: boolean;
+  };
+}
+
+interface KindnessReportItem {
+  severity: "good" | "info" | "warn" | "error";
+  code: string;
+  message: string;
+  action?: string;
+}
+
+interface KindnessReportView {
+  ok?: boolean;
+  items?: KindnessReportItem[];
+  stun?: {
+    state?: string;
+    mapping_consistency?: string;
+    note?: string | null;
+    servers_tried?: number;
+  };
+  upnp?: {
+    state?: string;
+    ports_mapped?: [number, number] | null;
+    detail?: string | null;
+  };
+}
+
+function kindnessSidecarLabel(state?: string): string {
+  switch (state) {
+    case "running":
+      return "Running";
+    case "starting":
+      return "Starting…";
+    case "failed":
+      return "Failed";
+    case "stopping":
+      return "Stopping…";
+    case "disabled":
+      return "Not started (Kindness Mode disabled or no binary found)";
+    default:
+      return "Stopped";
+  }
+}
+
 interface ConfigResponse {
   ok?: boolean;
   path?: string;
@@ -215,12 +281,14 @@ export interface SettingsProps {
 
 export type AdvancedSettingsProps = SettingsProps;
 
-type SettingsTab = "general" | "node" | "onion" | "clientAuth" | "advanced";
+type SettingsTab =
+  "general" | "node" | "onion" | "clientAuth" | "kindness" | "advanced";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "general", label: "General" },
   { id: "node", label: "Node Configuration" },
   { id: "onion", label: "Onion Services" },
   { id: "clientAuth", label: "Client Authorization" },
+  { id: "kindness", label: "Kindness Mode" },
   { id: "advanced", label: "Advanced Tor Configuration" },
 ];
 
@@ -273,6 +341,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     node: null,
     onion: null,
     clientAuth: null,
+    kindness: null,
     advanced: null,
   });
 
@@ -320,6 +389,20 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [outboundPasswordTouched, setOutboundPasswordTouched] = useState(false);
   const [outboundSsPasswordTouched, setOutboundSsPasswordTouched] =
     useState(false);
+
+  // Kindness Mode (M6, F-60–F-62/F-66): snowflake-proxy serving.
+  const [kindness, setKindness] = useState<KindnessSettings>(EMPTY_KINDNESS);
+  const [kindnessDirty, setKindnessDirty] = useState(false);
+  const [kindnessBusy, setKindnessBusy] = useState(false);
+  const [kindnessError, setKindnessError] = useState("");
+  const [kindnessMessage, setKindnessMessage] = useState("");
+  const [kindnessStatus, setKindnessStatus] =
+    useState<KindnessStatusView | null>(null);
+  const [kindnessStatusBusy, setKindnessStatusBusy] = useState(false);
+  const [kindnessReport, setKindnessReport] =
+    useState<KindnessReportView | null>(null);
+  const [kindnessCheckBusy, setKindnessCheckBusy] = useState(false);
+  const [kindnessCheckError, setKindnessCheckError] = useState("");
 
   // Config import/export
   const [configPath, setConfigPath] = useState("");
@@ -496,6 +579,131 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     }
   }
 
+  function applyKindnessFromConfig(config: unknown) {
+    const k = (config as { kindness?: Record<string, unknown> } | null)
+      ?.kindness;
+    setKindness({
+      enabled: k?.enabled === true,
+      capacity:
+        typeof k?.capacity === "number" && k.capacity > 0
+          ? String(k.capacity)
+          : "",
+      ephemeral_ports:
+        typeof k?.ephemeral_ports === "string" ? k.ephemeral_ports : "",
+    });
+    setKindnessDirty(false);
+    setKindnessError("");
+    setKindnessMessage("");
+  }
+
+  function onKindnessChange<K extends keyof KindnessSettings>(
+    key: K,
+    value: KindnessSettings[K],
+  ) {
+    setKindness((prev) => ({ ...prev, [key]: value }));
+    setKindnessDirty(true);
+    setKindnessError("");
+    setKindnessMessage("");
+  }
+
+  async function loadKindnessStatus() {
+    setKindnessStatusBusy(true);
+    try {
+      const status = await invoke<KindnessStatusView>("daemon_kindness_status");
+      setKindnessStatus(status);
+    } catch (e) {
+      log(`kindness status failed: ${String(e)}`, "error");
+    } finally {
+      setKindnessStatusBusy(false);
+    }
+  }
+
+  async function onSaveKindness(e?: FormEvent) {
+    if (e) {
+      e.preventDefault();
+    }
+    setKindnessBusy(true);
+    setKindnessError("");
+    setKindnessMessage("");
+    try {
+      const trimmedCapacity = kindness.capacity.trim();
+      let capacity: number | null = null;
+      if (kindness.enabled && trimmedCapacity) {
+        const parsed = parsePort(trimmedCapacity);
+        if (parsed === null) {
+          throw new Error(
+            "Kindness capacity must be an integer between 1 and 65535, or empty for the proxy default.",
+          );
+        }
+        capacity = parsed;
+      }
+      const trimmedPorts = kindness.ephemeral_ports.trim();
+      if (trimmedPorts && !/^\d+:\d+$/.test(trimmedPorts.replace(/\s+/g, ""))) {
+        throw new Error(
+          "Ephemeral ports must use the `<min>:<max>` format (for example 30000:40000).",
+        );
+      }
+      const ports = trimmedPorts.replace(/\s+/g, "") || null;
+      const result = await invoke<ConfigResponse>("daemon_apply_config", {
+        patch: {
+          kindness: {
+            enabled: kindness.enabled,
+            capacity,
+            ephemeral_ports: ports,
+          },
+        },
+      });
+      if (result.config) setCurrentConfig(result.config);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyKindnessFromConfig(result.config ?? null);
+      const warnings = result.effects?.warnings ?? [];
+      const msg = summarizeEffects(result.effects).join(" ");
+      const restartNote = result.effects?.restart_required
+        ? " Restart required: stop then connect (or restart the daemon) for the proxy change."
+        : "";
+      setKindnessMessage(
+        `${
+          warnings.length
+            ? `${msg} Warnings: ${warnings.join(" | ")}`
+            : msg || "Saved."
+        }${restartNote}`,
+      );
+      log(`kindness mode saved (enabled=${String(kindness.enabled)})`);
+      onApplied?.();
+      void loadKindnessStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setKindnessError(message);
+      log(`kindness save failed: ${message}`, "error");
+    } finally {
+      setKindnessBusy(false);
+    }
+  }
+
+  async function onRunKindnessCheck() {
+    setKindnessCheckBusy(true);
+    setKindnessCheckError("");
+    log("running kindness eligibility test (STUN, UPnP, broker)…");
+    try {
+      const report = await invoke<KindnessReportView>("daemon_kindness_check");
+      setKindnessReport(report);
+      log(
+        report.ok
+          ? "kindness eligibility test passed"
+          : "kindness eligibility test finished with problems",
+        report.ok ? "info" : "error",
+      );
+      void loadKindnessStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setKindnessCheckError(message);
+      log(`kindness check failed: ${message}`, "error");
+      void loadKindnessStatus();
+    } finally {
+      setKindnessCheckBusy(false);
+    }
+  }
+
   async function loadConfigState(): Promise<unknown | null> {
     try {
       const result = await invoke<ConfigResponse>("daemon_get_config");
@@ -505,6 +713,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyStreamFromConfig(cfg);
       applyNetworkFromConfig(cfg);
       applyOutboundFromConfig(cfg);
+      applyKindnessFromConfig(cfg);
       return cfg;
     } catch {
       // best-effort; listener loading may still work from local config
@@ -730,6 +939,9 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     if (powerUser && tab === "clientAuth") {
       void loadClientAuth();
       void loadOnionServices();
+    }
+    if (powerUser && tab === "kindness") {
+      void loadKindnessStatus();
     }
   }, [powerUser, tab]);
 
@@ -977,6 +1189,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyStreamFromConfig(result.config ?? null);
       applyNetworkFromConfig(result.config ?? null);
       applyOutboundFromConfig(result.config ?? null);
+      applyKindnessFromConfig(result.config ?? null);
       setConfigMessages([
         "Loaded current daemon config (redacted; no secrets).",
       ]);
@@ -1070,6 +1283,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyStreamFromConfig(result.config ?? null);
       applyNetworkFromConfig(result.config ?? null);
       applyOutboundFromConfig(result.config ?? null);
+      applyKindnessFromConfig(result.config ?? null);
       const lines = ["Config validated and saved (daemon config API)."];
       lines.push(...summarizeEffects(result.effects));
       lines.push(
@@ -3609,6 +3823,202 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </button>
               </div>
             </form>
+          </div>
+
+          <div
+            id="settings-panel-kindness"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-kindness"
+            hidden={tab !== "kindness"}
+          >
+            <div className="settings-section-head">
+              <p className="muted">
+                Kindness Mode runs a Snowflake proxy so censored users can
+                connect through this computer. UDP/network tests below use the
+                daemon’s direct network path.
+              </p>
+            </div>
+
+            <div className="settings-section kindness-status">
+              <h3>Status</h3>
+              <p className="muted">
+                {kindnessSidecarLabel(kindnessStatus?.sidecar?.state)}
+                {kindnessStatus?.sidecar?.pid
+                  ? ` (pid ${kindnessStatus.sidecar.pid})`
+                  : ""}
+              </p>
+              {kindnessStatus?.sidecar?.last_error ? (
+                <p className="error">{kindnessStatus.sidecar.last_error}</p>
+              ) : null}
+              <div className="actions">
+                <button
+                  type="button"
+                  className="small-button"
+                  disabled={kindnessStatusBusy}
+                  onClick={() => void loadKindnessStatus()}
+                >
+                  {kindnessStatusBusy ? "Refreshing…" : "Refresh status"}
+                </button>
+              </div>
+            </div>
+
+            <form
+              className="settings-section kindness-config"
+              onSubmit={(e) => void onSaveKindness(e)}
+            >
+              <h3>Proxy settings</h3>
+              <p className="muted">
+                Runs <code>snowflake-proxy</code> while the daemon runs.
+                Defaults are used for anything left empty. Changes require a
+                daemon restart (or Stop → Connect) to take effect.
+              </p>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={kindness.enabled}
+                  disabled={kindnessBusy}
+                  onChange={(e) =>
+                    onKindnessChange("enabled", e.target.checked)
+                  }
+                />
+                <span>
+                  <strong>Run the Snowflake proxy</strong> to donate bandwidth
+                  to help censored users connect.
+                </span>
+              </label>
+              <div className="field-row">
+                <label htmlFor="kindness-capacity">Capacity (optional)</label>
+                <input
+                  id="kindness-capacity"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  inputMode="numeric"
+                  value={kindness.capacity}
+                  disabled={kindnessBusy || !kindness.enabled}
+                  onChange={(e) => onKindnessChange("capacity", e.target.value)}
+                  placeholder="default"
+                />
+              </div>
+              <div className="field-row">
+                <label htmlFor="kindness-ephemeral-ports">
+                  Ephemeral UDP ports (optional)
+                </label>
+                <input
+                  id="kindness-ephemeral-ports"
+                  type="text"
+                  value={kindness.ephemeral_ports}
+                  disabled={kindnessBusy || !kindness.enabled}
+                  onChange={(e) =>
+                    onKindnessChange("ephemeral_ports", e.target.value)
+                  }
+                  placeholder="30000:40000"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <p className="muted">
+                Format <code>min:max</code> restricts which local UDP ports the
+                proxy may use. When a NAT is detected and your router supports
+                UPnP, the first ports of the range are mapped for inbound access
+                during the eligibility test.
+              </p>
+              <DirtyNote dirty={kindnessDirty} />
+              {kindnessError ? <p className="error">{kindnessError}</p> : null}
+              {kindnessMessage ? (
+                <p className="muted">{kindnessMessage}</p>
+              ) : null}
+              <div className="actions">
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={kindnessBusy}
+                >
+                  {kindnessBusy ? "Saving…" : "Save kindness settings"}
+                </button>
+              </div>
+            </form>
+
+            <div className="settings-section kindness-eligibility">
+              <h3>Eligibility test</h3>
+              <p className="muted">
+                Runs STUN NAT detection, UPnP gateway discovery (mapping the
+                configured ephemeral ports when a NAT was detected), and broker
+                reachability checks, then reports what is blocking serving
+                together with the fix for each failure. Sends UDP to public STUN
+                servers and an HTTPS request to the broker.
+              </p>
+              <div className="actions">
+                <button
+                  type="button"
+                  className="primary small-button"
+                  disabled={kindnessCheckBusy}
+                  onClick={() => void onRunKindnessCheck()}
+                >
+                  {kindnessCheckBusy
+                    ? "Testing… (can take ~15 seconds)"
+                    : "Run eligibility test"}
+                </button>
+              </div>
+              {kindnessCheckError ? (
+                <p className="error">{kindnessCheckError}</p>
+              ) : null}
+              {kindnessReport ? (
+                <div
+                  className={
+                    kindnessReport.ok
+                      ? "kindness-report passed"
+                      : "kindness-report"
+                  }
+                  role="region"
+                  aria-live="polite"
+                >
+                  <p
+                    className={
+                      kindnessReport.ok
+                        ? "kindness-summary good"
+                        : "kindness-summary bad"
+                    }
+                  >
+                    {kindnessReport.ok
+                      ? "No blockers found. This computer should be able to serve Snowflake users."
+                      : "Problems found. Fix the items marked in red and re-run the test."}
+                  </p>
+                  <ul>
+                    {(kindnessReport.items ?? []).map((item, index) => (
+                      <li
+                        key={`${item.code}-${index}`}
+                        className={`kindness-item-${item.severity}`}
+                      >
+                        <span
+                          className={`kindness-badge kindness-badge-${item.severity}`}
+                        >
+                          {item.severity}
+                        </span>{" "}
+                        <span>
+                          {item.message}
+                          {item.action ? (
+                            <em className="kindness-action"> {item.action}</em>
+                          ) : null}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  {kindnessReport.stun?.note ? (
+                    <p className="muted kindness-note">
+                      NAT probe note: {kindnessReport.stun.note}
+                    </p>
+                  ) : null}
+                  {kindnessReport.upnp?.detail &&
+                  !kindnessReport.upnp.ports_mapped ? (
+                    <p className="muted kindness-note">
+                      UPnP: {kindnessReport.upnp.detail}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           </div>
 
           <div

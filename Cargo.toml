@@ -87,6 +87,10 @@ reqwest = { version = "0.13", default-features = false, features = [
     "socks",
 ] }
 
+# --- UPnP (Kindness Mode port mapping, F-62) ------------------------------
+# Blocking IGDv1/IGDv2 client; only used via spawn_blocking.
+igd-next = { version = "0.18", default-features = false, features = ["io_sync"] }
+
 # --- Desktop shell --------------------------------------------------------
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-build = "2"

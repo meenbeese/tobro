@@ -236,6 +236,12 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Kindness sidecar state + `[kindness]` config summary (`kindness.status`).
+    fn kindness_status(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Run the Kindness eligibility check: STUN NAT detection (F-61), UPnP
+    /// gateway discovery/mapping (F-62), broker/binary bootstrap checks
+    /// (F-66). Network-touching.
+    fn kindness_check(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// List hosted onion services.
     fn onion_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Create a hosted onion service.
@@ -683,6 +689,71 @@ fn outbound_clear_password_at(
     }))
 }
 
+/// Build the `kindness.status` payload: config summary + live sidecar state
+/// (when Kindness Mode spawned a proxy). No secrets: `[kindness]` has none,
+/// and the sidecar `last_error` is passed through [`redact_secrets`].
+const SIDECAR_ID_DEFAULT: &str = "snowflake-proxy";
+
+fn kindness_status_json(
+    config: Option<&tobro_config::KindnessConfig>,
+    snapshot: Option<&crate::pt_supervisor::SidecarSnapshot>,
+) -> Result<serde_json::Value, String> {
+    let config = config.ok_or_else(|| "kindness config is unavailable".to_owned())?;
+    let (sidecar_id, sidecar_state, last_error, sidecar_pid) = match snapshot {
+        None => (SIDECAR_ID_DEFAULT, "disabled", None, None),
+        Some(snapshot) => {
+            let last_error = snapshot.last_error.as_deref().map(redact_secrets);
+            (
+                snapshot.id.as_str(),
+                crate::kindness_diag::sidecar_state_label(snapshot),
+                last_error,
+                snapshot.pid,
+            )
+        }
+    };
+    Ok(json!({
+        "ok": true,
+        "action": "kindness.status",
+        "enabled": config.enabled,
+        "sidecar": {
+            "id": sidecar_id,
+            "state": sidecar_state,
+            "pid": sidecar_pid,
+            "last_error": last_error,
+        },
+        "config": {
+            "enabled": config.enabled,
+            "capacity": config.capacity,
+            "ephemeral_ports": config.ephemeral_ports,
+            "stun_url": config.stun_url,
+            "nat_type_force_unrestricted": config.nat_type_force_unrestricted,
+            "verbose": config.verbose,
+        },
+    }))
+}
+
+/// Redact every string in a serialized report (defense in depth: report
+/// text contains URLs and error strings from the network, never secrets,
+/// but the same boundary rule applies as for other diagnostics).
+fn redact_report_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_secrets(text);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_report_strings(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, item) in map.iter_mut() {
+                redact_report_strings(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn bridges_test_at(
     config_path: &std::path::Path,
     state_dir: &std::path::Path,
@@ -857,6 +928,8 @@ pub struct SupervisorControl {
     listeners: Arc<RwLock<ListenerConfig>>,
     outbound_sidecar: Arc<tokio::sync::Mutex<Option<crate::outbound::SslocalHandle>>>,
     secrets: Arc<dyn SecretStore>,
+    /// Spawned snowflake-proxy handle when Kindness Mode is active.
+    kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -870,12 +943,14 @@ impl std::fmt::Debug for SupervisorControl {
 
 impl SupervisorControl {
     /// Create a control wrapper.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         handle: SupervisorHandle,
         config_path: std::path::PathBuf,
         state_dir: std::path::PathBuf,
         listeners: Arc<RwLock<ListenerConfig>>,
         secrets: Arc<dyn SecretStore>,
+        kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
     ) -> Self {
         Self {
             handle,
@@ -884,6 +959,7 @@ impl SupervisorControl {
             listeners,
             outbound_sidecar: Arc::new(tokio::sync::Mutex::new(None)),
             secrets,
+            kindness,
         }
     }
 
@@ -1169,6 +1245,35 @@ impl DaemonControl for SupervisorControl {
         .map_err(|e| format!("outbound secret task failed: {e}"))?
     }
 
+    async fn kindness_status(&self) -> Result<serde_json::Value, String> {
+        let snapshot = self.kindness.as_ref().map(|handle| handle.snapshot());
+        let path = self.config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = load_current_config(&path)?;
+            kindness_status_json(Some(&config.kindness), snapshot.as_ref())
+        })
+        .await
+        .map_err(|e| format!("kindness status task failed: {e}"))?
+    }
+
+    async fn kindness_check(&self) -> Result<serde_json::Value, String> {
+        let path = self.config_path.clone();
+        let state_dir = self.state_dir.clone();
+        let config =
+            tokio::task::spawn_blocking(move || tobro_config::Config::load_or_default(&path))
+                .await
+                .map_err(|e| format!("kindness check task failed: {e}"))?
+                .map_err(|e| format!("failed to load config: {e}"))?;
+        let report = crate::kindness_diag::run_eligibility(&config.kindness, &state_dir).await;
+        let mut response = serde_json::to_value(&report)
+            .map_err(|e| format!("could not serialize kindness report: {e}"))?;
+        redact_report_strings(&mut response);
+        if let Some(object) = response.as_object_mut() {
+            object.insert("action".to_owned(), json!("kindness.check"));
+        }
+        Ok(response)
+    }
+
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
         let db_path = self.db_path();
         let runtime_active = is_runtime_active(&self.snapshot().state);
@@ -1329,6 +1434,14 @@ impl DaemonControl for SupervisorHandle {
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err("outbound proxy secrets require daemon config context".to_owned())
+    }
+
+    async fn kindness_status(&self) -> Result<serde_json::Value, String> {
+        Err("kindness status requires daemon config context".to_owned())
+    }
+
+    async fn kindness_check(&self) -> Result<serde_json::Value, String> {
+        Err("kindness checks require daemon config context".to_owned())
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -1814,6 +1927,20 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::KINDNESS_STATUS => match control.kindness_status().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(
+                id,
+                RpcError::internal(format!("kindness.status failed: {}", redact_secrets(&e))),
+            ),
+        },
+        methods::KINDNESS_CHECK => match control.kindness_check().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(
+                id,
+                RpcError::internal(format!("kindness.check failed: {}", redact_secrets(&e))),
+            ),
+        },
         methods::ONION_LIST => match control.onion_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
@@ -2091,6 +2218,25 @@ mod daemon_tests {
             _params: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "outbound_proxy.clear_password", "mock": true }))
+        }
+
+        async fn kindness_status(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "ok": true,
+                "action": "kindness.status",
+                "enabled": false,
+                "sidecar": { "state": "disabled", "pid": null, "last_error": null },
+            }))
+        }
+
+        async fn kindness_check(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({
+                "ok": true,
+                "action": "kindness.check",
+                "items": [],
+                "stun": { "state": "unknown", "mapping_consistency": "unknown" },
+                "upnp": { "state": "unknown" },
+            }))
         }
 
         async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -2509,6 +2655,40 @@ mod config_tests {
         Ok(tobro_config::Config::load(path)?
             .outbound_proxy
             .password_keychain)
+    }
+
+    #[test]
+    fn kindness_status_reports_config_and_disabled_sidecar() {
+        let config = tobro_config::Config::default();
+        let value =
+            kindness_status_json(Some(&config.kindness), None).expect("kindness status payload");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["action"], "kindness.status");
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["sidecar"]["state"], "disabled");
+        assert_eq!(value["sidecar"]["pid"], serde_json::Value::Null);
+        assert_eq!(value["config"]["capacity"], serde_json::Value::Null);
+
+        // With a sidecar handle snapshot, the state label comes through and
+        // the last error is redacted at this boundary.
+        use crate::pt_supervisor::{SidecarId, SidecarSnapshot, SidecarState};
+        let snapshot = SidecarSnapshot {
+            id: SidecarId::new("snowflake-proxy"),
+            state: SidecarState::Failed,
+            ready_transports: Vec::new(),
+            last_error: Some("password=supersecret".to_owned()),
+            pid: Some(4242),
+        };
+        let value = kindness_status_json(Some(&config.kindness), Some(&snapshot)).expect("payload");
+        assert_eq!(value["sidecar"]["state"], "failed");
+        assert_eq!(value["sidecar"]["pid"], 4242);
+        assert!(
+            !value["sidecar"]["last_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("supersecret"),
+            "sidecar errors must be redacted in kindness.status"
+        );
     }
 
     #[test]

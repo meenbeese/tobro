@@ -81,6 +81,14 @@ pub mod methods {
     /// mode when no keychain secret remains.
     pub const OUTBOUND_PROXY_CLEAR_PASSWORD: &str = "outbound_proxy.clear_password";
 
+    /// Kindness Mode sidecar state + `[kindness]` config summary (no params,
+    /// no secrets).
+    pub const KINDNESS_STATUS: &str = "kindness.status";
+    /// Run the Kindness eligibility report (STUN NAT detection, UPnP gateway
+    /// discovery/mapping, broker reachability). Network-touching; may take
+    /// seconds. No params.
+    pub const KINDNESS_CHECK: &str = "kindness.check";
+
     /// List hosted onion services.
     pub const ONION_LIST: &str = "onion.list";
     /// Create a hosted onion service.
@@ -131,6 +139,8 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::BRIDGES_TEST
             | methods::OUTBOUND_PROXY_SET_PASSWORD
             | methods::OUTBOUND_PROXY_CLEAR_PASSWORD
+            | methods::KINDNESS_STATUS
+            | methods::KINDNESS_CHECK
             | methods::ONION_LIST
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
@@ -157,6 +167,8 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::RELOAD_CONFIG
         | methods::NEW_IDENTITY
         | methods::CONFIG_GET
+        | methods::KINDNESS_STATUS
+        | methods::KINDNESS_CHECK
         | methods::ONION_LIST
         | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
         methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
