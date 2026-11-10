@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "updated": "2026-11-10",
+  "source": "derived from Orbot's regionalization logic (guardianproject/orbot-android Regionalization.kt at baseline 53da58c6ab8831b8a10714ff1480dd774d8c5e0c: isKindnessModeDisabledForCountry and the censored-country lists) and https://orbot.app/kindness; see TOBRO_PLAN.md §4.9/F-67",
+  "notes": {
+    "warn": "Running a Snowflake proxy from a heavily censored region draws attention: the connection to the Snowflake broker is visible to your ISP even though the relayed content itself is encrypted, and your IP address appears in the broker's rendezvous logs. Because Tor is already blocked on your network, the local benefit is low while the local risk is not. Kindness Mode stays available, but consider leaving it off; see https://orbot.app/kindness for details.",
+    "disabled": "Kindness Mode is disabled in this region by the regional policy: running a Snowflake proxy from a heavily censored region can draw attention from the censoring network and the authorities, and offers little local benefit because Tor is blocked anyway. See https://orbot.app/kindness for background and alternatives."
+  },
+  "countries": {
+    "AF": "disabled",
+    "IR": "disabled",
+    "AE": "warn",
+    "BD": "warn",
+    "CN": "warn",
+    "CO": "warn",
+    "ID": "warn",
+    "KW": "warn",
+    "PK": "warn",
+    "QA": "warn",
+    "RU": "warn",
+    "SY": "warn",
+    "TR": "warn",
+    "UG": "warn",
+    "UZ": "warn"
+  }
+}

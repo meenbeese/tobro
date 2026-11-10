@@ -16,6 +16,7 @@ pub(crate) mod onion;
 pub(crate) mod outbound;
 pub(crate) mod pt_supervisor;
 pub(crate) mod redact;
+pub(crate) mod regional_policy;
 mod spike;
 mod supervisor;
 
@@ -143,7 +144,29 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     // Kindness mode (M6, F-60): run the snowflake-proxy sidecar when enabled.
     // A missing/unverifiable binary logs a warning and the daemon continues
     // without it; crash restarts and shutdown are handled by the supervisor.
-    let kindness = if config.kindness.is_active() {
+    // Regional policy (M6, F-67): the bundled policy plus any state-dir
+    // override decides whether the configured region is warned or Kindness
+    // is disabled entirely (Orbot-derived; a data file, not hard-coded UI).
+    let regional_policy = crate::regional_policy::load(Some(&state_dir));
+    let regional_outcome = crate::regional_policy::outcome_for(&regional_policy, &config);
+    match regional_outcome.policy {
+        "disabled" => {
+            tracing::warn!(
+                region = ?regional_outcome.country,
+                source = regional_outcome.source,
+                "kindness mode is disabled by the regional policy; the snowflake-proxy sidecar will not start"
+            );
+        }
+        "warn" => {
+            tracing::warn!(
+                region = ?regional_outcome.country,
+                source = regional_outcome.source,
+                "kindness mode runs, but the regional policy warns for this region"
+            );
+        }
+        _ => {}
+    }
+    let kindness = if config.kindness.is_active() && regional_outcome.policy != "disabled" {
         match crate::kindness::spawn_supervised(&config.kindness, &state_dir) {
             Ok(supervisor) => {
                 let events = supervisor.spawn_event_logger();

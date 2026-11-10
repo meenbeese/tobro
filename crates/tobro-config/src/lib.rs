@@ -686,6 +686,15 @@ impl Default for LoggingConfig {
 pub struct KindnessConfig {
     /// Run `snowflake-proxy` while the daemon runs.
     pub enabled: bool,
+    /// Region used by the Kindness regional policy (M6, F-67) as an ISO
+    /// 3166-1 alpha-2 code (e.g. `"us"`, `"ir"`). `None` (or `"auto"`)
+    /// falls back to the Orbot-derived source `bridges.country`, since
+    /// Orbot keys Kindness restrictions off the configured bridge country.
+    /// The resolved region is looked up in the regional policy file
+    /// (`regional_policy.json`) which may disable the proxy or emit a
+    /// warning for heavily censored regions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// Broker URL override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_url: Option<String>,
@@ -751,6 +760,7 @@ impl Default for KindnessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            region: None,
             broker_url: None,
             relay_url: None,
             stun_url: None,
@@ -773,6 +783,18 @@ impl KindnessConfig {
     /// True when the snowflake-proxy sidecar should run.
     pub fn is_active(&self) -> bool {
         self.enabled
+    }
+
+    /// Normalized regional-policy region override (`"auto"`/empty -> `None`,
+    /// otherwise an uppercase ISO 3166-1 alpha-2 code). Mirrors
+    /// [`BridgesConfig::normalized_country`], uppercased because the
+    /// regional policy file keys countries as uppercase alpha-2 codes.
+    pub fn normalized_region(&self) -> Option<String> {
+        self.region
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+            .map(|s| s.to_ascii_uppercase())
     }
 
     /// Parse `ephemeral_ports` in the upstream `<min>:<max>` format.
@@ -846,6 +868,17 @@ impl KindnessConfig {
             if arg.contains('\0') {
                 return Err(ConfigError::Invalid(format!(
                     "kindness.extra_args[{i}] must not contain NUL"
+                )));
+            }
+        }
+        if let Some(region) = self.region.as_deref() {
+            let r = region.trim();
+            if !r.is_empty()
+                && !r.eq_ignore_ascii_case("auto")
+                && (r.len() != 2 || !r.chars().all(|ch| ch.is_ascii_alphabetic()))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "kindness.region must be an ISO 3166-1 alpha-2 code (two letters) or \"auto\", got {region:?}"
                 )));
             }
         }
@@ -1528,6 +1561,37 @@ extra_args = ["-allow-non-tls-relay"]
         let mut config = Config::default();
         config.kindness.broker_url = Some(" ".to_owned());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn kindness_region_validates_and_normalizes() {
+        // Valid codes normalize (uppercase); `auto` and None normalize to None.
+        let mut config = Config::default();
+        config.kindness.region = Some(" ir ".to_owned());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.kindness.normalized_region().as_deref(), Some("IR"));
+
+        let mut config = Config::default();
+        config.kindness.region = Some("auto".to_owned());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.kindness.normalized_region(), None);
+
+        // Missing/empty keys stay None.
+        let config = Config::default();
+        assert_eq!(config.kindness.normalized_region(), None);
+
+        // Bad shapes are rejected like the other country settings.
+        for bad in ["ukr", "d", "DE1", "au to"] {
+            let mut config = Config::default();
+            config.kindness.region = Some(bad.trim().to_owned());
+            let err = config.validate().expect_err("invalid region must fail");
+            assert!(err.to_string().contains("kindness.region"), "{bad}: {err}");
+        }
+
+        // Two-letter codes from any case pass.
+        let mut config = Config::default();
+        config.kindness.region = Some("dE".to_owned());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

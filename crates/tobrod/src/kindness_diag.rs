@@ -64,8 +64,8 @@ pub(crate) enum DiagSeverity {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DiagItem {
     pub severity: DiagSeverity,
-    /// Stable short identifier (`binary`, `nat`, `nat_force`, `upnp`,
-    /// `upnp_mapping`, `broker`).
+    /// Stable short identifier (`region`, `binary`, `nat`, `nat_force`,
+    /// `upnp`, `upnp_mapping`, `broker`).
     pub code: &'static str,
     /// Human-readable outcome (no secrets).
     pub message: String,
@@ -592,16 +592,26 @@ pub(crate) async fn http_reachable(url: &str, timeout: Duration) -> Result<u16, 
     Ok(response.status().as_u16())
 }
 
-/// Run the full eligibility pass (F-61 + F-62 + F-66).
+/// Run the full eligibility pass (F-61 + F-62 + F-66, plus the F-67
+/// regional policy item).
 pub(crate) async fn run_eligibility(
-    config: &tobro_config::KindnessConfig,
+    config: &tobro_config::Config,
     state_dir: &Path,
 ) -> KindnessReport {
+    let kindness = &config.kindness;
     let mut items = Vec::new();
+
+    // 0. regional policy (F-67): data-driven, no network. The item comes
+    //    first because a region-local refusal outranks every network probe.
+    let policy = crate::regional_policy::load(Some(state_dir));
+    let outcome = crate::regional_policy::outcome_for(&policy, config);
+    if let Some(item) = regional_diag_item(&outcome, Some(state_dir)) {
+        items.push(item);
+    }
 
     // 1. binary availability (F-60 prerequisite; same locate strategy as the
     //    supervisor, no verification repeated here).
-    match crate::kindness::locate_binary(config, Some(state_dir)) {
+    match crate::kindness::locate_binary(kindness, Some(state_dir)) {
         Ok(located) => items.push(DiagItem {
             severity: DiagSeverity::Good,
             code: "binary",
@@ -621,7 +631,7 @@ pub(crate) async fn run_eligibility(
     }
 
     // 2. NAT detection (F-61).
-    let stun_urls = parse_stun_urls(config.stun_url.as_deref());
+    let stun_urls = parse_stun_urls(kindness.stun_url.as_deref());
     let stun = run_stun_probe(&stun_urls).await;
     match (stun.state, stun.mapping_consistency) {
         ("direct", _) => items.push(DiagItem {
@@ -667,7 +677,7 @@ pub(crate) async fn run_eligibility(
             ),
         }),
     }
-    if config.nat_type_force_unrestricted {
+    if kindness.nat_type_force_unrestricted {
         items.push(DiagItem {
             severity: DiagSeverity::Info,
             code: "nat_force",
@@ -680,7 +690,7 @@ pub(crate) async fn run_eligibility(
     }
 
     // 3. UPnP (F-62): discovery + bounded mapping when a range is configured.
-    let configured_range = config.parse_ephemeral_ports().ok();
+    let configured_range = kindness.parse_ephemeral_ports().ok();
     let upnp = tokio::task::spawn_blocking(move || {
         run_upnp_probe_blocking(stun.state == "nat", configured_range)
     })
@@ -753,7 +763,7 @@ pub(crate) async fn run_eligibility(
     }
 
     // 4. broker reachability (F-66 bootstrap part).
-    let broker_url = match config.broker_url.as_deref() {
+    let broker_url = match kindness.broker_url.as_deref() {
         Some(url) if !url.trim().is_empty() => url.trim(),
         _ => DEFAULT_BROKER_URL,
     };
@@ -820,6 +830,58 @@ pub(crate) fn sidecar_state_label(
         SidecarState::Ready => "running",
         SidecarState::Failed => "failed",
         SidecarState::Stopping => "stopping",
+    }
+}
+
+/// Build the F-67 regional-policy report item from a resolved outcome.
+///
+/// `disabled` regions produce an `error` item (the proxy will not run),
+/// `warn` produces a `warn` item, and `allow`/unknown produces nothing:
+/// an unrestricted region gets no diag noise. `override_dir` (the state
+/// directory holding the documented `<state-dir>/regional_policy.json`
+/// override) is included in the disabled copy so updates are actionable.
+pub(crate) fn regional_diag_item(
+    outcome: &crate::regional_policy::RegionalOutcome,
+    override_dir: Option<&Path>,
+) -> Option<DiagItem> {
+    let region = outcome.country.as_deref().unwrap_or("unknown");
+    let note = outcome
+        .note
+        .as_deref()
+        .unwrap_or("see the regional policy file");
+    match outcome.policy {
+        "disabled" => {
+            let action = match override_dir {
+                Some(dir) => format!(
+                    "Leave Kindness Mode off, or vendor a newer policy document to {}. \
+                     Policy derivation and background: https://orbot.app/kindness.",
+                    crate::regional_policy::override_path(dir).display()
+                ),
+                None => "Leave Kindness Mode off; see https://orbot.app/kindness for \
+                         background."
+                    .to_owned(),
+            };
+            Some(DiagItem {
+                severity: DiagSeverity::Error,
+                code: "region",
+                message: format!(
+                    "Kindness Mode is disabled for region {region} (source: {}) \
+                     per the regional policy: {note}",
+                    outcome.source
+                ),
+                action: Some(action),
+            })
+        }
+        "warn" => Some(DiagItem {
+            severity: DiagSeverity::Warn,
+            code: "region",
+            message: format!(
+                "the regional policy warns for region {region} (source: {source}): {note}",
+                source = outcome.source
+            ),
+            action: None,
+        }),
+        _ => None,
     }
 }
 
@@ -934,6 +996,65 @@ mod tests {
         );
         // Garbage list falls back to defaults.
         assert!(!parse_stun_urls(Some("stun:,:x, no:pe")).is_empty());
+    }
+
+    #[test]
+    fn regional_diag_item_matrix() {
+        fn outcome(
+            country: Option<&str>,
+            policy: &'static str,
+        ) -> crate::regional_policy::RegionalOutcome {
+            crate::regional_policy::RegionalOutcome {
+                country: country.map(str::to_owned),
+                source: "bridges",
+                policy,
+                note: Some("regional policy note".to_owned()),
+            }
+        }
+
+        // Disabled: an error item naming the region, source, and note.
+        let item = regional_diag_item(&outcome(Some("IR"), "disabled"), None)
+            .expect("disabled produces an item");
+        assert_eq!(item.code, "region");
+        assert!(matches!(item.severity, DiagSeverity::Error));
+        assert!(item.message.contains("IR"), "{}", item.message);
+        assert!(item.message.contains("bridges"), "{}", item.message);
+        assert!(
+            item.message.contains("regional policy note"),
+            "{}",
+            item.message
+        );
+        let action = regional_diag_item(&outcome(Some("IR"), "disabled"), None)
+            .expect("disabled item")
+            .action
+            .expect("disabled carries an action");
+        assert!(action.contains("orbot.app/kindness"), "{action}");
+        assert!(
+            !action.contains("regional_policy.json"),
+            "without a state dir the action copy stays generic: {action}"
+        );
+
+        // Warn: a warn item with the note, no action.
+        let item = regional_diag_item(&outcome(Some("CN"), "warn"), None).expect("warn item");
+        assert!(matches!(item.severity, DiagSeverity::Warn));
+        assert!(
+            item.message.contains("warns for region CN"),
+            "{}",
+            item.message
+        );
+        assert_eq!(item.action, None);
+
+        // Allow: silence.
+        assert!(regional_diag_item(&outcome(Some("DE"), "allow"), None).is_none());
+        assert!(regional_diag_item(&outcome(None, "allow"), None).is_none());
+
+        // The disabled action copy points at the documented override file
+        // when a state dir is available.
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let item = regional_diag_item(&outcome(Some("IR"), "disabled"), Some(dir.path()))
+            .expect("disabled item");
+        let action = item.action.expect("action");
+        assert!(action.contains("regional_policy.json"), "{action}");
     }
 
     #[test]

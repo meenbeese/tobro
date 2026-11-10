@@ -122,6 +122,12 @@ interface KindnessStatusView {
     metered_link?: string;
     charging?: string;
   };
+  region?: {
+    country?: string | null;
+    source?: string;
+    policy?: string;
+    note?: string | null;
+  };
   stats?: {
     available?: boolean;
     current?: number;
@@ -180,6 +186,23 @@ function kindnessPauseLabel(reason: string): string {
     return "Paused: the device is not charging";
   }
   return `Paused: ${reason}`;
+}
+
+function kindnessRegionLabel(region: {
+  country?: string | null;
+  source?: string;
+  policy?: string;
+  note?: string | null;
+}): string | null {
+  if (region.policy === "disabled") {
+    return `Kindness Mode is disabled for region ${
+      region.country ?? "unknown"
+    } by the regional policy`;
+  }
+  if (region.policy === "warn") {
+    return `Regional policy warning for region ${region.country ?? "unknown"}`;
+  }
+  return null;
 }
 
 interface ConfigResponse {
@@ -3914,6 +3937,21 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   {kindnessPauseLabel(kindnessStatus.limits.paused_reason)}
                 </p>
               ) : null}
+              {kindnessStatus?.region &&
+                (kindnessRegionLabel(kindnessStatus.region) ? (
+                  <p
+                    className={
+                      kindnessStatus.region.policy === "disabled"
+                        ? "error"
+                        : "kindness-paused"
+                    }
+                  >
+                    {kindnessRegionLabel(kindnessStatus.region)}
+                    {kindnessStatus.region.note
+                      ? `. ${kindnessStatus.region.note}`
+                      : ""}
+                  </p>
+                ) : null)}
               {kindnessStatus?.stats ? (
                 kindnessStatus.stats.available ? (
                   <div className="kindness-stats">

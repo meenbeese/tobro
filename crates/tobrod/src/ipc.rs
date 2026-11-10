@@ -719,11 +719,38 @@ struct KindnessStatsView {
     updated_at: i64,
 }
 
+/// `kindness.status` regional-policy block input (F-67).
+#[derive(Debug, Clone)]
+struct KindnessRegionView {
+    country: Option<String>,
+    source: &'static str,
+    policy: &'static str,
+    note: Option<String>,
+}
+
+/// Compute the regional-policy view for a loaded config, reading the
+/// bundled policy plus any state-dir override. Blocking but tiny; call it
+/// under `spawn_blocking`.
+fn kindness_region_view(
+    config: &tobro_config::Config,
+    state_dir: &std::path::Path,
+) -> KindnessRegionView {
+    let policy = crate::regional_policy::load(Some(state_dir));
+    let outcome = crate::regional_policy::outcome_for(&policy, config);
+    KindnessRegionView {
+        country: outcome.country,
+        source: outcome.source,
+        policy: outcome.policy,
+        note: outcome.note,
+    }
+}
+
 fn kindness_status_json(
     config: Option<&tobro_config::KindnessConfig>,
     snapshot: Option<&crate::pt_supervisor::SidecarSnapshot>,
     limits: Option<&crate::kindness_limits::LimitsObserved>,
     stats: Option<&KindnessStatsView>,
+    region: Option<&KindnessRegionView>,
 ) -> Result<serde_json::Value, String> {
     let config = config.ok_or_else(|| "kindness config is unavailable".to_owned())?;
     let limits = limits.cloned().unwrap_or_default();
@@ -763,6 +790,17 @@ fn kindness_status_json(
             "paused_reason": limits.paused_reason.map(|reason| reason.as_str()),
             "metered_link": limits.metered.as_str(),
             "charging": limits.charging.as_str(),
+        },
+        "region": match region {
+            Some(region) => json!({
+                "country": region.country,
+                "source": region.source,
+                "policy": region.policy,
+                "note": region.note,
+            }),
+            // Policy not resolvable here (no config/state-dir): absent, not
+            // an "allow" verdict pretending it was checked.
+            None => json!({ "available": false }),
         },
         "stats": match stats {
             Some(stats) => json!({
@@ -1318,10 +1356,15 @@ impl DaemonControl for SupervisorControl {
             .and_then(|shared| shared.read().ok())
             .map(|guard| guard.clone());
         let path = self.config_path.clone();
-        let config = tokio::task::spawn_blocking(move || load_current_config(&path))
-            .await
-            .map_err(|e| format!("kindness status task failed: {e}"))?
-            .map_err(|e| format!("kindness status failed: {e}"))?;
+        let state_dir = self.state_dir.clone();
+        let (config, region) = tokio::task::spawn_blocking(move || {
+            let config = load_current_config(&path)?;
+            let region = kindness_region_view(&config, &state_dir);
+            Ok::<(tobro_config::Config, KindnessRegionView), String>((config, region))
+        })
+        .await
+        .map_err(|e| format!("kindness status task failed: {e}"))?
+        .map_err(|e| format!("kindness status failed: {e}"))?;
         // Stats persist in the store; a failed read reports zeros (a failed
         // display should not pretend numbers are fresh).
         let pending = match tobro_store::Db::open(&self.db_path()).await {
@@ -1346,6 +1389,7 @@ impl DaemonControl for SupervisorControl {
             snapshot.as_ref(),
             limits.as_ref(),
             Some(&stats),
+            Some(&region),
         )
     }
 
@@ -1376,7 +1420,7 @@ impl DaemonControl for SupervisorControl {
                 .await
                 .map_err(|e| format!("kindness check task failed: {e}"))?
                 .map_err(|e| format!("failed to load config: {e}"))?;
-        let report = crate::kindness_diag::run_eligibility(&config.kindness, &state_dir).await;
+        let report = crate::kindness_diag::run_eligibility(&config, &state_dir).await;
         let mut response = serde_json::to_value(&report)
             .map_err(|e| format!("could not serialize kindness report: {e}"))?;
         redact_report_strings(&mut response);
@@ -2790,7 +2834,7 @@ mod config_tests {
     #[test]
     fn kindness_status_reports_config_and_disabled_sidecar() {
         let config = tobro_config::Config::default();
-        let value = kindness_status_json(Some(&config.kindness), None, None, None)
+        let value = kindness_status_json(Some(&config.kindness), None, None, None, None)
             .expect("kindness status payload");
         assert_eq!(value["ok"], true);
         assert_eq!(value["action"], "kindness.status");
@@ -2798,6 +2842,11 @@ mod config_tests {
         assert_eq!(value["sidecar"]["state"], "disabled");
         assert_eq!(value["sidecar"]["pid"], serde_json::Value::Null);
         assert_eq!(value["config"]["capacity"], serde_json::Value::Null);
+        assert_eq!(
+            value["region"],
+            json!({ "available": false }),
+            "no policy input: the region block is absent, not an allow verdict"
+        );
         // Limit defaults, with no watcher state available yet.
         assert_eq!(value["config"]["pause_on_metered"], true);
         assert_eq!(value["config"]["pause_when_not_charging"], false);
@@ -2817,7 +2866,7 @@ mod config_tests {
             last_error: Some("password=supersecret".to_owned()),
             pid: Some(4242),
         };
-        let value = kindness_status_json(Some(&config.kindness), Some(&snapshot), None, None)
+        let value = kindness_status_json(Some(&config.kindness), Some(&snapshot), None, None, None)
             .expect("payload");
         assert_eq!(value["sidecar"]["state"], "failed");
         assert_eq!(value["sidecar"]["pid"], 4242);
@@ -2828,6 +2877,20 @@ mod config_tests {
                 .contains("supersecret"),
             "sidecar errors must be redacted in kindness.status"
         );
+
+        // A regional-policy view surfaces in the region block (F-67).
+        let region = KindnessRegionView {
+            country: Some("IR".to_owned()),
+            source: "bridges",
+            policy: "disabled",
+            note: Some("regional policy note".to_owned()),
+        };
+        let value = kindness_status_json(Some(&config.kindness), None, None, None, Some(&region))
+            .expect("payload");
+        assert_eq!(value["region"]["country"], "IR");
+        assert_eq!(value["region"]["source"], "bridges");
+        assert_eq!(value["region"]["policy"], "disabled");
+        assert_eq!(value["region"]["note"], "regional policy note");
     }
 
     #[test]
@@ -2841,7 +2904,7 @@ mod config_tests {
             week_start: "2026-11-09".to_owned(),
             updated_at: 1_762_771_509_000,
         };
-        let value = kindness_status_json(Some(&config.kindness), None, None, Some(&stats))
+        let value = kindness_status_json(Some(&config.kindness), None, None, Some(&stats), None)
             .expect("payload");
         assert_eq!(value["stats"]["available"], true);
         assert_eq!(value["stats"]["current"], 2);
@@ -2858,8 +2921,9 @@ mod config_tests {
             week_start: "2026-11-09".to_owned(),
             updated_at: 1_762_771_509_000,
         };
-        let value = kindness_status_json(Some(&config.kindness), None, None, Some(&unavailable))
-            .expect("payload");
+        let value =
+            kindness_status_json(Some(&config.kindness), None, None, Some(&unavailable), None)
+                .expect("payload");
         assert_eq!(value["stats"]["available"], false);
         assert_eq!(value["stats"]["current"], 0);
     }
