@@ -154,6 +154,20 @@ pub struct NewClientAuthCredential {
     pub public_key: String,
 }
 
+/// Stored Kindness Mode connection statistics (`kindness.stats`).
+///
+/// Counts only: no client addresses, labels, or countries are recorded.
+/// `week_start` is the UTC date (YYYY-MM-DD) of the Monday that the
+/// `week_served` counter applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindnessStats {
+    pub total_served: u64,
+    pub week_start: String,
+    pub week_served: u64,
+    /// Unix timestamp in milliseconds, 0 when nothing was counted yet.
+    pub updated_at: i64,
+}
+
 /// Embedded libSQL store handle.
 pub struct Db {
     _db: Database,
@@ -482,6 +496,83 @@ impl Db {
                 id: id.to_owned(),
             });
         }
+        Ok(())
+    }
+
+    /// Read the Kindness Mode connection statistics (`kindness.stats`).
+    pub async fn kindness_stats(&self) -> Result<KindnessStats, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT total_served, week_start, week_served, updated_at FROM kindness_stats WHERE id = 1",
+                params![],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            // The row is seeded by the schema; a missing row still yields zeros.
+            return Ok(KindnessStats {
+                total_served: 0,
+                week_start: String::new(),
+                week_served: 0,
+                updated_at: 0,
+            });
+        };
+        Ok(KindnessStats {
+            total_served: row.get::<Option<i64>>(0)?.unwrap_or_default().max(0) as u64,
+            week_start: row.get::<Option<String>>(1)?.unwrap_or_default(),
+            week_served: row.get::<Option<i64>>(2)?.unwrap_or_default().max(0) as u64,
+            updated_at: row.get::<Option<i64>>(3)?.unwrap_or_default(),
+        })
+    }
+
+    /// Record that `served` additional clients connected and add it to both
+    /// counters. `week_start` is the caller's current ISO week start (UTC date
+    /// of Monday): when the stored week differs, the weekly counter restarts
+    /// at the new week, so the weekly number always covers exactly the stored
+    /// week. Returns the updated row.
+    pub async fn kindness_stats_record_served(
+        &self,
+        served: u64,
+        week_start: &str,
+        updated_at: i64,
+    ) -> Result<KindnessStats, StoreError> {
+        let current = self.kindness_stats().await?;
+        let (week_start, week_increment) = if current.week_start == week_start {
+            (current.week_start, current.week_served)
+        } else {
+            (week_start.to_owned(), 0)
+        };
+        let total = current.total_served.saturating_add(served);
+        let week = week_increment.saturating_add(served);
+        self.conn
+            .execute(
+                "INSERT INTO kindness_stats (id, total_served, week_start, week_served, updated_at) VALUES (1, ?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET total_served = ?1, week_start = ?2, week_served = ?3, updated_at = ?4",
+                params![
+                    total as i64,
+                    week_start.as_str(),
+                    week as i64,
+                    updated_at
+                ],
+            )
+            .await?;
+        Ok(KindnessStats {
+            total_served: total,
+            week_start,
+            week_served: week,
+            updated_at,
+        })
+    }
+
+    /// Reset every stored Kindness Mode counter. Volatile state (current
+    /// connections) is managed by the daemon, not the store.
+    pub async fn kindness_stats_reset(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE kindness_stats SET total_served = 0, week_start = '', week_served = 0, updated_at = 0 WHERE id = 1",
+                params![],
+            )
+            .await?;
         Ok(())
     }
 
@@ -829,6 +920,52 @@ mod tests {
         let row = rows.next().await?.ok_or("expected a row from COUNT(*)")?;
         let count: i64 = row.get(0)?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kindness_stats_start_at_zero_and_roll_over_weekly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let db = Db::open(&dir.path().join("test.sqlite3")).await?;
+
+        let empty = db.kindness_stats().await?;
+        assert_eq!(empty.total_served, 0);
+        assert_eq!(empty.week_served, 0);
+        assert_eq!(empty.updated_at, 0);
+
+        // First recording: totals and the week counter both move.
+        let first = db
+            .kindness_stats_record_served(3, "2026-11-09", 1_000)
+            .await?;
+        assert_eq!(first.total_served, 3);
+        assert_eq!(first.week_start, "2026-11-09");
+        assert_eq!(first.week_served, 3);
+        assert_eq!(first.updated_at, 1_000);
+
+        // Same week: counters accumulate, week start is retained.
+        let second = db
+            .kindness_stats_record_served(2, "2026-11-09", 2_000)
+            .await?;
+        assert_eq!(second.total_served, 5);
+        assert_eq!(second.week_start, "2026-11-09");
+        assert_eq!(second.week_served, 5);
+
+        // New week: only the weekly counter restarts; the total survives.
+        let rolled = db
+            .kindness_stats_record_served(1, "2026-11-16", 3_000)
+            .await?;
+        assert_eq!(rolled.total_served, 6);
+        assert_eq!(rolled.week_start, "2026-11-16");
+        assert_eq!(rolled.week_served, 1);
+        assert_eq!(rolled.updated_at, 3_000);
+
+        // Reset: all counters zero, and the next week takes over cleanly.
+        db.kindness_stats_reset().await?;
+        let reset = db.kindness_stats().await?;
+        assert_eq!(reset.total_served, 0);
+        assert_eq!(reset.week_served, 0);
+        assert_eq!(reset.updated_at, 0);
         Ok(())
     }
 

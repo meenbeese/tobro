@@ -88,6 +88,9 @@ pub mod methods {
     /// discovery/mapping, broker reachability). Network-touching; may take
     /// seconds. No params.
     pub const KINDNESS_CHECK: &str = "kindness.check";
+    /// Clear the stored Kindness served counters (weekly/all-time) and the
+    /// volatile current-connections count. No params, no secrets.
+    pub const KINDNESS_RESET_STATS: &str = "kindness.reset_stats";
 
     /// List hosted onion services.
     pub const ONION_LIST: &str = "onion.list";
@@ -141,6 +144,7 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::OUTBOUND_PROXY_CLEAR_PASSWORD
             | methods::KINDNESS_STATUS
             | methods::KINDNESS_CHECK
+            | methods::KINDNESS_RESET_STATS
             | methods::ONION_LIST
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
@@ -169,6 +173,7 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::CONFIG_GET
         | methods::KINDNESS_STATUS
         | methods::KINDNESS_CHECK
+        | methods::KINDNESS_RESET_STATS
         | methods::ONION_LIST
         | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
         methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
@@ -1033,9 +1038,26 @@ mod tests {
     }
 
     #[test]
+    fn kindness_reset_stats_is_allowlisted_without_params() {
+        assert!(is_allowed_method(methods::KINDNESS_RESET_STATS));
+        assert!(validate_params(methods::KINDNESS_RESET_STATS, &None).is_ok());
+        // Empty object still counts as "no params" for this method.
+        assert!(
+            validate_params(methods::KINDNESS_RESET_STATS, &Some(serde_json::json!({}))).is_ok()
+        );
+        assert!(
+            validate_params(
+                methods::KINDNESS_RESET_STATS,
+                &Some(serde_json::json!({"x": 1}))
+            )
+            .is_err()
+        );
+        assert!(validate_params(methods::KINDNESS_STATUS, &None).is_ok());
+    }
+
+    #[test]
     fn validates_backup_restore_params() {
         let ph = || Some(serde_json::json!({ "passphrase": "pw" }));
-
         // Backup requires a string passphrase; restore additionally requires
         // the bundle envelope object.
         assert!(validate_params(methods::ONION_BACKUP, &ph()).is_ok());

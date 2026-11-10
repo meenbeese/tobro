@@ -242,6 +242,12 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     /// gateway discovery/mapping (F-62), broker/binary bootstrap checks
     /// (F-66). Network-touching.
     fn kindness_check(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Clear the persisted Kindness served counters (`kindness.reset_stats`):
+    /// zeroes the weekly and all-time totals in the store and the volatile
+    /// current-connections count. No params, no sidecar restart.
+    fn kindness_reset_stats(
+        &self,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// List hosted onion services.
     fn onion_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Create a hosted onion service.
@@ -690,15 +696,34 @@ fn outbound_clear_password_at(
 }
 
 /// Build the `kindness.status` payload: config summary + live sidecar state
-/// (when Kindness Mode spawned a proxy) + observed limit state. No secrets:
-/// `[kindness]` has none, and the sidecar `last_error` is passed through
-/// [`redact_secrets`].
+/// (when Kindness Mode spawned a proxy) + observed limit state + connection
+/// statistics. No secrets: `[kindness]` has none, and the sidecar
+/// `last_error` is passed through [`redact_secrets`].
 const SIDECAR_ID_DEFAULT: &str = "snowflake-proxy";
+
+/// `kindness.status` stats-block input.
+#[derive(Debug, Clone)]
+struct KindnessStatsView {
+    /// Whether counting is active (`stats` on, or the user opted into
+    /// verbose proxy logs): the proxy then emits per-connection lines.
+    available: bool,
+    /// Connections currently open (volatile; resets on daemon restart).
+    current: u32,
+    /// All-time served counter (persisted in the store). Zeros when the
+    /// store could not be read — a display, never a claim.
+    served_total: u64,
+    served_week: u64,
+    /// UTC date of the Monday the weekly counter applies to.
+    week_start: String,
+    /// Unix timestamp in milliseconds (0 when nothing was counted yet).
+    updated_at: i64,
+}
 
 fn kindness_status_json(
     config: Option<&tobro_config::KindnessConfig>,
     snapshot: Option<&crate::pt_supervisor::SidecarSnapshot>,
     limits: Option<&crate::kindness_limits::LimitsObserved>,
+    stats: Option<&KindnessStatsView>,
 ) -> Result<serde_json::Value, String> {
     let config = config.ok_or_else(|| "kindness config is unavailable".to_owned())?;
     let limits = limits.cloned().unwrap_or_default();
@@ -738,6 +763,19 @@ fn kindness_status_json(
             "paused_reason": limits.paused_reason.map(|reason| reason.as_str()),
             "metered_link": limits.metered.as_str(),
             "charging": limits.charging.as_str(),
+        },
+        "stats": match stats {
+            Some(stats) => json!({
+                "available": stats.available,
+                "current": stats.current,
+                "served_total": stats.served_total,
+                "served_week": stats.served_week,
+                "week_start": stats.week_start,
+                "updated_at": stats.updated_at,
+            }),
+            // No stats handle at all (kindness sidecar absent): the block is
+            // unavailable rather than a zero pretending everything is fine.
+            None => json!({ "available": false }),
         },
     }))
 }
@@ -942,6 +980,8 @@ pub struct SupervisorControl {
     kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
     /// Shared limit-state (metered/charging watcher) for `kindness.status`.
     kindness_limits: Option<crate::kindness_limits::LimitShared>,
+    /// Shared volatile stats (current connections) for `kindness.status`.
+    kindness_stats: Option<crate::kindness_stats::StatsShared>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -964,6 +1004,7 @@ impl SupervisorControl {
         secrets: Arc<dyn SecretStore>,
         kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
         kindness_limits: Option<crate::kindness_limits::LimitShared>,
+        kindness_stats: Option<crate::kindness_stats::StatsShared>,
     ) -> Self {
         Self {
             handle,
@@ -974,6 +1015,7 @@ impl SupervisorControl {
             secrets,
             kindness,
             kindness_limits,
+            kindness_stats,
         }
     }
 
@@ -1261,17 +1303,69 @@ impl DaemonControl for SupervisorControl {
 
     async fn kindness_status(&self) -> Result<serde_json::Value, String> {
         let snapshot = self.kindness.as_ref().map(|handle| handle.snapshot());
+        // A poisoned lock means the counters are untrustworthy: fall back to
+        // defaults (zeros) instead of reading possibly torn state, and leave
+        // the limits label "unknown". Best-effort display state, never a
+        // claim.
+        let live = self
+            .kindness_stats
+            .as_ref()
+            .and_then(|shared| shared.read().ok())
+            .map(|guard| guard.clone());
         let limits = self
             .kindness_limits
             .as_ref()
-            .map(|shared| shared.read().expect("kindness limits lock").clone());
+            .and_then(|shared| shared.read().ok())
+            .map(|guard| guard.clone());
         let path = self.config_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let config = load_current_config(&path)?;
-            kindness_status_json(Some(&config.kindness), snapshot.as_ref(), limits.as_ref())
-        })
-        .await
-        .map_err(|e| format!("kindness status task failed: {e}"))?
+        let config = tokio::task::spawn_blocking(move || load_current_config(&path))
+            .await
+            .map_err(|e| format!("kindness status task failed: {e}"))?
+            .map_err(|e| format!("kindness status failed: {e}"))?;
+        // Stats persist in the store; a failed read reports zeros (a failed
+        // display should not pretend numbers are fresh).
+        let pending = match tobro_store::Db::open(&self.db_path()).await {
+            Ok(db) => db.kindness_stats().await.ok(),
+            Err(_) => None,
+        };
+        let stats = KindnessStatsView {
+            // Counting is only active when the proxy's per-connection log
+            // lines reach tobro (`-verbose` is passed for stats/verbose).
+            available: config.kindness.stats || config.kindness.verbose,
+            current: live.as_ref().map(|s| s.current).unwrap_or(0),
+            served_total: pending.as_ref().map(|s| s.total_served).unwrap_or(0),
+            served_week: pending.as_ref().map(|s| s.week_served).unwrap_or(0),
+            week_start: pending
+                .as_ref()
+                .map(|s| s.week_start.clone())
+                .unwrap_or_default(),
+            updated_at: pending.as_ref().map(|s| s.updated_at).unwrap_or(0),
+        };
+        kindness_status_json(
+            Some(&config.kindness),
+            snapshot.as_ref(),
+            limits.as_ref(),
+            Some(&stats),
+        )
+    }
+
+    async fn kindness_reset_stats(&self) -> Result<serde_json::Value, String> {
+        // Volatile counters go first so the response and the store agree.
+        if let Some(shared) = self.kindness_stats.as_ref() {
+            crate::kindness_stats::reset_live(shared);
+        }
+        tobro_store::Db::open(&self.db_path())
+            .await
+            .map_err(|e| format!("failed to open store: {e}"))?
+            .kindness_stats_reset()
+            .await
+            .map_err(|e| format!("failed to reset kindness stats: {e}"))?;
+        Ok(json!({
+            "ok": true,
+            "action": "kindness.reset_stats",
+            "reset": true,
+            "note": "served connection counters were cleared; the count starts over now",
+        }))
     }
 
     async fn kindness_check(&self) -> Result<serde_json::Value, String> {
@@ -1460,6 +1554,10 @@ impl DaemonControl for SupervisorHandle {
 
     async fn kindness_check(&self) -> Result<serde_json::Value, String> {
         Err("kindness checks require daemon config context".to_owned())
+    }
+
+    async fn kindness_reset_stats(&self) -> Result<serde_json::Value, String> {
+        Err("kindness stats require daemon store context".to_owned())
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -1959,6 +2057,16 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 RpcError::internal(format!("kindness.check failed: {}", redact_secrets(&e))),
             ),
         },
+        methods::KINDNESS_RESET_STATS => match control.kindness_reset_stats().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(
+                id,
+                RpcError::internal(format!(
+                    "kindness.reset_stats failed: {}",
+                    redact_secrets(&e)
+                )),
+            ),
+        },
         methods::ONION_LIST => match control.onion_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
@@ -2255,6 +2363,10 @@ mod daemon_tests {
                 "stun": { "state": "unknown", "mapping_consistency": "unknown" },
                 "upnp": { "state": "unknown" },
             }))
+        }
+
+        async fn kindness_reset_stats(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "kindness.reset_stats", "reset": true }))
         }
 
         async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -2678,7 +2790,7 @@ mod config_tests {
     #[test]
     fn kindness_status_reports_config_and_disabled_sidecar() {
         let config = tobro_config::Config::default();
-        let value = kindness_status_json(Some(&config.kindness), None, None)
+        let value = kindness_status_json(Some(&config.kindness), None, None, None)
             .expect("kindness status payload");
         assert_eq!(value["ok"], true);
         assert_eq!(value["action"], "kindness.status");
@@ -2692,6 +2804,8 @@ mod config_tests {
         assert_eq!(value["limits"]["paused_reason"], serde_json::Value::Null);
         assert_eq!(value["limits"]["metered_link"], "unknown");
         assert_eq!(value["limits"]["charging"], "unknown");
+        // No stats handle on this code path: unavailable, not zero.
+        assert_eq!(value["stats"]["available"], false);
 
         // With a sidecar handle snapshot, the state label comes through and
         // the last error is redacted at this boundary.
@@ -2703,8 +2817,8 @@ mod config_tests {
             last_error: Some("password=supersecret".to_owned()),
             pid: Some(4242),
         };
-        let value =
-            kindness_status_json(Some(&config.kindness), Some(&snapshot), None).expect("payload");
+        let value = kindness_status_json(Some(&config.kindness), Some(&snapshot), None, None)
+            .expect("payload");
         assert_eq!(value["sidecar"]["state"], "failed");
         assert_eq!(value["sidecar"]["pid"], 4242);
         assert!(
@@ -2714,6 +2828,40 @@ mod config_tests {
                 .contains("supersecret"),
             "sidecar errors must be redacted in kindness.status"
         );
+    }
+
+    #[test]
+    fn kindness_status_reports_stats_block() {
+        let config = tobro_config::Config::default();
+        let stats = KindnessStatsView {
+            available: true,
+            current: 2,
+            served_total: 12,
+            served_week: 3,
+            week_start: "2026-11-09".to_owned(),
+            updated_at: 1_762_771_509_000,
+        };
+        let value = kindness_status_json(Some(&config.kindness), None, None, Some(&stats))
+            .expect("payload");
+        assert_eq!(value["stats"]["available"], true);
+        assert_eq!(value["stats"]["current"], 2);
+        assert_eq!(value["stats"]["served_total"], 12);
+        assert_eq!(value["stats"]["served_week"], 3);
+        assert_eq!(value["stats"]["week_start"], "2026-11-09");
+
+        // When counting is disabled the block stays present but honest.
+        let unavailable = KindnessStatsView {
+            available: false,
+            current: 0,
+            served_total: 12,
+            served_week: 3,
+            week_start: "2026-11-09".to_owned(),
+            updated_at: 1_762_771_509_000,
+        };
+        let value = kindness_status_json(Some(&config.kindness), None, None, Some(&unavailable))
+            .expect("payload");
+        assert_eq!(value["stats"]["available"], false);
+        assert_eq!(value["stats"]["current"], 0);
     }
 
     #[test]

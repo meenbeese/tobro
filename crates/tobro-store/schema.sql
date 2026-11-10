@@ -53,3 +53,17 @@ CREATE TABLE IF NOT EXISTS onion_service_client_auth (
 
 CREATE INDEX IF NOT EXISTS onion_service_client_auth_client
     ON onion_service_client_auth(client_auth_id);
+
+-- Kindness Mode connection statistics (`kindness.stats`).
+-- Single lazily-seeded row: counts of clients the proxy served. Nothing about
+-- the clients themselves is recorded (no addresses, no labels, no countries).
+-- `current` connections are volatile daemon state, never stored here.
+CREATE TABLE IF NOT EXISTS kindness_stats (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    total_served INTEGER NOT NULL DEFAULT 0,
+    week_start   TEXT NOT NULL DEFAULT '',
+    week_served  INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO kindness_stats (id) VALUES (1) ON CONFLICT DO NOTHING;

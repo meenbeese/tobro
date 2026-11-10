@@ -83,6 +83,11 @@ onion hosting, Kindness Mode, as well as numerous circumvention methods.
   UPnP gateway/external-IP discovery with port-map setup for the ephemeral
   range, and broker reachability — reported as actionable items (firewall,
   symmetric NAT, conflicting VPN) rather than raw errors.
+- **Stats:** connection counts are gathered from the proxy's own log output
+  (per-connection events, so nothing else is counted): currently open
+  connections (volatile, resets with the daemon) plus weekly and all-time
+  served totals stored in the local database. Counts are numbers only: no
+  client addresses, labels, or countries; reset clears them for good.
 - Honest diagnostics: no invented connectivity claims; states are
   `direct`/`nat`/`unknown` with per-server consistency labels.
 

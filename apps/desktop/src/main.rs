@@ -71,6 +71,7 @@ enum IpcCommand {
     },
     KindnessStatus(oneshot::Sender<Result<Value, String>>),
     KindnessCheck(oneshot::Sender<Result<Value, String>>),
+    KindnessResetStats(oneshot::Sender<Result<Value, String>>),
     ClientAuthList(oneshot::Sender<Result<Value, String>>),
     ClientAuthGenerate {
         params: Value,
@@ -273,6 +274,18 @@ async fn daemon_kindness_check(state: State<'_, AppState>) -> Result<Value, Stri
     state
         .commands
         .send(IpcCommand::KindnessCheck(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_kindness_reset_stats(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::KindnessResetStats(tx))
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -698,6 +711,7 @@ fn main() {
             daemon_test_bridges,
             daemon_kindness_status,
             daemon_kindness_check,
+            daemon_kindness_reset_stats,
             daemon_onion_list,
             daemon_onion_create,
             daemon_onion_update,
@@ -1824,6 +1838,7 @@ fn reject_command(cmd: IpcCommand, message: &str) {
         | IpcCommand::ConfigGet(tx)
         | IpcCommand::KindnessStatus(tx)
         | IpcCommand::KindnessCheck(tx)
+        | IpcCommand::KindnessResetStats(tx)
         | IpcCommand::OnionList(tx)
         | IpcCommand::ClientAuthList(tx) => {
             let _ = tx.send(err);
@@ -1971,6 +1986,14 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
             // Network-touching (STUN/UPnP/broker); no params, may take seconds.
             let result = client
                 .call(methods::KINDNESS_CHECK, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::KindnessResetStats(tx) => {
+            // Clears the stored counters in the daemon store; no params.
+            let result = client
+                .call(methods::KINDNESS_RESET_STATS, None)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);

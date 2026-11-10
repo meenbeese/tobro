@@ -999,6 +999,12 @@ textarea {
   color: var(--warn);
   margin: 4px 0 0;
 }
+.kindness-stats {
+  margin: 4px 0;
+}
+.kindness-stats p {
+  margin: 4px 0;
+}
 .kindness-status h3 {
   margin-bottom: 4px;
 }

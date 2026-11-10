@@ -91,6 +91,7 @@ interface KindnessSettings {
   ephemeral_ports: string;
   pause_on_metered: boolean;
   pause_when_not_charging: boolean;
+  stats: boolean;
 }
 
 const EMPTY_KINDNESS: KindnessSettings = {
@@ -99,6 +100,7 @@ const EMPTY_KINDNESS: KindnessSettings = {
   ephemeral_ports: "",
   pause_on_metered: true,
   pause_when_not_charging: false,
+  stats: true,
 };
 
 interface KindnessStatusView {
@@ -119,6 +121,14 @@ interface KindnessStatusView {
     paused_reason?: string | null;
     metered_link?: string;
     charging?: string;
+  };
+  stats?: {
+    available?: boolean;
+    current?: number;
+    served_total?: number;
+    served_week?: number;
+    week_start?: string;
+    updated_at?: number;
   };
 }
 
@@ -611,9 +621,10 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
           : "",
       ephemeral_ports:
         typeof k?.ephemeral_ports === "string" ? k.ephemeral_ports : "",
-      // Absent keys keep the daemon defaults (metered pause on).
+      // Absent keys keep the daemon defaults (metered pause on, stats on).
       pause_on_metered: k?.pause_on_metered !== false,
       pause_when_not_charging: k?.pause_when_not_charging === true,
+      stats: k?.stats !== false,
     });
     setKindnessDirty(false);
     setKindnessError("");
@@ -639,6 +650,26 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       log(`kindness status failed: ${String(e)}`, "error");
     } finally {
       setKindnessStatusBusy(false);
+    }
+  }
+
+  async function onResetKindnessStats() {
+    if (
+      !window.confirm(
+        "Reset kindness statistics?\n\nThe all-time and weekly served counts go back to zero and cannot be restored.",
+      )
+    ) {
+      return;
+    }
+    setKindnessStatusBusy(true);
+    try {
+      await invoke("daemon_kindness_reset_stats");
+      log("Kindness statistics were reset.", "info");
+    } catch (e) {
+      log(`kindness stats reset failed: ${String(e)}`, "error");
+    } finally {
+      setKindnessStatusBusy(false);
+      void loadKindnessStatus();
     }
   }
 
@@ -676,6 +707,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
             ephemeral_ports: ports,
             pause_on_metered: kindness.pause_on_metered,
             pause_when_not_charging: kindness.pause_when_not_charging,
+            stats: kindness.stats,
           },
         },
       });
@@ -3882,6 +3914,39 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   {kindnessPauseLabel(kindnessStatus.limits.paused_reason)}
                 </p>
               ) : null}
+              {kindnessStatus?.stats ? (
+                kindnessStatus.stats.available ? (
+                  <div className="kindness-stats">
+                    <p>
+                      Connections served:{" "}
+                      <strong>{kindnessStatus.stats.served_total ?? 0}</strong>{" "}
+                      total,{" "}
+                      <strong>{kindnessStatus.stats.served_week ?? 0}</strong>{" "}
+                      this week
+                      {kindnessStatus.stats.week_start
+                        ? ` (week of ${kindnessStatus.stats.week_start})`
+                        : ""}
+                      . Currently open:{" "}
+                      <strong>{kindnessStatus.stats.current ?? 0}</strong>.
+                    </p>
+                    <p className="muted">
+                      {kindnessStatus.stats.updated_at
+                        ? `Last counted ${new Date(kindnessStatus.stats.updated_at).toLocaleString()}. `
+                        : "Nothing counted yet. "}
+                      Counts are stored locally only; no client addresses are
+                      recorded.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="kindness-stats">
+                    <p className="muted">
+                      No connection counts are shown: counting is off in proxy
+                      settings, so the proxy output used for counting is not
+                      collected.
+                    </p>
+                  </div>
+                )
+              ) : null}
               <div className="actions">
                 <button
                   type="button"
@@ -3890,6 +3955,18 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                   onClick={() => void loadKindnessStatus()}
                 >
                   {kindnessStatusBusy ? "Refreshing…" : "Refresh status"}
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={
+                    kindnessStatusBusy ||
+                    (!kindnessStatus?.stats?.available &&
+                      !(kindnessStatus?.stats?.served_total ?? 0))
+                  }
+                  onClick={() => void onResetKindnessStats()}
+                >
+                  Reset statistics
                 </button>
               </div>
             </div>
@@ -3916,6 +3993,20 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 <span>
                   <strong>Run the Snowflake proxy</strong> to donate bandwidth
                   to help censored users connect.
+                </span>
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={kindness.stats}
+                  disabled={kindnessBusy || !kindness.enabled}
+                  onChange={(e) => onKindnessChange("stats", e.target.checked)}
+                />
+                <span>
+                  <strong>Count served connections.</strong> Keeps a weekly and
+                  an all-time total on this computer only, shown in Status.
+                  Needs verbose proxy output, which tobro enables for this
+                  (slightly more log volume, scrubbed of personal data).
                 </span>
               </label>
               <div className="field-row">

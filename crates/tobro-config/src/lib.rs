@@ -194,6 +194,12 @@ fn default_kindness_pause_on_metered() -> bool {
     true
 }
 
+/// Connection statistics default to on: the counters are local-only and the
+/// feature is the point of Kindness Mode's status view.
+fn default_kindness_stats() -> bool {
+    true
+}
+
 fn default_smart_connect_timeout_secs() -> u64 {
     30
 }
@@ -705,6 +711,13 @@ pub struct KindnessConfig {
     /// enforced only when the platform reports battery charging state).
     #[serde(default)]
     pub pause_when_not_charging: bool,
+    /// Count connections served by the proxy (weekly and all-time, stored in
+    /// the local database). Counts come from the proxy's own log output:
+    /// enabling stats makes tobro run the proxy with `-verbose` so its
+    /// per-connection events reach tobro (log volume increases slightly; the
+    /// proxy applies IP scrubbing itself unless unsafe logging is requested).
+    #[serde(default = "default_kindness_stats")]
+    pub stats: bool,
     /// UDP port range for client connections, upstream format `<min>:<max>`
     /// (passed to the proxy as `-ephemeral-ports-range`). Optional: when
     /// unset the proxy picks ephemeral ports automatically.
@@ -744,6 +757,7 @@ impl Default for KindnessConfig {
             capacity: None,
             pause_on_metered: true,
             pause_when_not_charging: false,
+            stats: true,
             ephemeral_ports: None,
             nat_type_force_unrestricted: false,
             verbose: false,
@@ -1396,9 +1410,10 @@ mod tests {
         let kindness = KindnessConfig::default();
         assert!(!kindness.is_active());
         assert!(kindness.validate().is_ok());
-        // Limit defaults: metered pause on, charging pause off.
+        // Limit defaults: metered pause on, charging pause off, stats on.
         assert!(kindness.pause_on_metered);
         assert!(!kindness.pause_when_not_charging);
+        assert!(kindness.stats);
     }
 
     #[test]

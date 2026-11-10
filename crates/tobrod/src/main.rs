@@ -10,6 +10,7 @@ mod ipc;
 pub(crate) mod kindness;
 pub(crate) mod kindness_diag;
 pub(crate) mod kindness_limits;
+pub(crate) mod kindness_stats;
 mod lifecycle;
 pub(crate) mod onion;
 pub(crate) mod outbound;
@@ -173,6 +174,19 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             std::sync::Arc::clone(&kindness_limits),
         );
     }
+    // Stats (M6): count served clients from the proxy's log output. The
+    // volatile current-connections count is always shared so
+    // `kindness.status` can report it; the counts persist in the store.
+    let kindness_stats: crate::kindness_stats::StatsShared = std::sync::Arc::new(
+        std::sync::RwLock::new(crate::kindness_stats::StatsLive::default()),
+    );
+    if let Some((supervisor, _events)) = kindness.as_ref() {
+        crate::kindness_stats::spawn_tracker(
+            supervisor.control_handle().subscribe_events(),
+            state_dir.join(tobro_store::DB_FILE_NAME),
+            std::sync::Arc::clone(&kindness_stats),
+        );
+    }
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
@@ -216,6 +230,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             .as_ref()
             .map(|(supervisor, _events)| supervisor.control_handle()),
         Some(std::sync::Arc::clone(&kindness_limits)),
+        Some(std::sync::Arc::clone(&kindness_stats)),
     );
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();

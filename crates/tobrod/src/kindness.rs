@@ -32,7 +32,7 @@ use crate::pt_supervisor::{
 use crate::redact::redact_secrets;
 
 /// Logical sidecar id (for logs/events).
-const SIDECAR_ID: &str = "snowflake-proxy";
+pub(crate) const SIDECAR_ID: &str = "snowflake-proxy";
 
 /// Candidate binary names, in search order (`snowflake-client` is the PT
 /// client sidecar; the proxy binary has its own name).
@@ -120,7 +120,12 @@ pub(crate) fn build_args(cfg: &tobro_config::KindnessConfig) -> Vec<OsString> {
         args.push("-ephemeral-ports-range".into());
         args.push(format!("{min}:{max}").into());
     }
-    if cfg.verbose {
+    // tobro runs the proxy with `-verbose` whenever it must observe
+    // connection events: the per-connection `Data Channel ... open`/`close`
+    // lines are only emitted when the package log is not discarded (upstream
+    // writes them via `log.Printf`, silenced by default). The stats counter
+    // (`stats`, default on) and the explicit verbose opt-in both need it.
+    if cfg.verbose || cfg.stats {
         args.push("-verbose".into());
     }
     if cfg.nat_type_force_unrestricted {
@@ -332,15 +337,21 @@ mod tests {
     }
 
     #[test]
-    fn default_config_yields_no_args() {
+    fn default_config_yields_only_the_stats_verbose_flag() {
         let cfg = default_cfg();
         assert!(cfg.validate().is_ok());
+        // Statistics default on and need the proxy's `-verbose` output.
+        assert_eq!(build_args(&cfg), vec![OsStr::new("-verbose")]);
+        // Opting out of stats (and not opting into verbose) removes it.
+        let mut cfg = cfg.clone();
+        cfg.stats = false;
         assert!(build_args(&cfg).is_empty());
     }
 
     #[test]
     fn build_args_passes_configured_flags_in_order() {
         let cfg = cfg_with(|c| {
+            c.stats = false;
             c.broker_url = Some(" https://broker.example.com/ ".to_owned());
             c.relay_url = Some("wss://relay.example.com/".to_owned());
             c.stun_url = Some("stun:stun.example.com:3478".to_owned());
@@ -372,6 +383,7 @@ mod tests {
     #[test]
     fn build_args_appends_extra_args_last() {
         let cfg = cfg_with(|c| {
+            c.stats = false;
             c.verbose = true;
             c.extra_args = vec!["--foo".to_owned(), "bar baz".to_owned()];
         });
@@ -389,6 +401,7 @@ mod tests {
     #[test]
     fn build_spec_uses_private_state_dir_and_no_pt_gate() {
         let cfg = cfg_with(|c| {
+            c.stats = false;
             c.relay_url = Some("wss://relay.example.com/".to_owned());
         });
         let spec = build_spec(
