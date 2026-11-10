@@ -690,15 +690,18 @@ fn outbound_clear_password_at(
 }
 
 /// Build the `kindness.status` payload: config summary + live sidecar state
-/// (when Kindness Mode spawned a proxy). No secrets: `[kindness]` has none,
-/// and the sidecar `last_error` is passed through [`redact_secrets`].
+/// (when Kindness Mode spawned a proxy) + observed limit state. No secrets:
+/// `[kindness]` has none, and the sidecar `last_error` is passed through
+/// [`redact_secrets`].
 const SIDECAR_ID_DEFAULT: &str = "snowflake-proxy";
 
 fn kindness_status_json(
     config: Option<&tobro_config::KindnessConfig>,
     snapshot: Option<&crate::pt_supervisor::SidecarSnapshot>,
+    limits: Option<&crate::kindness_limits::LimitsObserved>,
 ) -> Result<serde_json::Value, String> {
     let config = config.ok_or_else(|| "kindness config is unavailable".to_owned())?;
+    let limits = limits.cloned().unwrap_or_default();
     let (sidecar_id, sidecar_state, last_error, sidecar_pid) = match snapshot {
         None => (SIDECAR_ID_DEFAULT, "disabled", None, None),
         Some(snapshot) => {
@@ -728,6 +731,13 @@ fn kindness_status_json(
             "stun_url": config.stun_url,
             "nat_type_force_unrestricted": config.nat_type_force_unrestricted,
             "verbose": config.verbose,
+            "pause_on_metered": config.pause_on_metered,
+            "pause_when_not_charging": config.pause_when_not_charging,
+        },
+        "limits": {
+            "paused_reason": limits.paused_reason.map(|reason| reason.as_str()),
+            "metered_link": limits.metered.as_str(),
+            "charging": limits.charging.as_str(),
         },
     }))
 }
@@ -930,6 +940,8 @@ pub struct SupervisorControl {
     secrets: Arc<dyn SecretStore>,
     /// Spawned snowflake-proxy handle when Kindness Mode is active.
     kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
+    /// Shared limit-state (metered/charging watcher) for `kindness.status`.
+    kindness_limits: Option<crate::kindness_limits::LimitShared>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -951,6 +963,7 @@ impl SupervisorControl {
         listeners: Arc<RwLock<ListenerConfig>>,
         secrets: Arc<dyn SecretStore>,
         kindness: Option<crate::pt_supervisor::PtSidecarHandle>,
+        kindness_limits: Option<crate::kindness_limits::LimitShared>,
     ) -> Self {
         Self {
             handle,
@@ -960,6 +973,7 @@ impl SupervisorControl {
             outbound_sidecar: Arc::new(tokio::sync::Mutex::new(None)),
             secrets,
             kindness,
+            kindness_limits,
         }
     }
 
@@ -1247,10 +1261,14 @@ impl DaemonControl for SupervisorControl {
 
     async fn kindness_status(&self) -> Result<serde_json::Value, String> {
         let snapshot = self.kindness.as_ref().map(|handle| handle.snapshot());
+        let limits = self
+            .kindness_limits
+            .as_ref()
+            .map(|shared| shared.read().expect("kindness limits lock").clone());
         let path = self.config_path.clone();
         tokio::task::spawn_blocking(move || {
             let config = load_current_config(&path)?;
-            kindness_status_json(Some(&config.kindness), snapshot.as_ref())
+            kindness_status_json(Some(&config.kindness), snapshot.as_ref(), limits.as_ref())
         })
         .await
         .map_err(|e| format!("kindness status task failed: {e}"))?
@@ -2660,14 +2678,20 @@ mod config_tests {
     #[test]
     fn kindness_status_reports_config_and_disabled_sidecar() {
         let config = tobro_config::Config::default();
-        let value =
-            kindness_status_json(Some(&config.kindness), None).expect("kindness status payload");
+        let value = kindness_status_json(Some(&config.kindness), None, None)
+            .expect("kindness status payload");
         assert_eq!(value["ok"], true);
         assert_eq!(value["action"], "kindness.status");
         assert_eq!(value["enabled"], false);
         assert_eq!(value["sidecar"]["state"], "disabled");
         assert_eq!(value["sidecar"]["pid"], serde_json::Value::Null);
         assert_eq!(value["config"]["capacity"], serde_json::Value::Null);
+        // Limit defaults, with no watcher state available yet.
+        assert_eq!(value["config"]["pause_on_metered"], true);
+        assert_eq!(value["config"]["pause_when_not_charging"], false);
+        assert_eq!(value["limits"]["paused_reason"], serde_json::Value::Null);
+        assert_eq!(value["limits"]["metered_link"], "unknown");
+        assert_eq!(value["limits"]["charging"], "unknown");
 
         // With a sidecar handle snapshot, the state label comes through and
         // the last error is redacted at this boundary.
@@ -2679,7 +2703,8 @@ mod config_tests {
             last_error: Some("password=supersecret".to_owned()),
             pid: Some(4242),
         };
-        let value = kindness_status_json(Some(&config.kindness), Some(&snapshot)).expect("payload");
+        let value =
+            kindness_status_json(Some(&config.kindness), Some(&snapshot), None).expect("payload");
         assert_eq!(value["sidecar"]["state"], "failed");
         assert_eq!(value["sidecar"]["pid"], 4242);
         assert!(

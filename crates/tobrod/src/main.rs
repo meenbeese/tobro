@@ -9,6 +9,7 @@ mod client_auth;
 mod ipc;
 pub(crate) mod kindness;
 pub(crate) mod kindness_diag;
+pub(crate) mod kindness_limits;
 mod lifecycle;
 pub(crate) mod onion;
 pub(crate) mod outbound;
@@ -159,6 +160,19 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     } else {
         None
     };
+    // Limits (M6): best-effort pause rules for the proxy. A shared observed
+    // state is always created so `kindness.status` can report it; the
+    // watcher only runs while a pause rule is enabled.
+    let kindness_limits: crate::kindness_limits::LimitShared = std::sync::Arc::new(
+        std::sync::RwLock::new(crate::kindness_limits::LimitsObserved::default()),
+    );
+    if let Some((supervisor, _events)) = kindness.as_ref() {
+        crate::kindness_limits::spawn_watcher(
+            supervisor.control_handle(),
+            &config.kindness,
+            std::sync::Arc::clone(&kindness_limits),
+        );
+    }
     let listeners =
         std::sync::Arc::new(std::sync::RwLock::new(tobro_tor::adapter::ListenerConfig {
             socks_port: config.proxy.socks_port,
@@ -201,6 +215,7 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         kindness
             .as_ref()
             .map(|(supervisor, _events)| supervisor.control_handle()),
+        Some(std::sync::Arc::clone(&kindness_limits)),
     );
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();

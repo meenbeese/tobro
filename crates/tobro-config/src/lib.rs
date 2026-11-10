@@ -188,6 +188,12 @@ fn default_smart_connect() -> bool {
     true
 }
 
+/// Pause-on-metered defaults to true so Kindness Mode does not donate on
+/// capped links unless detection is explicitly disabled.
+fn default_kindness_pause_on_metered() -> bool {
+    true
+}
+
 fn default_smart_connect_timeout_secs() -> u64 {
     30
 }
@@ -669,7 +675,7 @@ impl Default for LoggingConfig {
 /// flags explicitly configured, and unknown behaviors can be reached with
 /// `extra_args`. See upstream `snowflake/proxy` (broker
 /// `https://snowflake-broker.torproject.net/`, relay `wss://snowflake.torproject.net/`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KindnessConfig {
     /// Run `snowflake-proxy` while the daemon runs.
@@ -685,9 +691,20 @@ pub struct KindnessConfig {
     pub stun_url: Option<String>,
     /// Maximum concurrent clients to serve. Only forwarded as `-capacity`
     /// when set: current upstream releases derive capacity from the broker,
-    /// while older releases accept the flag.
+    /// while older releases accept the flag. This is the connection cap;
+    /// upstream `snowflake-proxy` exposes no bandwidth-limit flag, so
+    /// per-connection serving volume cannot be capped by binary release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u32>,
+    /// Pause the proxy while a metered connection is detected (best effort:
+    /// enforced only when the platform reports the link as metered; desktop
+    /// platforms with no metered-link API stay unthrottled).
+    #[serde(default = "default_kindness_pause_on_metered")]
+    pub pause_on_metered: bool,
+    /// Pause the proxy while the device runs on battery (best effort:
+    /// enforced only when the platform reports battery charging state).
+    #[serde(default)]
+    pub pause_when_not_charging: bool,
     /// UDP port range for client connections, upstream format `<min>:<max>`
     /// (passed to the proxy as `-ephemeral-ports-range`). Optional: when
     /// unset the proxy picks ephemeral ports automatically.
@@ -712,6 +729,30 @@ pub struct KindnessConfig {
     /// Extra raw arguments passed through to the proxy (power users only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+}
+
+impl Default for KindnessConfig {
+    /// Hand-rolled so the two pause-limit defaults agree with serde: a missing
+    /// key, `Config::default()`, and the TOML default fn all say the same
+    /// thing (pause on metered yes, pause when not charging no).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            broker_url: None,
+            relay_url: None,
+            stun_url: None,
+            capacity: None,
+            pause_on_metered: true,
+            pause_when_not_charging: false,
+            ephemeral_ports: None,
+            nat_type_force_unrestricted: false,
+            verbose: false,
+            sha256_hex: None,
+            proxy_path: None,
+            proxy_dir: None,
+            extra_args: Vec::new(),
+        }
+    }
 }
 
 impl KindnessConfig {
@@ -1355,6 +1396,28 @@ mod tests {
         let kindness = KindnessConfig::default();
         assert!(!kindness.is_active());
         assert!(kindness.validate().is_ok());
+        // Limit defaults: metered pause on, charging pause off.
+        assert!(kindness.pause_on_metered);
+        assert!(!kindness.pause_when_not_charging);
+    }
+
+    #[test]
+    fn kindness_limit_flags_parse_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[kindness]\npause_on_metered = false\npause_when_not_charging = true\n",
+        )?;
+        let config = Config::load(&path)?;
+        assert!(!config.kindness.pause_on_metered);
+        assert!(config.kindness.pause_when_not_charging);
+        // Older configs without limit keys get the defaults.
+        std::fs::write(&path, "version = 1\n[kindness]\n")?;
+        let legacy = Config::load(&path)?;
+        assert!(legacy.kindness.pause_on_metered);
+        assert!(!legacy.kindness.pause_when_not_charging);
+        Ok(())
     }
 
     #[test]

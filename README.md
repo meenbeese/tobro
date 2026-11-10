@@ -1,19 +1,133 @@
-# tobro
+# Tobro
 
-A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
+A ground up, native, and desktop-only implementation of the Tor client using modern
+technologies that reproduces the useful surface of Orbot using Rust/Arti and Tauri.
+Supports connect/disconnect, bridges and pluggable transports, local proxy services,
+onion hosting, Kindness Mode, as well as numerous circumvention methods.
 
-**Status:** M0-M5 complete; M6 in progress.
+**Status:** M0-M5 shipped; M6 in progress.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
+
+## Screenshot
+
+![Tobro app UI](apps/desktop/assets/screenshot.png)
+
+## Features
+
+### Core Tor connectivity
+
+- One-click connect/stop with live bootstrap progress, structured state
+  machine, and automatic reconnect after network loss (guards preserved).
+- **New identity** on demand: fresh circuits without dropping guard state.
+- Embedded Arti 2.8 client inside the `tobrod` daemon; the GUI talks to it
+  over local JSON-RPC only — the UI can crash without touching the network.
+
+### Local proxy services
+
+- **SOCKS5** and **HTTP CONNECT** listeners with configurable ports,
+  conflict detection, and a next-free-port helper.
+- **DNS proxy** for `.onion` resolution and SOCKS-side destination handling.
+- Opt-in **bind-all-interfaces** mode with explicit firewall warnings.
+- **Stream isolation** options: isolate by destination address, port, and/or
+  client protocol; upstream SOCKS credentials get their own circuit by default.
+
+### Circumvention and bridges
+
+- Bridge lines with **lyrebird** (`obfs4`, `meek_lite`/`meek`, `webtunnel`),
+  **snowflake-client** (`snowflake`, including AMP cache, front, and broker
+  parameters), and **dnstt-client** (`dnstt`).
+- **Moat** bridge fetching: request fresh bridges by country and transport,
+  with automatic fallback to the bundled built-in distribution.
+- Bundled built-in bridge distribution; per-transport and per-country filters.
+- Bridge tooling: validate/normalize/import/export lines, live transport
+  diagnostics via `bridges.test`, and redacted export for safe sharing.
+
+### Power-user networking
+
+- Explicit **exit-country selection**, IPv6 prefer/only/disable, and default
+  stream preferences; unsupported knobs are hidden with explanations rather
+  than silently ignored.
+- Full **config engine**: validate/apply JSON patches, redacted config reads
+  (no secrets), import/export without key material, live reload.
+
+### Outbound proxy (upstream)
+
+- Route Tor itself through an upstream **HTTP/SOCKS** or **Shadowsocks**
+  proxy (`sslocal` sidecar) — useful when the local network requires a
+  corporate or residential proxy first.
+- Upstream **auth secrets live in the OS keychain**, never in the config file;
+  set/clear them from the settings window without exposing passwords in logs.
+
+### Onion services (hosting)
+
+- Host v3 onion services with arbitrary port mappings
+  (`VIRT[:TARGET_HOST]:TARGET`); create/edit/enable/disable/delete at runtime.
+- Published `.onion` addresses push to the UI as events; key material is
+  stored in a 0700 managed directory, never in config plaintext.
+- **Client authorization:** generate x25519 credentials, import/export
+  standard `.auth_private` files, attach/detach credentials per service
+  (restricted-discovery mode).
+- **Encrypted backups:** passphrase-protected bundles of service keys and
+  client-auth credentials, restorable to another machine.
+
+### Kindness Mode (Snowflake proxy)
+
+- Donate bandwidth to censored users by running a `snowflake-proxy` sidecar
+  supervised by the daemon (start/stop, crash backoff, capacity caps).
+- **Limits:** optional pause rules stop and later resume the proxy with no
+  bandwidth donated while the rule holds: metered connections (Linux
+  detection) and battery power (macOS/Linux detection); enforced only when
+  the platform positively reports the condition, so unknowns never pause.
+- **Eligibility check** before enabling: STUN-based NAT type detection,
+  UPnP gateway/external-IP discovery with port-map setup for the ephemeral
+  range, and broker reachability — reported as actionable items (firewall,
+  symmetric NAT, conflicting VPN) rather than raw errors.
+- Honest diagnostics: no invented connectivity claims; states are
+  `direct`/`nat`/`unknown` with per-server consistency labels.
+
+### Desktop experience
+
+- Tray-first app: window hides to tray on close; quit from the tray menu.
+- **App lock** with lock-on-idle and lock-on-close, preferring OS
+  authentication (password fallback available).
+- **Autostart** with start-to-tray/minimized mode.
+- Separate **floating logs window** with filtering, redaction, copy, and save.
+- Settings windows (general, node configuration, onion services, client
+  authorization, Kindness Mode, advanced Tor config) with a power-user gate.
+- Connection view with bootstrap progress, circuit/identity controls, and
+  reachable-daemon fallback.
+
+### CLI (`tobroctl`)
+
+Full headless control with JSON output and stable exit codes:
+
+```text
+status · connect · stop · new-identity · reload-config · watch
+config     get / validate / apply
+bridges    validate / import / builtin / export / apply / test / moat
+onion      list / create / update / enable / disable / delete / backup / restore
+client-auth  list / generate / import / export / delete / attach / detach
+```
+
+`watch` streams daemon notifications (state, bootstrap, onion publish) as
+JSON lines — suitable for scripting and CI checks.
+
+### Security & privacy posture
+
+- No telemetry anywhere; diagnostics are redacted locally before display.
+- Secrets (outbound proxy passwords, onion service keys, client-auth
+  credentials) live in the OS keychain or 0700 managed directories.
+- Log redaction is enforced by tests; config reads are redacted by default.
+- Local-only IPC (Unix domain socket / named pipe); the daemon runs and
+  restarts independently of the GUI.
 
 ## At a glance
 
 - **Tor:** Arti 2.8 (embedded) via `tobrod` daemon + Tauri/React desktop app.
 - **Platforms:** macOS, Windows, Linux.
-- **Proxy:** local SOCKS5, HTTP CONNECT, and DNS (configurable).
-- **Bridges (M3):** `[bridges]` config + **lyrebird** (**obfs4**, **meek_lite**/`meek`, **WebTunnel**) and **snowflake-client** (**snowflake**, AMP/front/broker params supported via bridge lines). Moat/Smart Connect planned.
-- **Desktop:** connect/stop/new identity, bootstrap status, tray, autostart, app lock, settings, floating logs.
-- **CLI:** `tobroctl` — status/connect/stop/new identity/config/watch.
+- **Crates:** `tobro-tor` (wrapper), `tobro-config`, `tobro-ipc`,
+  `tobro-store`, `tobrod`, `tobroctl`.
 - **Non-goals:** mobile, relay/exit, `torrc` compatibility, bundled browser.
 
 ## Core state machine
@@ -68,12 +182,18 @@ A desktop-only, ground-up rewrite of Orbot using Rust/Arti and Tauri.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Bridges (lyrebird / snowflake, M3)
+## Bridges (lyrebird / snowflake)
 
-Enable bridges in `config.toml` and provide bridge lines. tobro resolves PT binaries and configures Arti transports:
+Enable bridges in `config.toml` and provide bridge lines. tobro resolves PT
+binaries and configures Arti transports:
 
 - **lyrebird**: `obfs4`, `meek_lite` (`meek` alias), `webtunnel` (`transport_path` / `transport_dir`)
 - **snowflake-client**: `snowflake` (`snowflake_path` / `snowflake_dir`); AMP/front/broker/STUN/UTLS settings are passed via bridge-line parameters (including AMP cache rendezvous where supported by the client)
+- **dnstt-client**: `dnstt` bridge lines
+- **Moat** fetching: request fresh bridges by country/transport with fallback
+  to the bundled built-in distribution
+
+Smart Connect (automatic direct/bridge fallback) is planned.
 
 ```toml
 [bridges]
@@ -105,7 +225,18 @@ cargo run -p tobroctl -- config apply '{"proxy":{"socks_port":9050,"bind_all_int
 cargo run -p tobroctl -- stop           # disconnect Tor
 cargo run -p tobroctl -- watch          # stream state/bootstrap notifications
 
-# M0 spike / runtime checks (boots Tor, serves listeners)
+# onion services
+cargo run -p tobroctl -- onion list
+cargo run -p tobroctl -- onion create --name web --port 80:8080
+cargo run -p tobroctl -- client-auth generate --nickname laptop
+cargo run -p tobroctl -- onion backup --out backup.json --passphrase '…'
+
+# bridge helpers
+cargo run -p tobroctl -- bridges validate @bridges.txt
+cargo run -p tobroctl -- bridges moat --country de --transport obfs4
+cargo run -p tobroctl -- bridges apply @bridges.txt
+
+# runtime checks (boots Tor, serves listeners)
 cargo run -p tobrod -- spike --exit-after-check
 # opt-in .onion resolution check through the local DNS proxy (UDP; needs live Tor + a reachable target)
 cargo run -p tobrod -- spike --exit-after-check --timeout-secs 300 --dns-check-host <v3-onion-hostname>.onion
@@ -156,11 +287,13 @@ it. You can still run the daemon manually: `cargo run -p tobrod -- run`.
 
 The shell connects to `tobrod` over local IPC (default platform state path, or
 `--socket <path>`), shows status/bootstrap progress, provides Connect/Stop/New
-identity, settings (listener/config management), and a floating logs window
-(filter/redact/copy/save). If `tobrod` is not running, the GUI attempts to start
-it automatically. The window hides to the tray on close; quit from the tray menu
-to exit the GUI. The daemon is independent.
+identity, full settings (listeners, outbound proxy, exit country and IP
+version, onion services, client authorization, Kindness Mode, stream
+isolation, and advanced Tor config), and a floating logs
+window (filter/redact/copy/save). If `tobrod` is not running, the GUI attempts
+to start it automatically. The window hides to the tray on close; quit from the
+tray menu to exit the GUI. The daemon is independent.
 
 ## License
 
-GPL-3.0-only — see [LICENSE.txt](LICENSE.txt).
+[GPL-3.0-only](LICENSE.txt).

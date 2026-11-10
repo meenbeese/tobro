@@ -995,6 +995,10 @@ textarea {
   font-size: var(--text-small);
   margin: 8px 0 0;
 }
+.kindness-paused {
+  color: var(--warn);
+  margin: 4px 0 0;
+}
 .kindness-status h3 {
   margin-bottom: 4px;
 }

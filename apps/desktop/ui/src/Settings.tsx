@@ -89,12 +89,16 @@ interface KindnessSettings {
   enabled: boolean;
   capacity: string;
   ephemeral_ports: string;
+  pause_on_metered: boolean;
+  pause_when_not_charging: boolean;
 }
 
 const EMPTY_KINDNESS: KindnessSettings = {
   enabled: false,
   capacity: "",
   ephemeral_ports: "",
+  pause_on_metered: true,
+  pause_when_not_charging: false,
 };
 
 interface KindnessStatusView {
@@ -108,6 +112,13 @@ interface KindnessStatusView {
     capacity?: number | null;
     ephemeral_ports?: string | null;
     nat_type_force_unrestricted?: boolean;
+    pause_on_metered?: boolean;
+    pause_when_not_charging?: boolean;
+  };
+  limits?: {
+    paused_reason?: string | null;
+    metered_link?: string;
+    charging?: string;
   };
 }
 
@@ -149,6 +160,16 @@ function kindnessSidecarLabel(state?: string): string {
     default:
       return "Stopped";
   }
+}
+
+function kindnessPauseLabel(reason: string): string {
+  if (reason === "metered") {
+    return "Paused: a metered connection was detected";
+  }
+  if (reason === "not_charging") {
+    return "Paused: the device is not charging";
+  }
+  return `Paused: ${reason}`;
 }
 
 interface ConfigResponse {
@@ -590,6 +611,9 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
           : "",
       ephemeral_ports:
         typeof k?.ephemeral_ports === "string" ? k.ephemeral_ports : "",
+      // Absent keys keep the daemon defaults (metered pause on).
+      pause_on_metered: k?.pause_on_metered !== false,
+      pause_when_not_charging: k?.pause_when_not_charging === true,
     });
     setKindnessDirty(false);
     setKindnessError("");
@@ -650,6 +674,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
             enabled: kindness.enabled,
             capacity,
             ephemeral_ports: ports,
+            pause_on_metered: kindness.pause_on_metered,
+            pause_when_not_charging: kindness.pause_when_not_charging,
           },
         },
       });
@@ -659,7 +685,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       const warnings = result.effects?.warnings ?? [];
       const msg = summarizeEffects(result.effects).join(" ");
       const restartNote = result.effects?.restart_required
-        ? " Restart required: stop then connect (or restart the daemon) for the proxy change."
+        ? " Restart required: stop then connect (or restart the daemon) for the kindness change."
         : "";
       setKindnessMessage(
         `${
@@ -3851,6 +3877,11 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
               {kindnessStatus?.sidecar?.last_error ? (
                 <p className="error">{kindnessStatus.sidecar.last_error}</p>
               ) : null}
+              {kindnessStatus?.limits?.paused_reason ? (
+                <p className="kindness-paused">
+                  {kindnessPauseLabel(kindnessStatus.limits.paused_reason)}
+                </p>
+              ) : null}
               <div className="actions">
                 <button
                   type="button"
@@ -3923,6 +3954,52 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 proxy may use. When a NAT is detected and your router supports
                 UPnP, the first ports of the range are mapped for inbound access
                 during the eligibility test.
+              </p>
+              <h3>Limits</h3>
+              <p className="muted">
+                Optional pause rules stop the proxy (no bandwidth donated) while
+                a condition holds and resume it automatically. Detection is
+                best-effort: when the platform cannot report a condition, the
+                proxy keeps running.
+              </p>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={kindness.pause_on_metered}
+                  disabled={kindnessBusy || !kindness.enabled}
+                  onChange={(e) =>
+                    onKindnessChange("pause_on_metered", e.target.checked)
+                  }
+                />
+                <span>
+                  <strong>Pause on metered connections.</strong> Metered links
+                  are detected on Linux (NetworkManager); on other platforms the
+                  proxy keeps running.
+                </span>
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={kindness.pause_when_not_charging}
+                  disabled={kindnessBusy || !kindness.enabled}
+                  onChange={(e) =>
+                    onKindnessChange(
+                      "pause_when_not_charging",
+                      e.target.checked,
+                    )
+                  }
+                />
+                <span>
+                  <strong>Pause while on battery power.</strong> Charging is
+                  detected on macOS (<code>pmset</code>) and Linux (
+                  <code>/sys/class/power_supply</code>); machines without a
+                  battery always keep running.
+                </span>
+              </label>
+              <p className="muted">
+                Like the proxy settings above, pause rules are read when the
+                daemon starts; a restart applies changed toggles. While paused,
+                the status at the top shows the current reason.
               </p>
               <DirtyNote dirty={kindnessDirty} />
               {kindnessError ? <p className="error">{kindnessError}</p> : null}
