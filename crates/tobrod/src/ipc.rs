@@ -307,6 +307,16 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
         &self,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Fetch recent, redacted log lines from the in-memory ring buffer
+    /// (`daemon.logs`). `params` is validated upstream and carries an optional
+    /// integer `lines` (default chosen by the control plane).
+    fn daemon_logs(
+        &self,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Shut the daemon process down cleanly (`daemon.shutdown`); the response
+    /// is sent before exit, mirroring a SIGINT.
+    fn shutdown(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Subscribe to supervisor events.
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent>;
 }
@@ -1020,6 +1030,10 @@ pub struct SupervisorControl {
     kindness_limits: Option<crate::kindness_limits::LimitShared>,
     /// Shared volatile stats (current connections) for `kindness.status`.
     kindness_stats: Option<crate::kindness_stats::StatsShared>,
+    /// In-memory log ring buffer served to IPC clients via `daemon.logs`.
+    log_buffer: Option<crate::logs::LogBufferShared>,
+    /// Clean-shutdown trigger for `daemon.shutdown` (wired to the main loop).
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -1054,7 +1068,23 @@ impl SupervisorControl {
             kindness,
             kindness_limits,
             kindness_stats,
+            log_buffer: None,
+            shutdown: None,
         }
+    }
+
+    /// Attach the log ring buffer used by `daemon.logs`.
+    #[must_use]
+    pub fn with_log_buffer(mut self, ring: crate::logs::LogBufferShared) -> Self {
+        self.log_buffer = Some(ring);
+        self
+    }
+
+    /// Attach the clean-shutdown trigger used by `daemon.shutdown`.
+    #[must_use]
+    pub fn with_shutdown(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.shutdown = Some(notify);
+        self
     }
 
     async fn stop_outbound_sidecar(&self) {
@@ -1522,6 +1552,39 @@ impl DaemonControl for SupervisorControl {
         crate::client_auth::detach(&db_path, params).await
     }
 
+    async fn daemon_logs(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let Some(ring) = self.log_buffer.as_ref() else {
+            return Err("log buffer is not attached to this daemon".to_owned());
+        };
+        let requested = params
+            .get("lines")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::logs::DEFAULT_REQUESTED_LINES as u64);
+        let (lines, truncated) = ring.last(requested as usize);
+        Ok(json!({
+            "ok": true,
+            "action": "daemon.logs",
+            "count": lines.len(),
+            "lines": lines,
+            "truncated": truncated,
+            "capacity": ring.capacity(),
+            "total_lines": ring.total_lines(),
+        }))
+    }
+
+    async fn shutdown(&self) -> Result<serde_json::Value, String> {
+        let Some(notify) = self.shutdown.as_ref() else {
+            return Err("shutdown trigger is not attached to this daemon".to_owned());
+        };
+        tracing::info!("clean shutdown requested over IPC (daemon.shutdown)");
+        notify.notify_one();
+        Ok(json!({
+            "ok": true,
+            "action": "daemon.shutdown",
+            "note": "the daemon is disconnecting Tor and exiting; expect the IPC socket to close"
+        }))
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
         self.handle.subscribe_events()
     }
@@ -1674,6 +1737,14 @@ impl DaemonControl for SupervisorHandle {
         Err("client auth operations require daemon config/state context".to_owned())
     }
 
+    async fn daemon_logs(&self, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("log serving requires the daemon log ring buffer context".to_owned())
+    }
+
+    async fn shutdown(&self) -> Result<serde_json::Value, String> {
+        Err("shutdown requires the daemon process shutdown trigger".to_owned())
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
         SupervisorHandle::subscribe_events(self)
     }
@@ -1767,7 +1838,7 @@ pub async fn serve_daemon<C: DaemonControl>(
     listeners: Arc<RwLock<ListenerConfig>>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
-    tracing::info!(socket = %server.path().display(), "IPC listening (M1)");
+    tracing::info!(socket = %server.path().display(), "IPC listening");
     loop {
         let connection = server.accept().await?;
         let control = control.clone();
@@ -2024,6 +2095,19 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 }
             }
         }
+        methods::LOGS => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            match control.daemon_logs(params).await {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(e) => {
+                    RpcResponse::error(id, RpcError::internal(format!("daemon.logs failed: {e}")))
+                }
+            }
+        }
+        methods::SHUTDOWN => match control.shutdown().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(format!("shutdown failed: {e}"))),
+        },
         methods::CONFIG_GET => match control.config_get().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(e)),
@@ -2282,6 +2366,8 @@ mod daemon_tests {
         connects: Arc<Mutex<u32>>,
         disconnects: Arc<Mutex<u32>>,
         new_identities: Arc<Mutex<u32>>,
+        shutdowns: Arc<Mutex<u32>>,
+        logs: crate::logs::LogBufferShared,
         _events_tx: broadcast::Sender<SupervisorEvent>,
         events_tx: broadcast::Sender<SupervisorEvent>,
     }
@@ -2298,6 +2384,8 @@ mod daemon_tests {
                 connects: Arc::new(Mutex::new(0)),
                 disconnects: Arc::new(Mutex::new(0)),
                 new_identities: Arc::new(Mutex::new(0)),
+                shutdowns: Arc::new(Mutex::new(0)),
+                logs: crate::logs::LogBuffer::shared(64),
                 _events_tx: events_tx.clone(),
                 events_tx,
             }
@@ -2494,6 +2582,31 @@ mod daemon_tests {
             Ok(json!({ "ok": true, "action": "client_auth.detach" }))
         }
 
+        async fn daemon_logs(
+            &self,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            let requested = params
+                .get("lines")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(crate::logs::DEFAULT_REQUESTED_LINES as u64);
+            let (lines, truncated) = self.logs.last(requested as usize);
+            Ok(json!({
+                "ok": true,
+                "action": "daemon.logs",
+                "count": lines.len(),
+                "lines": lines,
+                "truncated": truncated,
+                "capacity": self.logs.capacity(),
+                "total_lines": self.logs.total_lines(),
+            }))
+        }
+
+        async fn shutdown(&self) -> Result<serde_json::Value, String> {
+            *self.shutdowns.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            Ok(json!({ "ok": true, "action": "daemon.shutdown" }))
+        }
+
         fn subscribe_events(&self) -> broadcast::Receiver<SupervisorEvent> {
             self.events_tx.subscribe()
         }
@@ -2588,6 +2701,68 @@ mod daemon_tests {
             assert!(resp.error.is_none(), "params should be accepted");
             assert!(resp.result.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_logs_and_shutdown_dispatch() {
+        let control = MockControl::new();
+        control.logs.push("one");
+        control.logs.push("two: password=hunter2");
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::LOGS, None),
+        )
+        .await;
+        let result = resp.result.expect("logs should succeed");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "daemon.logs");
+        assert_eq!(result["count"], 2);
+        let lines = result["lines"].as_array().expect("lines array");
+        assert_eq!(lines[0], "one");
+        assert!(
+            !lines[1].as_str().expect("string line").contains("hunter2"),
+            "log lines served over IPC must be redacted"
+        );
+
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(2, methods::SHUTDOWN, None),
+        )
+        .await;
+        let result = resp.result.expect("shutdown should succeed");
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            *control.shutdowns.lock().unwrap_or_else(|e| e.into_inner()),
+            1
+        );
+
+        // `daemon.logs` still requires a handshake like every other method.
+        let mut handshaken = false;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(3, methods::LOGS, None),
+        )
+        .await;
+        let err = resp.error.expect("should error");
+        assert_eq!(err.code, tobro_ipc::codes::UNAUTHORIZED);
     }
 
     #[tokio::test]

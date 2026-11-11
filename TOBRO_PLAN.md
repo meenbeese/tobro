@@ -598,24 +598,6 @@ ui/
 └── tests/                         # unit + component + e2e
 ```
 
-### 5.5 Core state machine
-
-```text
-        ┌──────────┐   start   ┌───────────┐  bootstrap  ┌────────────┐
-        │ Stopped  ├──────────►│ Starting  ├────────────►│ Bootstrapping │
-        └────▲─────┘           └─────┬─────┘             └──────┬─────┘
-             │                       │ error                    │ 100%
-             │ stop                  ▼                          ▼
-        ┌────┴─────┐           ┌───────────┐             ┌────────────┐
-        │ Stopping │◄──────────┤  Error    │             │  Connected │
-        └──────────┘   stop    └───────────┘             └─────┬──────┘
-                                                               │ network loss
-                                                               ▼
-                                                        ┌────────────┐
-                                                        │ Reconnecting│
-                                                        └────────────┘
-```
-
 Rules:
 
 - Every transition is idempotent and cancellation-safe.

@@ -5,7 +5,7 @@ technologies that reproduces the useful surface of Orbot using Rust/Arti and Tau
 Supports connect/disconnect, bridges and pluggable transports, local proxy services,
 onion hosting, Kindness Mode, as well as numerous circumvention methods.
 
-**Status:** M0-M5 shipped; M6 in progress.
+**Status:** M0-M6 shipped; M7 in progress.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -108,15 +108,20 @@ onion hosting, Kindness Mode, as well as numerous circumvention methods.
 Full headless control with JSON output and stable exit codes:
 
 ```text
-status · connect · stop · new-identity · reload-config · watch
-config     get / validate / apply
-bridges    validate / import / builtin / export / apply / test / moat
-onion      list / create / update / enable / disable / delete / backup / restore
+status · start · connect · stop · shutdown · new-identity · reload-config · logs · watch
+config       get / validate / apply
+diagnostics  export (redacted bundle: status, config, onion, kindness, logs)
+bridges      validate / import / builtin / export / apply / test / moat
+onion        list / create / update / enable / disable / delete / backup / restore
 client-auth  list / generate / import / export / delete / attach / detach
 ```
 
-`watch` streams daemon notifications (state, bootstrap, onion publish) as
-JSON lines — suitable for scripting and CI checks.
+`start` launches the daemon headless and detached and waits for its IPC
+endpoint; `logs` reads the daemon's in-memory redacted log ring buffer;
+`diagnostics export` produces a shareable, redacted JSON bundle. `watch`
+streams daemon notifications (state, bootstrap, onion publish) as JSON lines —
+suitable for scripting and CI checks. See [docs/headless.md](docs/headless.md)
+for the full headless guide (systemd/launchd examples included).
 
 ### Security & privacy posture
 
@@ -214,6 +219,20 @@ lines = [
 
 ## CLI commands
 
+Headless quickstart (see [docs/headless.md](docs/headless.md) for the full
+guide and service-manager examples):
+
+```sh
+cargo run -p tobroctl -- start          # spawn `tobrod run` detached, wait for IPC
+cargo run -p tobroctl -- status         # JSON status (stopped until connected)
+cargo run -p tobroctl -- connect        # start Tor/bootstrap + local listeners
+cargo run -p tobroctl -- logs           # recent, redacted daemon logs (JSON)
+cargo run -p tobroctl -- shutdown       # disconnect Tor and exit the daemon
+cargo run -p tobroctl -- diagnostics export --out diag.json   # redacted bundle
+```
+
+Manual control (daemon in the foreground, e.g. under a service manager):
+
 ```sh
 # terminal 1: start the control plane (loads config/store, idle until connect)
 cargo run -p tobrod -- run
@@ -259,7 +278,9 @@ cargo run -p tobro -- --hidden
 `tobrod run` starts stopped; use `connect` to start Tor. `tobroctl` prints JSON to
 stdout and diagnostics to stderr (exit `0` on success, `1` on error). The IPC
 endpoint defaults to `<platform data dir>/tobro/state/tobrod.sock`; pass
-`--socket <path>` to both commands when using custom dirs.
+`--socket <path>` to both commands when using custom dirs. For daemon
+management (`start`/`logs`/`diagnostics export`/`shutdown`), headless
+deployment, and service-manager units, see [docs/headless.md](docs/headless.md).
 
 The spike bootstraps Arti, prints JSON-line bootstrap events to stdout, fetches
 a page through Tor, starts SOCKS/HTTP on `9050` and DNS on `9053`, then fetches

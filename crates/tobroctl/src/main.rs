@@ -12,7 +12,15 @@ use serde_json::{Value, json};
     name = "tobroctl",
     version,
     about = "Control the tobro daemon",
-    long_about = "Control tobrod over local IPC.\n\nFor M1, `tobrod run` starts the daemon in a stopped state; use `tobroctl connect` to start Tor and `tobroctl stop` to disconnect. Output is JSON on stdout; diagnostics go to stderr. Exit code 0 on success, 1 on error."
+    long_about = "Control the headless tobrod daemon over local IPC.\n\n\
+Typical headless flow:\n  \
+  tobroctl start        spawn `tobrod run` detached and wait until it is ready\n  \
+  tobroctl status       current daemon state (JSON)\n  \
+  tobroctl connect      start Tor (bootstrap)\n  \
+  tobroctl stop         stop Tor (daemon keeps running)\n  \
+  tobroctl logs         recent, redacted daemon logs (JSON)\n  \
+  tobroctl shutdown     disconnect and exit the daemon process\n\n\
+Output is JSON on stdout; diagnostics go to stderr. Exit code 0 on success, 1 on error."
 )]
 struct Cli {
     /// IPC socket/endpoint path (defaults to the platform state directory).
@@ -27,12 +35,46 @@ struct Cli {
 enum Command {
     /// Print the daemon status as JSON.
     Status,
+    /// Launch the headless daemon (`tobrod run`) and wait until IPC is ready.
+    Start {
+        /// Path to the `tobrod` binary (defaults to a sibling of `tobroctl`).
+        #[arg(long, value_name = "PATH")]
+        daemon: Option<PathBuf>,
+        /// Daemon log file (defaults to `<state-dir>/tobrod.log`).
+        #[arg(long, value_name = "PATH")]
+        log_file: Option<PathBuf>,
+        /// Run the daemon in the foreground instead of spawning it detached.
+        #[arg(long)]
+        foreground: bool,
+        /// Also start Tor once the daemon is ready.
+        #[arg(long)]
+        connect: bool,
+        /// Seconds to wait for the daemon IPC endpoint to become ready.
+        #[arg(long, default_value_t = 20)]
+        wait: u64,
+    },
     /// Ask the daemon to connect/start Tor.
     Connect,
     /// Ask the daemon to stop/disconnect Tor.
     Stop,
+    /// Ask the daemon process to disconnect Tor and exit cleanly.
+    Shutdown,
     /// Request a new identity (new circuits; guard state preserved).
     NewIdentity,
+    /// Fetch recent daemon log lines (redacted ring buffer) as JSON.
+    Logs {
+        /// Maximum number of recent lines to return (1..=10000).
+        #[arg(long, default_value_t = 200)]
+        lines: u64,
+        /// Print raw log lines instead of a JSON envelope.
+        #[arg(long)]
+        text: bool,
+    },
+    /// Collect or inspect daemon diagnostics.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
+    },
     /// Reload and validate daemon configuration from disk.
     ReloadConfig,
     /// Read or modify daemon configuration via the daemon config API.
@@ -57,6 +99,24 @@ enum Command {
     },
     /// Stream IPC notifications as JSON lines until Ctrl-C.
     Watch,
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    /// Export a redacted diagnostics bundle (status, config, onion, kindness, logs).
+    ///
+    /// The bundle never contains key material, passwords, or raw bridge
+    /// credentials: the config comes from the daemon's redacted view and log
+    /// lines are redacted at capture time. Hosted `.onion` addresses are
+    /// public by design and included; review the file before sharing it.
+    Export {
+        /// Write the bundle JSON to this path (0600) instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Maximum number of recent log lines to include (1..=10000).
+        #[arg(long, default_value_t = 200)]
+        lines: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -295,7 +355,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None => default_socket()?,
     };
 
-    // Local-only bridge commands do not require a running daemon.
+    // Local-only bridge commands and `start` do not require a running daemon.
     if let Command::Bridges { command } = &cli.command {
         match command {
             BridgesCommand::Validate { input } => return bridges_validate(input),
@@ -329,6 +389,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // `start` may launch the daemon itself, so it runs before the connect.
+    if let Command::Start {
+        daemon,
+        log_file,
+        foreground,
+        connect,
+        wait,
+    } = &cli.command
+    {
+        return start_daemon(
+            &socket,
+            daemon.as_deref(),
+            log_file.as_deref(),
+            *foreground,
+            *connect,
+            *wait,
+        )
+        .await;
+    }
+
     let mut client = tobro_ipc::Client::connect(&socket)
         .await
         .with_context(|| format!("could not connect to tobrod at {}", socket.display()))?;
@@ -352,10 +432,39 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let result = client.call(tobro_ipc::methods::STOP, None).await?;
             print_json(&result)?;
         }
+        Command::Shutdown => {
+            let result = client.call(tobro_ipc::methods::SHUTDOWN, None).await?;
+            print_json(&result)?;
+            // The daemon answers, then drops the socket while it exits; give
+            // it a moment so callers can immediately observe a stopped daemon.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         Command::NewIdentity => {
             let result = client.call(tobro_ipc::methods::NEW_IDENTITY, None).await?;
             print_json(&result)?;
         }
+        Command::Logs { lines, text } => {
+            let result = client
+                .call(
+                    tobro_ipc::methods::LOGS,
+                    Some(json!({ "lines": clamp_log_lines(lines) })),
+                )
+                .await?;
+            if text {
+                if let Some(lines) = result.get("lines").and_then(Value::as_array) {
+                    for line in lines.iter().filter_map(Value::as_str) {
+                        println!("{line}");
+                    }
+                }
+            } else {
+                print_json(&result)?;
+            }
+        }
+        Command::Diagnostics { command } => match command {
+            DiagnosticsCommand::Export { out, lines } => {
+                diagnostics_export(&mut client, out, clamp_log_lines(lines)).await?
+            }
+        },
         Command::ReloadConfig => {
             let result = client.call(tobro_ipc::methods::RELOAD_CONFIG, None).await?;
             print_json(&result)?;
@@ -582,6 +691,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 print_json(&result)?;
             }
         },
+        Command::Start { .. } => unreachable!("handled before the IPC connection"),
         Command::Watch => watch(&mut client).await?,
     }
 
@@ -947,6 +1057,240 @@ fn read_patch(input: &str) -> anyhow::Result<Value> {
         anyhow::bail!("patch must be a JSON object");
     }
     Ok(value)
+}
+
+/// Clamp `--lines` into the range the daemon accepts (1..=10000).
+fn clamp_log_lines(lines: u64) -> u64 {
+    lines.clamp(1, tobro_ipc::MAX_LOG_LINES_REQUEST)
+}
+
+/// Launch the headless daemon and wait for its IPC endpoint.
+///
+/// Detached spawn: the daemon runs in its own process group (Unix), so a
+/// Ctrl-C on `tobroctl` never takes the daemon down with it.
+async fn start_daemon(
+    socket: &Path,
+    daemon: Option<&Path>,
+    log_file: Option<&Path>,
+    foreground: bool,
+    connect: bool,
+    wait_secs: u64,
+) -> anyhow::Result<()> {
+    // Fast path: a daemon is already serving this endpoint.
+    if let Ok(mut probe) = tobro_ipc::Client::connect(socket).await
+        && probe.handshake().await.is_ok()
+    {
+        let status = probe
+            .call(tobro_ipc::methods::STATUS, None)
+            .await
+            .unwrap_or(Value::Null);
+        print_json(&json!({
+            "ok": true,
+            "action": "start",
+            "spawned": false,
+            "already_running": true,
+            "socket": socket.display().to_string(),
+            "status": status,
+            "note": "a daemon is already running on this endpoint; nothing was launched",
+        }))?;
+        return Ok(());
+    }
+
+    let daemon_path = match daemon {
+        Some(path) => path.to_path_buf(),
+        None => locate_daemon_binary()?,
+    };
+    let log_path = match log_file {
+        Some(path) => path.to_path_buf(),
+        None => socket
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tobrod.log"),
+    };
+
+    let mut command = tokio::process::Command::new(&daemon_path);
+    command
+        .arg("run")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--log-file")
+        .arg(&log_path);
+
+    if foreground {
+        eprintln!(
+            "running {} in the foreground (Ctrl-C to stop); logs go to stderr and {}",
+            daemon_path.display(),
+            log_path.display()
+        );
+        let status = command
+            .status()
+            .await
+            .with_context(|| format!("failed to launch {}", daemon_path.display()))?;
+        print_json(&json!({
+            "ok": status.success(),
+            "action": "start",
+            "foreground": true,
+            "exit_code": status.code(),
+        }))?;
+        return Ok(());
+    }
+
+    // Own process group so Ctrl-C on `tobroctl` never takes the daemon down.
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", daemon_path.display()))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs.max(1));
+    loop {
+        if child.try_wait()?.is_some() {
+            anyhow::bail!(
+                "tobrod exited during startup; run `tobroctl start --foreground` (or `tobrod run`) \
+                 to see the failure, and check the log file {}",
+                log_path.display()
+            );
+        }
+        if let Ok(mut probe) = tobro_ipc::Client::connect(socket).await
+            && probe.handshake().await.is_ok()
+        {
+            let status = probe
+                .call(tobro_ipc::methods::STATUS, None)
+                .await
+                .unwrap_or(Value::Null);
+            if connect {
+                let result = probe.call(tobro_ipc::methods::CONNECT, None).await?;
+                eprintln!("connect requested: {result}");
+            }
+            print_json(&json!({
+                "ok": true,
+                "action": "start",
+                "spawned": true,
+                "daemon": daemon_path.display().to_string(),
+                "socket": socket.display().to_string(),
+                "log_file": log_path.display().to_string(),
+                "connect_requested": connect,
+                "status": status,
+            }))?;
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "tobrod did not become ready within {wait_secs}s (socket: {}); \
+                 run `tobroctl start --foreground` for the daemon output",
+                socket.display()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// Find the `tobrod` binary next to the running `tobroctl` binary.
+fn locate_daemon_binary() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().context("could not locate the tobroctl binary")?;
+    let dir = exe
+        .parent()
+        .context("could not locate the tobroctl binary directory")?;
+    let name = if cfg!(windows) {
+        "tobrod.exe"
+    } else {
+        "tobrod"
+    };
+    let candidate = dir.join(name);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "could not find the tobrod daemon binary next to tobroctl (expected {}); \
+         build it with `cargo build -p tobrod` and pass --daemon PATH",
+        candidate.display()
+    )
+}
+
+/// Result wrapper for optional diagnostics sections: a failing section degrades
+/// to `{"ok": false, "error": ...}` instead of failing the whole export.
+async fn fetch_section(
+    client: &mut tobro_ipc::Client,
+    method: &str,
+    params: Option<Value>,
+) -> Value {
+    match client.call(method, params).await {
+        Ok(value) => json!({ "ok": true, "data": value }),
+        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+    }
+}
+
+async fn diagnostics_export(
+    client: &mut tobro_ipc::Client,
+    out: Option<PathBuf>,
+    lines: u64,
+) -> anyhow::Result<()> {
+    let hello = match client.handshake().await {
+        Ok(hello) => serde_json::to_value(hello)?,
+        Err(error) => Value::String(format!("handshake failed: {error}")),
+    };
+    let status = fetch_section(client, tobro_ipc::methods::STATUS, None).await;
+    let config = fetch_section(client, tobro_ipc::methods::CONFIG_GET, None).await;
+    let onion = fetch_section(client, tobro_ipc::methods::ONION_LIST, None).await;
+    let kindness = fetch_section(client, tobro_ipc::methods::KINDNESS_STATUS, None).await;
+    let client_auth = fetch_section(client, tobro_ipc::methods::CLIENT_AUTH_LIST, None).await;
+    let logs = fetch_section(
+        client,
+        tobro_ipc::methods::LOGS,
+        Some(json!({ "lines": lines })),
+    )
+    .await;
+
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let bundle = json!({
+        "format": "tobro-diagnostics",
+        "version": 1,
+        "generated_at": generated_at,
+        "tool": { "name": "tobroctl", "version": env!("CARGO_PKG_VERSION") },
+        "daemon": { "hello": hello, "status": status },
+        "config": config,
+        "onion": onion,
+        "kindness": kindness,
+        "client_auth": client_auth,
+        "logs": logs,
+        "notes": [
+            "config is the daemon's redacted view: outbound proxy secrets are removed",
+            "log lines are redacted at capture time (bridge material, credentials, client-auth keys)",
+            "hosted .onion addresses are public by design and included; review before sharing",
+            "no private keys, passwords, or .auth_private key material are ever included",
+        ],
+    });
+
+    match out {
+        Some(path) => {
+            let bytes = serde_json::to_vec_pretty(&bundle)?;
+            write_bundle_file(&path, &bytes)?;
+            let sections = json!({
+                "daemon.status": status.get("ok").and_then(Value::as_bool),
+                "config": config.get("ok").and_then(Value::as_bool),
+                "onion": onion.get("ok").and_then(Value::as_bool),
+                "kindness": kindness.get("ok").and_then(Value::as_bool),
+                "client_auth": client_auth.get("ok").and_then(Value::as_bool),
+                "logs": logs.get("ok").and_then(Value::as_bool),
+            });
+            print_json(&json!({
+                "ok": true,
+                "action": "diagnostics.export",
+                "written": path.display().to_string(),
+                "bytes": bytes.len(),
+                "sections": sections,
+                "note": "no secrets are included; review the file before sharing it",
+            }))?;
+        }
+        None => print_json(&bundle)?,
+    }
+    Ok(())
 }
 
 fn default_socket() -> anyhow::Result<PathBuf> {

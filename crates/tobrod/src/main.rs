@@ -12,6 +12,7 @@ pub(crate) mod kindness_diag;
 pub(crate) mod kindness_limits;
 pub(crate) mod kindness_stats;
 mod lifecycle;
+mod logs;
 pub(crate) mod onion;
 pub(crate) mod outbound;
 pub(crate) mod pt_supervisor;
@@ -21,6 +22,7 @@ mod spike;
 mod supervisor;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -81,16 +83,24 @@ struct RunArgs {
     /// IPC socket/endpoint path override (defaults to `<state-dir>/tobrod.sock`).
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+    /// Append logs to this file in addition to stderr (used by `tobroctl start`).
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    // `tobrod run` initializes tracing itself (log ring buffer for
+    // `daemon.logs` plus an optional log file); everything else logs plainly.
+    if !matches!(cli.command, Some(Command::Run(_))) {
+        init_tracing();
+    }
+
     let Some(command) = cli.command else {
         println!(
-            "tobrod {} (run `tobrod run` for the M1 daemon, or `tobrod spike` for the M0 spike)",
+            "tobrod {} (run `tobrod run` for the headless daemon, or `tobrod spike` for the M0 spike)",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -103,12 +113,29 @@ async fn main() -> anyhow::Result<()> {
         let _ = ensure_private_dir(project.data_dir());
     }
     match command {
-        Command::Run(args) => run_daemon(args, state_dir, cache_dir).await,
+        Command::Run(args) => {
+            // Log ring buffer (shared with IPC via `daemon.logs`) and optional
+            // log file, both wired into the tracing writer.
+            let ring = logs::LogBuffer::shared(logs::DEFAULT_CAPACITY);
+            let file = open_log_file(args.log_file.as_deref())?;
+            init_tracing_with_capture(logs::LogCapture::new(
+                Arc::clone(&ring),
+                file.as_ref().map(|f| Arc::clone(&f.0)),
+            ));
+            run_daemon(args, state_dir, cache_dir, ring, file).await
+        }
         Command::Spike(args) => spike::run(args, state_dir, cache_dir).await,
     }
 }
 
-async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> anyhow::Result<()> {
+async fn run_daemon(
+    args: RunArgs,
+    state_dir: PathBuf,
+    cache_dir: PathBuf,
+    log_ring: logs::LogBufferShared,
+    log_file: Option<(Arc<Mutex<std::fs::File>>, PathBuf)>,
+) -> anyhow::Result<()> {
+    let log_file = log_file.map(|(_, path)| path);
     let config_path = args
         .config
         .or_else(|| tobro_config::default_path().ok())
@@ -243,6 +270,9 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             outbound_proxy,
             onion_services: Vec::new(),
         }));
+    // Shutdown trigger for `daemon.shutdown` (tobroctl shutdown / GUI quit):
+    // the same clean path as SIGINT, selected alongside ctrl-c below.
+    let shutdown_requested = Arc::new(tokio::sync::Notify::new());
     let ipc_control = ipc::SupervisorControl::new(
         handle.clone(),
         config_path.clone(),
@@ -254,7 +284,9 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
             .map(|(supervisor, _events)| supervisor.control_handle()),
         Some(std::sync::Arc::clone(&kindness_limits)),
         Some(std::sync::Arc::clone(&kindness_stats)),
-    );
+    )
+    .with_log_buffer(log_ring)
+    .with_shutdown(Arc::clone(&shutdown_requested));
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();
     let ipc_task = tokio::spawn(async move {
@@ -272,13 +304,19 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
         socks_port = config.proxy.socks_port,
         http_port = config.proxy.effective_http_port(),
         dns_port = config.proxy.dns_port,
-        "tobrod running (M1); waiting for daemon.connect"
+        log_file = log_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "stderr only".to_owned()),
+        "tobrod running (headless); use `tobroctl status|connect|stop|logs|shutdown`"
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to listen for ctrl-c")?;
-    tracing::info!("shutdown requested");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown requested (signal)");
+        }
+        _ = shutdown_requested.notified() => {
+            tracing::info!("shutdown requested (IPC daemon.shutdown)");
+        }
+    }
+    tracing::info!("shutting down");
     let _ = handle.disconnect().await;
     let _ = handle.shutdown().await;
     if let Some((kindness, _kindness_events)) = kindness {
@@ -290,12 +328,47 @@ async fn run_daemon(args: RunArgs, state_dir: PathBuf, cache_dir: PathBuf) -> an
     Ok(())
 }
 
+/// Open the daemon log file (append, created with parent dirs). Missing file
+/// support is not fatal: the daemon still logs to stderr and the ring buffer.
+fn open_log_file(
+    path: Option<&Path>,
+) -> anyhow::Result<Option<(Arc<Mutex<std::fs::File>>, PathBuf)>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    Ok(Some((Arc::new(Mutex::new(file)), path.to_path_buf())))
+}
+
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,tobro=info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Like [`init_tracing`], but tee output to the log ring buffer (and any log
+/// file already attached to the capture writer). ANSI styling is disabled so
+/// `daemon.logs` consumers (tobroctl JSON, diagnostics export) get clean text.
+fn init_tracing_with_capture(capture: logs::LogCapture) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,tobro=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(capture)
         .try_init();
 }
 

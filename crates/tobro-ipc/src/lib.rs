@@ -15,7 +15,8 @@
 //! # M1/M2 surface
 //!
 //! Methods: `daemon.hello`, `daemon.status`, `daemon.connect`, `daemon.stop`,
-//! `daemon.reload_config`, `daemon.new_identity`.
+//! `daemon.reload_config`, `daemon.new_identity`, `daemon.logs`,
+//! `daemon.shutdown`.
 //! Notifications: `bootstrap.progress`, `daemon.state_changed`.
 //! Servers enforce a method allowlist, version/hello preflight, explicit no-params
 //! validation, peer-identity checks (platform-specific), and idle-connection timeouts.
@@ -64,6 +65,12 @@ pub mod methods {
     pub const RELOAD_CONFIG: &str = "daemon.reload_config";
     /// Request a new identity (restart Tor client/listeners for new circuits).
     pub const NEW_IDENTITY: &str = "daemon.new_identity";
+    /// Fetch recent daemon log lines from the in-memory ring buffer:
+    /// optional params `{"lines": <1..=10000>}`. Lines are redacted at capture.
+    pub const LOGS: &str = "daemon.logs";
+    /// Ask the daemon to shut down cleanly (same as SIGINT to the process).
+    /// No params; the response is sent before the daemon exits.
+    pub const SHUTDOWN: &str = "daemon.shutdown";
     /// Get the current daemon configuration (redacted; no secrets).
     pub const CONFIG_GET: &str = "config.get";
     /// Validate a configuration patch without applying it.
@@ -126,6 +133,9 @@ pub mod methods {
     pub const PREFLIGHT: &[&str] = &[HELLO];
 }
 
+/// Largest `lines` count accepted by `daemon.logs`.
+pub const MAX_LOG_LINES_REQUEST: u64 = 10_000;
+
 /// Returns true if `method` is in the supported method allowlist.
 pub fn is_allowed_method(method: &str) -> bool {
     matches!(
@@ -136,6 +146,8 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::STOP
             | methods::RELOAD_CONFIG
             | methods::NEW_IDENTITY
+            | methods::LOGS
+            | methods::SHUTDOWN
             | methods::CONFIG_GET
             | methods::CONFIG_VALIDATE
             | methods::CONFIG_APPLY
@@ -170,12 +182,45 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::STOP
         | methods::RELOAD_CONFIG
         | methods::NEW_IDENTITY
+        | methods::SHUTDOWN
         | methods::CONFIG_GET
         | methods::KINDNESS_STATUS
         | methods::KINDNESS_CHECK
         | methods::KINDNESS_RESET_STATS
         | methods::ONION_LIST
         | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
+        methods::LOGS => {
+            if params.is_none() || matches!(params, Some(Value::Null)) {
+                return Ok(());
+            }
+            let Some(Value::Object(map)) = params else {
+                return Err(RpcError::invalid_params(
+                    method,
+                    "expected optional params object: {\"lines\": <1..=10000>}",
+                ));
+            };
+            if let Some(lines) = map.get("lines") {
+                let Some(count) = lines.as_u64() else {
+                    return Err(RpcError::invalid_params(
+                        method,
+                        "\"lines\" must be a positive integer",
+                    ));
+                };
+                if !(1..=MAX_LOG_LINES_REQUEST).contains(&count) {
+                    return Err(RpcError::invalid_params(
+                        method,
+                        format!("\"lines\" must be between 1 and {MAX_LOG_LINES_REQUEST}"),
+                    ));
+                }
+            }
+            if let Some(key) = map.keys().find(|k| k.as_str() != "lines") {
+                return Err(RpcError::invalid_params(
+                    method,
+                    format!("unknown parameter {key:?}; only \"lines\" is supported"),
+                ));
+            }
+            Ok(())
+        }
         methods::CONFIG_VALIDATE | methods::CONFIG_APPLY => {
             let Some(Value::Object(map)) = params else {
                 return Err(RpcError::invalid_params(
@@ -1053,6 +1098,43 @@ mod tests {
             .is_err()
         );
         assert!(validate_params(methods::KINDNESS_STATUS, &None).is_ok());
+    }
+
+    #[test]
+    fn logs_and_shutdown_are_allowlisted_and_validated() {
+        assert!(is_allowed_method(methods::LOGS));
+        assert!(is_allowed_method(methods::SHUTDOWN));
+        assert!(validate_params(methods::SHUTDOWN, &None).is_ok());
+        assert!(
+            validate_params(methods::SHUTDOWN, &Some(serde_json::json!({"force": true}))).is_err()
+        );
+
+        for params in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"lines": 1})),
+            Some(serde_json::json!({"lines": 500})),
+            Some(serde_json::json!({"lines": 10_000})),
+        ] {
+            assert!(
+                validate_params(methods::LOGS, &params).is_ok(),
+                "should accept {params:?}"
+            );
+        }
+        for params in [
+            Some(serde_json::json!({"lines": 0})),
+            Some(serde_json::json!({"lines": 10_001})),
+            Some(serde_json::json!({"lines": -1})),
+            Some(serde_json::json!({"lines": "many"})),
+            Some(serde_json::json!({"since": 5})),
+            Some(serde_json::json!(true)),
+        ] {
+            assert!(
+                validate_params(methods::LOGS, &params).is_err(),
+                "should reject {params:?}"
+            );
+        }
     }
 
     #[test]
