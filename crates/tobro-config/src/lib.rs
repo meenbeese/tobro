@@ -3,6 +3,13 @@
 //! M1 skeleton: typed TOML config with defaults and basic validation.
 //! Expand with bridges, stream prefs, onion services, etc. in later milestones.
 
+mod tun;
+
+pub use tun::{
+    DEFAULT_TUN_MTU, KillSwitchPolicy, SplitCidr, SplitDestination, SplitDomain, SplitRule,
+    TUN_MAX_MTU, TUN_MIN_MTU, TunConfig, UdpPolicy,
+};
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -71,6 +78,10 @@ pub struct Config {
     pub onion_services: OnionServicesConfig,
     /// Kindness Mode settings (M6, F-60): run a snowflake-proxy sidecar.
     pub kindness: KindnessConfig,
+    /// TUN mode settings (M7, §4.7): system-wide routing, split tunneling,
+    /// kill switch, and UDP policy. Defaults to fully disabled; `tun.enabled`
+    /// is rejected by validation until the M7 engine lands.
+    pub tun: TunConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -87,6 +98,7 @@ impl Default for Config {
             bridges: BridgesConfig::default(),
             onion_services: OnionServicesConfig::default(),
             kindness: KindnessConfig::default(),
+            tun: TunConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
@@ -1044,6 +1056,7 @@ impl Config {
             }
         }
         self.kindness.validate()?;
+        self.tun.validate()?;
         self.outbound_proxy.validate()?;
         Ok(())
     }

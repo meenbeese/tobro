@@ -388,6 +388,10 @@ fn config_effects(
     let network_changed = current.network != next.network;
     let bridges_changed = current.bridges != next.bridges;
     let outbound_proxy_changed = current.outbound_proxy != next.outbound_proxy;
+    // TUN config changes are reported but do not force a proxy restart: the
+    // TUN routing engine is not implemented yet (M7), so they have no runtime
+    // effect in this build.
+    let tun_changed = current.tun != next.tun;
     let restart_required = listeners_changed
         || stream_changed
         || network_changed
@@ -438,6 +442,7 @@ fn config_effects(
         "network_changed": network_changed,
         "bridges_changed": bridges_changed,
         "outbound_proxy_changed": outbound_proxy_changed,
+        "tun_changed": tun_changed,
         "runtime_active": running,
         "warnings": warnings,
     })
