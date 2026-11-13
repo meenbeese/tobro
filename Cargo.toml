@@ -14,6 +14,7 @@ members = [
     "crates/tobro-config",
     "crates/tobro-helper",
     "crates/tobro-ipc",
+    "crates/tobro-osapi",
     "crates/tobro-store",
     "crates/tobro-tor",
     "crates/tobro-tun",
@@ -25,7 +26,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 license = "GPL-3.0-only"
 publish = false
 
@@ -92,6 +93,23 @@ reqwest = { version = "0.13", default-features = false, features = [
 # --- UPnP (Kindness Mode port mapping, F-62) ------------------------------
 # Blocking IGDv1/IGDv2 client; only used via spawn_blocking.
 igd-next = { version = "0.18", default-features = false, features = ["io_sync"] }
+
+# --- TUN mode (M7 T4) -----------------------------------------------------
+# `tobro-osapi` is the only crate allowed `unsafe` (see its lib.rs docs).
+tobro-osapi = { path = "crates/tobro-osapi" }
+# Linux backend: `tun2` creates the TUN device (safe ioctl wrapper, the
+# workspace forbids unsafe code); `rtnetlink` configures addressing, MTU,
+# link state, and routes via netlink so the helper never shells out (§10.5).
+# The `async` feature provides `create_as_async` (not a default feature).
+tun2 = { version = "4", features = ["async"] }
+rtnetlink = "0.24"
+# macOS backend (T4b): route tables go through the small audited PF_ROUTE
+# FFI in `tobro-osapi`; DNS uses the SystemConfiguration dynamic store.
+system-configuration = "0.8"
+# Windows backend (T4c): adapter management (index, DNS, MTU, delete) via
+# wintun-bindings; route tables via the iphlpapi FFI in `tobro-osapi`.
+wintun-bindings = "0.7"
+libc = "0.2"
 
 # --- Desktop shell --------------------------------------------------------
 tauri = { version = "2", features = ["tray-icon", "image-png"] }

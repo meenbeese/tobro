@@ -149,7 +149,7 @@ export function About({ onClose }: AboutProps) {
               <strong>License:</strong> GPL-3.0-only
             </li>
             <li>
-              <strong>Rust toolchain (workspace):</strong> 1.92 (MSRV target per
+              <strong>Rust toolchain (workspace):</strong> 1.100.0 (pinned per
               workspace config)
             </li>
             <li>

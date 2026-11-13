@@ -212,7 +212,7 @@ These are **not** parity requirements; they are replaced or dropped:
 | Layer | Choice | Version (Nov 2026) | Why |
 |---|---|---|---|
 | Tor engine | **Arti**, embedded `arti-client` | `arti-client` 0.48.0 / Arti 2.8.0 | Rust-native, no C Tor binary, client SOCKS/HTTP/DNS/onion services/PTs, memory-safe, single toolchain |
-| Toolchain | Stable Rust, 2024 edition | MSRV 1.92 | Arti 2.8 requires 1.92; pin in `rust-toolchain.toml` |
+| Toolchain | Stable Rust, 2024 edition | Pinned 1.100 | Arti 2.8 requires MSRV 1.92; the workspace pins 1.100 in `rust-toolchain.toml` |
 | Async runtime | Tokio | 1.54+ | Arti's default runtime; ecosystem standard |
 | Desktop shell | **Tauri 2** | 2.x | Small binaries, native WebView, Rust core, tray/updater/autostart plugins, no Chromium bundle |
 | UI | **React 19 + TypeScript + Vite** | React 19, Vite 7 | Mature ecosystem, fast iteration, strong typing, easy localization/accessibility |
@@ -550,7 +550,7 @@ Those costs are paid once in M1 and are worth it for the product shape.
 ```text
 tobro/
 ├── Cargo.toml                     # workspace
-├── rust-toolchain.toml            # pin 1.92+
+├── rust-toolchain.toml            # pin 1.100
 ├── package.json                   # frontend workspace
 ├── apps/
 │   ├── desktop/                   # Tauri shell binary `tobro`
@@ -928,7 +928,7 @@ Assumptions: 2–3 engineers (Rust + frontend), part-time design/security review
 
 Deliverables:
 
-- Workspace skeleton, `rust-toolchain.toml` (1.92), lint/format/test CI on macOS/Windows/Linux.
+- Workspace skeleton, `rust-toolchain.toml` (1.100), lint/format/test CI on macOS/Windows/Linux.
 - Spike: headless Rust binary bootstraps Arti 2.8, starts SOCKS/HTTP/DNS, prints bootstrap events, serves a request through Tor.
 - Spike: Tauri 2 window talks to the spike daemon over a Unix socket/named pipe.
 - Risk register with owners.
