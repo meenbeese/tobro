@@ -34,9 +34,9 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/icon.svg",
       "icons/icon.ico",
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/mac.icon"
     ],
     "category": "Utility",
     "shortDescription": "Desktop Tor client powered by Arti",
