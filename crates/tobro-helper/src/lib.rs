@@ -22,25 +22,72 @@
 //!
 //! # Skeleton status
 //!
-//! The protocol loop, peer gating, state machine, and dispatch are complete;
-//! the privileged platform backends ([`Platform`]) are still
-//! [`NullPlatform`], which rejects privileged operations with
-//! `UNSUPPORTED` until the per-OS backends land (M7 T4).
+//! The protocol loop, peer gating, state machine, and dispatch are complete.
+//! The privileged platform backends ([`Platform`]) are per-OS: Linux has the
+//! real TUN/netlink backend ([`LinuxPlatform`], T4a), macOS the utun
+//! backend ([`MacosPlatform`], T4b), Windows the wintun backend
+//! ([`WindowsPlatform`], T4c). Any other platform still gets
+//! [`NullPlatform`], which rejects privileged operations with `UNSUPPORTED`.
 //!
 //! "Runs only while TUN is enabled" is honored by [`Args::idle_exit_secs`]:
 //! the helper exits cleanly when no client connects within the window.
 
 pub mod platform;
+#[cfg(target_os = "linux")]
+pub mod platform_linux;
+#[cfg(target_os = "macos")]
+pub mod platform_macos;
+#[cfg(target_os = "windows")]
+pub mod platform_windows;
 pub mod service;
 pub mod session;
 
 pub use platform::{NullPlatform, Platform, PlatformError};
+#[cfg(target_os = "linux")]
+pub use platform_linux::LinuxPlatform;
+#[cfg(target_os = "macos")]
+pub use platform_macos::MacosPlatform;
+#[cfg(target_os = "windows")]
+pub use platform_windows::WindowsPlatform;
 pub use service::HelperService;
 #[cfg(unix)]
 pub use session::serve_unix;
 #[cfg(windows)]
 pub use session::serve_windows;
 pub use session::{PeerGate, PeerIdentity, ServeExit, shutdown_signal};
+
+/// The platform backend selected at compile time. Linux, macOS, and Windows
+/// have real backends (M7 T4); other platforms get the placeholder.
+#[cfg(target_os = "linux")]
+pub type ActivePlatform = LinuxPlatform;
+#[cfg(target_os = "macos")]
+pub type ActivePlatform = MacosPlatform;
+#[cfg(target_os = "windows")]
+pub type ActivePlatform = WindowsPlatform;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub type ActivePlatform = NullPlatform;
+
+/// Construct the active backend, failing fast on OS-level setup errors
+/// (e.g. netlink unavailable).
+#[cfg(target_os = "linux")]
+pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    LinuxPlatform::connect()
+}
+
+#[cfg(target_os = "macos")]
+pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    Ok(MacosPlatform::new())
+}
+
+#[cfg(target_os = "windows")]
+pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    Ok(WindowsPlatform::new())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    Ok(NullPlatform)
+}
 
 use clap::Parser;
 

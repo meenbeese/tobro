@@ -18,6 +18,25 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux TUN backend (T4a): device creation + netlink configuration.
+tun2 = { workspace = true }
+rtnetlink = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS TUN backend (T4b): utun device + SystemConfiguration DNS. Route
+# manipulation goes through the audited FFI in `tobro-osapi`.
+tun2 = { workspace = true }
+tobro-osapi = { workspace = true }
+system-configuration = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows TUN backend (T4c): wintun device via tun2; adapter management
+# (index/DNS/MTU/delete) via wintun-bindings; routes via `tobro-osapi`.
+tun2 = { workspace = true }
+tobro-osapi = { workspace = true }
+wintun-bindings = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

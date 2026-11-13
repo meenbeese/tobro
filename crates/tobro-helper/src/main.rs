@@ -7,7 +7,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tobro_helper::{Args, HelperService, NullPlatform, ServeExit, init_logging};
+use tobro_helper::{
+    ActivePlatform, Args, HelperService, ServeExit, init_logging, new_active_platform,
+};
 use tobro_tun::default_endpoint;
 
 fn main() -> ExitCode {
@@ -32,7 +34,14 @@ fn main() -> ExitCode {
 /// Bind and serve until shutdown or the idle window expires.
 async fn run(endpoint: PathBuf, idle_secs: u64) -> ExitCode {
     let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
-    let mut service = HelperService::new(NullPlatform);
+    let platform = match new_active_platform() {
+        Ok(platform) => platform,
+        Err(error) => {
+            tracing::error!("could not initialize the platform backend: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut service = HelperService::new(platform);
 
     let exit = serve(endpoint, &mut service, idle).await;
     match exit {
@@ -57,7 +66,7 @@ async fn run(endpoint: PathBuf, idle_secs: u64) -> ExitCode {
 #[cfg(unix)]
 async fn serve(
     endpoint: PathBuf,
-    service: &mut HelperService<NullPlatform>,
+    service: &mut HelperService<ActivePlatform>,
     idle: Option<std::time::Duration>,
 ) -> ServeExit {
     let listener = match tobro_tun::bind_listener(&endpoint).await {
@@ -75,7 +84,7 @@ async fn serve(
 #[cfg(windows)]
 async fn serve(
     endpoint: PathBuf,
-    service: &mut HelperService<NullPlatform>,
+    service: &mut HelperService<ActivePlatform>,
     idle: Option<std::time::Duration>,
 ) -> ServeExit {
     tracing::info!("listening on {endpoint:?}");

@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { GearSix, Info, ListBullets } from "@phosphor-icons/react";
+import {
+  GearSix,
+  Info,
+  ListBullets,
+  Plugs,
+  ShieldCheck,
+} from "@phosphor-icons/react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   useCallback,
@@ -14,6 +20,13 @@ import appIconUrl from "./assets/icon.svg";
 import { StatusIcon } from "./StatusIcon";
 import { ConnectionInfo } from "./ConnectionInfo";
 import { storeDaemonInfo } from "./daemonInfo";
+import {
+  DEVICE_MODE_AVAILABLE,
+  TUNNEL_MODE_KEY,
+  readTunnelMode,
+  setTunnelMode,
+  type TunnelMode,
+} from "./tunnelMode";
 
 type DaemonState =
   | "starting"
@@ -84,7 +97,36 @@ export default function App() {
   const [unlockError, setUnlockError] = useState("");
   const [unlockBusy, setUnlockBusy] = useState(false);
   const [connectedAt, setConnectedAt] = useState<number | null>(null);
+  const [tunnelMode, setTunnelModeState] = useState<TunnelMode>(() =>
+    readTunnelMode(),
+  );
   const idleTimer = useRef<number | null>(null);
+
+  // Keep the mode in sync across windows (storage event) and within this
+  // window (custom event from the toggle itself).
+  useEffect(() => {
+    const sync = () => setTunnelModeState(readTunnelMode());
+    window.addEventListener("storage", (e) => {
+      if (e.key === TUNNEL_MODE_KEY) sync();
+    });
+    window.addEventListener("tobro-tunnel-mode-changed", sync);
+    return () => {
+      window.removeEventListener("tobro-tunnel-mode-changed", sync);
+    };
+  }, []);
+
+  function onTunnelModeChange(mode: TunnelMode) {
+    if (mode === tunnelMode) return;
+    setTunnelMode(mode);
+    setTunnelModeState(mode);
+    appendLog(
+      mode === "device"
+        ? "tunnel mode: full-device VPN selected"
+        : "tunnel mode: proxy ports selected",
+      "info",
+      "ui",
+    );
+  }
 
   function appendLog(
     text: string,
@@ -202,7 +244,15 @@ export default function App() {
       status?.state === "serving");
   // Allow Connect even when the local daemon is unavailable so the desktop can
   // start tobrod and connect with a single button (Orbot parity).
-  const canConnect = !busy && !isActive && status?.state !== "stopping";
+  // In device mode the TUN engine is not wired up yet, so connecting would
+  // silently run in ports mode — keep Connect disabled there until M7.
+  const deviceModeUnavailable =
+    tunnelMode === "device" && !DEVICE_MODE_AVAILABLE;
+  const canConnect =
+    !deviceModeUnavailable &&
+    !busy &&
+    !isActive &&
+    status?.state !== "stopping";
   const canNewIdentity =
     reachable &&
     !busy &&
@@ -594,10 +644,44 @@ export default function App() {
               <p className="headline">{headline}</p>
             </div>
           </div>
+          <div
+            className="mode-toggle"
+            role="radiogroup"
+            aria-label="Tunnel mode"
+          >
+            <button
+              type="button"
+              role="radio"
+              aria-checked={tunnelMode === "ports"}
+              className={tunnelMode === "ports" ? "active" : ""}
+              onClick={() => onTunnelModeChange("ports")}
+              title="Route selected apps through local proxies (SOCKS/HTTP/DNS)"
+            >
+              <Plugs size={16} aria-hidden="true" />
+              Ports mode
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={tunnelMode === "device"}
+              className={tunnelMode === "device" ? "active" : ""}
+              onClick={() => onTunnelModeChange("device")}
+              title="Route all device traffic through Tor via the privileged TUN helper"
+            >
+              <ShieldCheck size={16} aria-hidden="true" />
+              Full device VPN
+            </button>
+          </div>
+          {deviceModeUnavailable ? (
+            <p className="muted mode-note" role="note">
+              Full-device VPN is not available in this build yet (planned in
+              milestone M7): it needs the privileged TUN helper and routing
+              engine. Switch back to ports mode to connect.
+            </p>
+          ) : null}
           {!reachable ? (
             <p className="muted" style={{ marginTop: 0 }}>
-              If the local <code>tobrod</code> daemon is not running, Tobro will
-              try to start it automatically when you connect.
+              Everything starts automatically when you connect.
             </p>
           ) : null}
           {showProgress ? (

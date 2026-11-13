@@ -1,0 +1,39 @@
+[package]
+name = "tobro-osapi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# macOS route socket FFI (PF_ROUTE / RTM_ADD / RTM_DELETE).
+# macOS SystemConfiguration DNS FFI (dynamic store) — see `sc_dns`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+system-configuration = { workspace = true }
+
+# Windows routing table FFI (iphlpapi CreateIpForwardEntry2/DeleteIpForwardEntry2).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+wintun-bindings = { workspace = true }
+
+# This is the ONLY workspace crate allowed to use `unsafe`. The workspace
+# default is `unsafe_code = "forbid"`; this crate replaces the lint table
+# (see src/lib.rs for the security rationale).
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
