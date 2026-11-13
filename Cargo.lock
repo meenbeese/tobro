@@ -7639,6 +7639,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobro-helper"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "futures",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tobro-tun",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tobro-ipc"
 version = "0.0.0"
 dependencies = [
@@ -7699,6 +7715,20 @@ dependencies = [
  "tor-socksproto",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "tobro-tun"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

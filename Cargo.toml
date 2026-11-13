@@ -12,9 +12,11 @@
 resolver = "3"
 members = [
     "crates/tobro-config",
+    "crates/tobro-helper",
     "crates/tobro-ipc",
     "crates/tobro-store",
     "crates/tobro-tor",
+    "crates/tobro-tun",
     "crates/tobrod",
     "crates/tobroctl",
     "apps/desktop",

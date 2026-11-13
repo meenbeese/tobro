@@ -9,9 +9,12 @@ onion hosting, Kindness Mode, as well as numerous circumvention methods.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
-## Screenshot
+## Screenshots
 
-![Tobro app UI](apps/desktop/assets/screenshot.png)
+| | |
+|---|---|
+| ![Tobro main window: connected status with SOCKS, HTTP, and DNS endpoints](apps/desktop/assets/screenshot_1.png) | ![Tobro logs window with filter and redaction](apps/desktop/assets/screenshot_2.png) |
+| ![Tobro settings window: general, node configuration, onion services](apps/desktop/assets/screenshot_3.png) | ![Tobro about window: application and runtime details](apps/desktop/assets/screenshot_4.png) |
 
 ## Features
 
