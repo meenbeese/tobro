@@ -19,10 +19,13 @@
 //! - **macOS**: opening a `PF_ROUTE` routing socket, writing a request
 //!   message, reading the reply. All message bytes are built from validated
 //!   plain-data inputs (`std::net` types + interface indices); no attacker
-//!   controlled lengths, pointers, or format strings exist.
+//!   controlled lengths, pointers, or format strings exist. The kill switch
+//!   additionally speaks `/dev/pf` ioctls with fixed-size structures
+//!   ([`pf`]) — never `pfctl`, per §10.5's no-shell rule.
 //! - **Windows**: calling the two iphlpapi functions
 //!   (`CreateIpForwardEntry2` / `DeleteIpForwardEntry2`) with a zeroed-out
-//!   struct filled from validated plain-data inputs.
+//!   struct filled from validated plain-data inputs, and the handful of
+//!   Windows Filtering Platform calls used by the kill switch ([`wfp`]).
 //!
 //! Every public function is safe and takes plain `std::net` types. Nothing
 //! here shells out, listens, or touches anything beyond the routing tables.
@@ -37,8 +40,16 @@
 #[cfg(target_os = "macos")]
 pub mod bsd_route;
 
+/// macOS packet-filter (PF) kill-switch enforcement (M7 T4b).
+#[cfg(target_os = "macos")]
+pub mod pf;
+
 #[cfg(target_os = "macos")]
 pub mod sc_dns;
+
+/// Windows Filtering Platform (WFP) kill-switch enforcement (M7 T4c).
+#[cfg(target_os = "windows")]
+pub mod wfp;
 
 #[cfg(target_os = "windows")]
 pub mod win_route;

@@ -15,13 +15,17 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 system-configuration = { workspace = true }
 
-# Windows routing table FFI (iphlpapi CreateIpForwardEntry2/DeleteIpForwardEntry2).
+# Windows routing table FFI (iphlpapi CreateIpForwardEntry2/DeleteIpForwardEntry2)
+# and kill-switch FFI (Windows Filtering Platform / fwpuclnt).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Rpc",
 ] }
 wintun-bindings = { workspace = true }
 

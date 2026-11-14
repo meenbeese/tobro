@@ -18,8 +18,12 @@
 //! - `wintun.dll` must sit next to the helper binary (bundled by packaging,
 //!   M8); until then device creation fails with a clear error. The driver
 //!   library is loaded lazily on first use so `status`/`teardown` still work.
-//! - `KillSwitchMode::Block` is unsupported here: fail-closed enforcement
-//!   belongs in Windows Filtering Platform (WFP), deferred to M8.
+//! - `KillSwitchMode::Block` installs persistent Windows Filtering Platform
+//!   filters through `tobro-osapi`'s WFP FFI (the helper never shells out,
+//!   §10.5): permit loopback and the tunnel adapter (matched by LUID), block
+//!   all other egress, per family. The objects live in the WFP store and
+//!   fail closed — they keep enforcing if the helper crashes — and teardown
+//!   removes them again by fixed key, never touching foreign filters.
 //! - Logs carry counts only, never addresses or destinations (§10.5).
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -71,6 +75,9 @@ struct DeviceState {
     applied_address: Prefix,
     /// Routes the helper installed (tunnel + bypass), for convergence.
     installed_routes: Vec<RouteSpec>,
+    /// Whether WFP kill-switch filters are currently installed (the filters
+    /// themselves are key-based, so only the presence bit is tracked).
+    kill_switch: bool,
 }
 
 impl DeviceState {
@@ -94,6 +101,7 @@ impl std::fmt::Debug for DeviceState {
         // Count-only summary; never device details (§10.5).
         f.debug_struct("DeviceState")
             .field("tracked_routes", &self.installed_routes.len())
+            .field("kill_switch_enforced", &self.kill_switch)
             .finish_non_exhaustive()
     }
 }
@@ -197,6 +205,7 @@ impl Platform for WindowsPlatform {
                     prefix_len: 0,
                 }),
                 installed_routes: Vec::new(),
+                kill_switch: false,
             });
         }
 
@@ -323,19 +332,74 @@ impl Platform for WindowsPlatform {
     }
 
     async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError> {
-        let guard = self.state.lock().await;
-        if guard.is_none() {
-            return Err(PlatformError::KillSwitch(
+        // The kill switch follows device creation: there is always an
+        // enforced adapter here.
+        let mut guard = self.state.lock().await;
+        let state = guard.as_mut().ok_or_else(|| {
+            PlatformError::KillSwitch(
                 "no active TUN device; the kill switch follows device creation".to_owned(),
-            ));
-        }
-        drop(guard);
+            )
+        })?;
         match mode {
-            KillSwitchMode::Block => Err(PlatformError::Unsupported(
-                "fail-closed enforcement needs Windows Filtering Platform rules, deferred to M8; use the restore policy or skip the kill switch on Windows for now".to_owned(),
-            )),
-            KillSwitchMode::Restore | KillSwitchMode::Disabled => Ok(()),
+            KillSwitchMode::Block => {
+                if state.kill_switch {
+                    tracing::info!("apply_kill_switch: WFP enforcement already active");
+                    return Ok(()); // idempotent
+                }
+                // The filters pin the adapter LUID, so read it fresh from
+                // the adapter (it changes when the adapter is recreated).
+                let adapter = state.reopen_adapter()?;
+                let luid = adapter.get_luid();
+                drop(adapter);
+                let filters =
+                    tokio::task::spawn_blocking(move || -> Result<usize, PlatformError> {
+                        let engine = tobro_osapi::wfp::WfpEngine::open().map_err(|error| {
+                            PlatformError::KillSwitch(format!(
+                                "could not open the Windows Filtering Platform engine: {error}"
+                            ))
+                        })?;
+                        engine
+                            .apply_kill_switch(tobro_osapi::wfp::adapter_luid(luid))
+                            .map_err(|error| {
+                                PlatformError::KillSwitch(format!(
+                                    "could not install the WFP kill-switch filters: {error}"
+                                ))
+                            })
+                    })
+                    .await
+                    .map_err(|error| {
+                        PlatformError::KillSwitch(format!("kill switch task failed: {error}"))
+                    })??;
+                state.kill_switch = true;
+                tracing::info!("apply_kill_switch: WFP enforcement active ({filters} filter(s))");
+            }
+            KillSwitchMode::Restore | KillSwitchMode::Disabled => {
+                // Teardown order is fail-closed: routes are already gone, so
+                // the block keeps covering the leak direction until the
+                // filters themselves are removed.
+                if state.kill_switch {
+                    tokio::task::spawn_blocking(move || -> Result<(), PlatformError> {
+                        let engine = tobro_osapi::wfp::WfpEngine::open().map_err(|error| {
+                            PlatformError::KillSwitch(format!(
+                                "could not open the Windows Filtering Platform engine: {error}"
+                            ))
+                        })?;
+                        engine.remove_kill_switch().map_err(|error| {
+                            PlatformError::KillSwitch(format!(
+                                "could not remove the WFP kill-switch filters: {error}"
+                            ))
+                        })
+                    })
+                    .await
+                    .map_err(|error| {
+                        PlatformError::KillSwitch(format!("kill switch task failed: {error}"))
+                    })??;
+                    state.kill_switch = false;
+                    tracing::info!("apply_kill_switch: enforcement removed");
+                }
+            }
         }
+        Ok(())
     }
 
     async fn teardown(&self) -> Result<(), PlatformError> {
@@ -345,6 +409,33 @@ impl Platform for WindowsPlatform {
         };
         let tracked = state.tracked_route_count();
         let removed = self.remove_tracked_routes(&mut state).await;
+        // Remove the WFP enforcement (fail-closed order: the block stays up
+        // until the routes are back to stock) before the adapter vanishes.
+        if state.kill_switch {
+            let enforcement_removed =
+                tokio::task::spawn_blocking(move || -> Result<(), PlatformError> {
+                    let engine = tobro_osapi::wfp::WfpEngine::open().map_err(|error| {
+                        PlatformError::KillSwitch(format!(
+                            "could not open the Windows Filtering Platform engine: {error}"
+                        ))
+                    })?;
+                    engine.remove_kill_switch().map_err(|error| {
+                        PlatformError::KillSwitch(format!(
+                            "could not remove the WFP kill-switch filters: {error}"
+                        ))
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    PlatformError::KillSwitch(format!("kill switch task failed: {error}"))
+                });
+            if let Err(error) = enforcement_removed {
+                tracing::warn!("teardown: could not remove the WFP enforcement: {error}");
+            } else {
+                state.kill_switch = false;
+                tracing::info!("teardown: kill-switch enforcement removed");
+            }
+        }
         // Deconstruct the state: drop the device (ends the wintun session),
         // then delete the adapter — its addressing and DNS settings
         // disappear with it.
@@ -355,6 +446,7 @@ impl Platform for WindowsPlatform {
             index: _,
             applied_address: _,
             installed_routes: _,
+            kill_switch: _,
         } = state;
         drop(device);
         let delete_result = match wintun_bindings::Adapter::open(&wintun, &name) {

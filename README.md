@@ -167,7 +167,7 @@ feature is not (yet) available on a given OS.
 | App lock via OS auth (Touch ID / Windows Hello) | ❌ (planned; password fallback) | ❌ (planned; password fallback) | ❌ (planned; password fallback) |
 | Window capture protection | Best-effort | Best-effort | Best-effort (varies by DE/WM) |
 | Headless daemon + `tobroctl` | ✅ (launchd example) | ✅ | ✅ (systemd example) |
-| TUN mode + privileged helper (`tobro-helper`) | 🚧 M7 in progress (utun + PF_ROUTE + SC DNS) | 🚧 M7 in progress (wintun + iphlpapi) | 🚧 M7 in progress (netlink + TUN) |
+| TUN mode + privileged helper (`tobro-helper`) | 🚧 M7 in progress (utun + PF_ROUTE + SC DNS + PF kill switch) | 🚧 M7 in progress (wintun + iphlpapi + WFP kill switch) | 🚧 M7 in progress (netlink + TUN + blackhole-route kill switch) |
 | System proxy integration / proxy env vars | ❌ (planned post-1.0) | ❌ (planned post-1.0) | ❌ (planned post-1.0) |
 
 ¹ Requires a running Secret Service provider (GNOME Keyring, KWallet). When no

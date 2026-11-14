@@ -321,10 +321,8 @@ pub(crate) async fn build_plan_with(
     gateways: &Gateways,
     resolve_domain: &(dyn Fn(&str) -> DomainResolver<'_> + Send + Sync),
 ) -> Result<(TunnelPlan, PlanNotes), String> {
-    let v4_prefix =
-        Prefix::parse(TUNNEL_PREFIX_V4).map_err(|error| error.to_string())?;
-    let v6_prefix =
-        Prefix::parse(TUNNEL_PREFIX_V6).map_err(|error| error.to_string())?;
+    let v4_prefix = Prefix::parse(TUNNEL_PREFIX_V4).map_err(|error| error.to_string())?;
+    let v6_prefix = Prefix::parse(TUNNEL_PREFIX_V6).map_err(|error| error.to_string())?;
     let device = TunDevice {
         name: String::new(), // helper's platform default
         addresses: vec![v4_prefix, v6_prefix],
@@ -426,9 +424,7 @@ pub(crate) async fn build_plan_with(
 }
 
 /// Build the plan with production gateway discovery and resolution.
-pub(crate) async fn build_plan(
-    config: &TunConfig,
-) -> Result<(TunnelPlan, PlanNotes), String> {
+pub(crate) async fn build_plan(config: &TunConfig) -> Result<(TunnelPlan, PlanNotes), String> {
     let gateways = discover_gateways().await;
     build_plan_with(config, &gateways, &|name| {
         Box::pin(async move { resolve_domain_default(name).await })
@@ -593,7 +589,9 @@ impl TunManager {
         let (plan, notes) = match build_plan(config).await {
             Ok(plan) => plan,
             Err(message) => {
-                self.set_phase(TunPhase::Error(format!("TUN plan failed to build: {message}")));
+                self.set_phase(TunPhase::Error(format!(
+                    "TUN plan failed to build: {message}"
+                )));
                 return Err(message);
             }
         };
@@ -701,7 +699,10 @@ impl TunManager {
                     break;
                 }
             }
-            manager.inner.heartbeat_running.store(false, Ordering::SeqCst);
+            manager
+                .inner
+                .heartbeat_running
+                .store(false, Ordering::SeqCst);
         });
     }
 
@@ -895,9 +896,7 @@ mod tests {
     }
 
     fn no_resolver() -> impl Fn(&str) -> DomainResolver<'_> {
-        |_| {
-            Box::pin(async { Err("resolver disabled in test".to_owned()) }) as DomainResolver<'_>
-        }
+        |_| Box::pin(async { Err("resolver disabled in test".to_owned()) }) as DomainResolver<'_>
     }
 
     fn static_resolver(addresses: Vec<IpAddr>) -> impl Fn(&str) -> DomainResolver<'_> {
@@ -921,16 +920,18 @@ mod tests {
         // Defaults for both families point into the device.
         assert_eq!(plan.routes.len(), 2);
         assert!(plan.routes.iter().all(|route| route.gateway.is_none()));
-        assert!(plan
-            .routes
-            .iter()
-            .any(|route| route.destination.prefix_len == 0
-                && matches!(route.destination.addr, IpAddr::V4(_))));
-        assert!(plan
-            .routes
-            .iter()
-            .any(|route| route.destination.prefix_len == 0
-                && matches!(route.destination.addr, IpAddr::V6(_))));
+        assert!(
+            plan.routes
+                .iter()
+                .any(|route| route.destination.prefix_len == 0
+                    && matches!(route.destination.addr, IpAddr::V4(_)))
+        );
+        assert!(
+            plan.routes
+                .iter()
+                .any(|route| route.destination.prefix_len == 0
+                    && matches!(route.destination.addr, IpAddr::V6(_)))
+        );
         // DNS points at the engine's interception addresses.
         assert_eq!(plan.dns.servers.len(), 2);
         assert!(plan.dns.servers.contains(&IpAddr::V4(TUNNEL_DNS_V4)));
@@ -966,7 +967,8 @@ mod tests {
             .expect("plan must build");
         assert_eq!(plan.bypass_routes.len(), 2);
         assert!(plan.bypass_routes.iter().all(|route| {
-            route.gateway.is_some() && route.gateway.unwrap().is_ipv4() == route.destination.addr.is_ipv4()
+            route.gateway.is_some()
+                && route.gateway.unwrap().is_ipv4() == route.destination.addr.is_ipv4()
         }));
         assert!(notes.skipped_domains.is_empty());
     }
@@ -998,15 +1000,17 @@ mod tests {
             .await
             .expect("plan must build");
         assert_eq!(plan.bypass_routes.len(), 2);
-        assert!(plan
-            .bypass_routes
-            .iter()
-            .any(|route| route.destination.prefix_len == 32
-                && route.destination.addr == IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
-        assert!(plan
-            .bypass_routes
-            .iter()
-            .any(|route| route.destination.prefix_len == 128));
+        assert!(
+            plan.bypass_routes
+                .iter()
+                .any(|route| route.destination.prefix_len == 32
+                    && route.destination.addr == IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+        assert!(
+            plan.bypass_routes
+                .iter()
+                .any(|route| route.destination.prefix_len == 128)
+        );
         assert!(notes.skipped_domains.is_empty());
     }
 
@@ -1046,7 +1050,10 @@ mod tests {
         let manager = manager_for(&dir);
 
         // A disabled config never touches the helper.
-        manager.apply(&disabled_config()).await.expect("disabled is a no-op");
+        manager
+            .apply(&disabled_config())
+            .await
+            .expect("disabled is a no-op");
         assert_eq!(manager.status().phase, TunPhase::Disabled);
         assert_eq!(helper.state().lock().unwrap().handshakes, 0);
 
@@ -1086,10 +1093,7 @@ mod tests {
         let (dir, helper) = mock_helper().await;
         let state = helper.state();
         helper.set_responder(Some(Arc::new(move |request| {
-            if matches!(
-                request,
-                tobro_tun::HelperRequest::ApplyPlan { .. }
-            ) {
+            if matches!(request, tobro_tun::HelperRequest::ApplyPlan { .. }) {
                 tobro_tun::MockReply::Respond(tobro_tun::HelperResponse::Rejected {
                     code: tobro_tun::reject_codes::DEVICE_ERROR,
                     message: "device creation failed (mock)".to_owned(),
@@ -1105,7 +1109,10 @@ mod tests {
             .apply(&enabled_config())
             .await
             .expect_err("rejected plan must fail");
-        assert!(error.contains("rejected") || error.contains("device"), "{error}");
+        assert!(
+            error.contains("rejected") || error.contains("device"),
+            "{error}"
+        );
         let TunPhase::Error(message) = manager.status().phase else {
             panic!("expected an error phase");
         };
@@ -1129,11 +1136,17 @@ mod tests {
         // The heartbeat path notices the helper lost the plan and converges
         // by re-applying the stored config over a fresh connection.
         let ping = manager.heartbeat_ping().await;
-        assert!(ping.is_ok(), "the heartbeat must recover after a helper restart");
+        assert!(
+            ping.is_ok(),
+            "the heartbeat must recover after a helper restart"
+        );
         let mock = helper.state();
         {
             let mock = mock.lock().unwrap();
-            assert!(mock.active, "the plan must be re-applied after a helper restart");
+            assert!(
+                mock.active,
+                "the plan must be re-applied after a helper restart"
+            );
             assert_eq!(mock.applies, 1);
         }
         drop(mock);
@@ -1150,7 +1163,10 @@ mod tests {
         manager.probe().await;
         let status = manager.status();
         assert_eq!(status.helper_reachable, Some(true));
-        assert_eq!(status.helper.map(|h| h.helper_version), Some("mock".to_owned()));
+        assert_eq!(
+            status.helper.map(|h| h.helper_version),
+            Some("mock".to_owned())
+        );
 
         helper.shutdown().await;
         manager.probe().await;

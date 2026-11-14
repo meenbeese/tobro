@@ -17,9 +17,16 @@
 //! - DNS replaces the global `State:/Network/Global/DNS` dynamic-store key
 //!   after backing the previous value up as an XML property list; teardown
 //!   restores it. Resolver-service-level integration is future work (M8).
-//! - `KillSwitchMode::Block` is unsupported here: BSD cannot hold two
-//!   default routes for fail-closed insurance and enforcement belongs in a
-//!   packet filter (PF), which is deferred to M8 hardening.
+//! - `KillSwitchMode::Block` installs PF rules through `tobro-osapi`'s
+//!   `/dev/pf` FFI (the helper never shells out, §10.5): pass on loopback
+//!   and the tunnel interface, block-drop everything outbound. The rules
+//!   live in the root filter ruleset and fail closed — they keep enforcing
+//!   if the helper crashes — and teardown removes them again. A ruleset
+//!   holding foreign rules is never touched (the apply fails closed
+//!   instead). PF is enabled through the ref-counted `DIOCSTARTREF` token
+//!   interface; an apply that finds the rules already installed and PF
+//!   running (e.g. after a helper crash) adopts that state without taking
+//!   a second reference, so crash cycles do not leak enable references.
 //! - `SCDynamicStore` is not `Send`; every SystemConfiguration call runs
 //!   inside `tokio::task::spawn_blocking`. Logs carry counts only, never
 //!   addresses or destinations (§10.5).
@@ -58,6 +65,24 @@ fn first_ipv4(addresses: &[Prefix]) -> Option<&Prefix> {
         .find(|prefix| matches!(prefix.addr, IpAddr::V4(_)))
 }
 
+/// Active PF kill-switch enforcement: the open `/dev/pf` session and the
+/// reference token that releases the PF enable on teardown.
+struct EnabledKillSwitch {
+    pf: tobro_osapi::pf::PfSession,
+    /// The `DIOCSTARTREF` release token, `None` when this apply did not
+    /// enable PF: the rules were already loaded and PF was already running
+    /// from a previous (possibly crashed) helper instance, so no reference
+    /// was taken and none may be released.
+    token: Option<u64>,
+}
+
+impl std::fmt::Debug for EnabledKillSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Count-only; never the token value (§10.5).
+        f.debug_struct("EnabledKillSwitch").finish_non_exhaustive()
+    }
+}
+
 /// Device-scoped helper state: everything `teardown` must undo.
 struct DeviceState {
     /// The actual interface name the kernel assigned (`utunN`).
@@ -73,6 +98,8 @@ struct DeviceState {
     /// The global DNS key backup: `None` = not backed up yet; `Some(None)` =
     /// the key did not exist; `Some(Some(xml))` = the previous value.
     dns_backup: Option<Option<Vec<u8>>>,
+    /// PF enforcement installed by `KillSwitchMode::Block`.
+    kill_switch: Option<EnabledKillSwitch>,
 }
 
 impl DeviceState {
@@ -88,6 +115,7 @@ impl std::fmt::Debug for DeviceState {
         f.debug_struct("DeviceState")
             .field("tracked_routes", &self.installed_routes.len())
             .field("dns_backup_taken", &self.dns_backup.is_some())
+            .field("kill_switch_enforced", &self.kill_switch.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -206,6 +234,7 @@ impl Platform for MacosPlatform {
                 }),
                 installed_routes: Vec::new(),
                 dns_backup: None,
+                kill_switch: None,
             });
         }
 
@@ -333,20 +362,118 @@ impl Platform for MacosPlatform {
     }
 
     async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError> {
-        // Guard: the kill switch follows device creation.
-        let guard = self.state.lock().await;
-        if guard.is_none() {
-            return Err(PlatformError::KillSwitch(
+        // The kill switch follows device creation: there is always an
+        // enforced device here.
+        let mut guard = self.state.lock().await;
+        let state = guard.as_mut().ok_or_else(|| {
+            PlatformError::KillSwitch(
                 "no active TUN device; the kill switch follows device creation".to_owned(),
-            ));
-        }
-        drop(guard);
+            )
+        })?;
         match mode {
-            KillSwitchMode::Block => Err(PlatformError::Unsupported(
-                "fail-closed enforcement needs packet-filter rules (PF), deferred to M8; use the restore policy or skip the kill switch on macOS for now".to_owned(),
-            )),
-            KillSwitchMode::Restore | KillSwitchMode::Disabled => Ok(()),
+            KillSwitchMode::Block => {
+                if state.kill_switch.is_some() {
+                    tracing::info!("apply_kill_switch: PF enforcement already active");
+                    return Ok(()); // idempotent
+                }
+                let interface = state.name.clone();
+                let enforcement = tokio::task::spawn_blocking(
+                    move || -> Result<(EnabledKillSwitch, usize), PlatformError> {
+                        let pf = tobro_osapi::pf::PfSession::open().map_err(|error| {
+                            PlatformError::KillSwitch(format!("could not open /dev/pf: {error}"))
+                        })?;
+                        let loaded = pf.apply_kill_switch_rules(&interface).map_err(|error| {
+                            PlatformError::KillSwitch(format!(
+                                "could not install the PF kill-switch rules: {error}"
+                            ))
+                        })?;
+                        // Take an enable reference only when needed. If the
+                        // rules were already installed and PF is already
+                        // running, that running reference may belong to a
+                        // previous helper instance (crash-relaunch): its
+                        // token is unrecoverable, so re-enabling here would
+                        // leak one reference per crash cycle. PF stops only
+                        // when *all* references are gone, which is exactly
+                        // the fail-closed property the kill switch relies on.
+                        let token = if loaded > 0
+                            || !pf.is_running().map_err(|error| {
+                                PlatformError::KillSwitch(format!(
+                                    "could not query the packet filter state: {error}"
+                                ))
+                            })? {
+                            Some(pf.enable().map_err(|error| {
+                                PlatformError::KillSwitch(format!(
+                                    "could not enable the packet filter: {error}"
+                                ))
+                            })?)
+                        } else {
+                            None
+                        };
+                        Ok((EnabledKillSwitch { pf, token }, loaded))
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    PlatformError::KillSwitch(format!("kill switch task failed: {error}"))
+                })??;
+                let (enforcement, loaded) = enforcement;
+                tracing::info!(
+                    "apply_kill_switch: PF enforcement active ({loaded} rule(s) loaded)"
+                );
+                state.kill_switch = Some(enforcement);
+            }
+            KillSwitchMode::Restore | KillSwitchMode::Disabled => {
+                // Teardown order is fail-closed: routes are already gone, so
+                // the block keeps covering the leak direction until the
+                // rules themselves are removed.
+                if let Some(enforcement) = state.kill_switch.take() {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        // Remove the rules first, then release the enable
+                        // reference (releasing it could stop PF evaluating
+                        // the block while the rules are still installed).
+                        // The reference is released only if this instance
+                        // took one (`token` is None when enforcement was
+                        // adopted from a previous run without a reference).
+                        let result =
+                            enforcement
+                                .pf
+                                .remove_kill_switch_rules()
+                                .and_then(|removed| match enforcement.token {
+                                    Some(token) => enforcement.pf.disable(token).map(|_| removed),
+                                    None => Ok(removed),
+                                });
+                        (enforcement, result)
+                    })
+                    .await;
+                    match outcome {
+                        Ok((enforcement, Ok(removed))) => {
+                            drop(enforcement);
+                            tracing::info!(
+                                "apply_kill_switch: enforcement removed ({removed} rule(s))"
+                            );
+                        }
+                        Ok((enforcement, Err(error))) => {
+                            // Keep the enforcement tracked (fail-closed): the
+                            // rules stay installed and PF stays enabled.
+                            state.kill_switch = Some(enforcement);
+                            return Err(PlatformError::KillSwitch(format!(
+                                "could not remove the PF kill-switch enforcement: {error}"
+                            )));
+                        }
+                        Err(error) => {
+                            // The closure owns the session; if the task died
+                            // without running, the kernel state persists
+                            // untracked and a later apply re-establishes
+                            // tracking (the rules are recognized by label).
+                            return Err(PlatformError::KillSwitch(format!(
+                                "kill switch task failed: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     async fn teardown(&self) -> Result<(), PlatformError> {
@@ -356,6 +483,40 @@ impl Platform for MacosPlatform {
         };
         let tracked = state.tracked_route_count();
         let removed = self.remove_tracked_routes(&mut state).await;
+        // Remove the PF enforcement (rules first, then the enable reference:
+        // releasing the reference could stop PF evaluating the block while
+        // the rules are still installed) while everything else is already
+        // back to stock.
+        let enforcement = state.kill_switch.take();
+        let enforcement_removed = tokio::task::spawn_blocking(move || {
+            let Some(enforcement) = enforcement else {
+                return Ok(0usize);
+            };
+            enforcement
+                .pf
+                .remove_kill_switch_rules()
+                .and_then(|removed| {
+                    // Release the enable reference only if this instance took
+                    // one (`token` is None when enforcement was adopted from
+                    // a previous run without a reference).
+                    match enforcement.token {
+                        Some(token) => enforcement.pf.disable(token).map(|_| removed),
+                        None => Ok(removed),
+                    }
+                })
+        })
+        .await
+        .map_err(|error| PlatformError::KillSwitch(format!("kill switch task failed: {error}")))?;
+        match enforcement_removed {
+            Ok(rules_removed) => {
+                tracing::info!(
+                    "teardown: kill-switch enforcement removed ({rules_removed} rule(s))"
+                );
+            }
+            Err(error) => {
+                tracing::warn!("teardown: could not remove the PF enforcement: {error}");
+            }
+        }
         // Restore DNS best-effort, then drop the device: closing the utun
         // makes the kernel remove the interface and its device routes.
         let backup = state.dns_backup.take();
@@ -432,12 +593,22 @@ mod macos_integration {
         };
         platform.apply_dns(&dns).await.expect("dns");
 
-        // Block is unsupported until the PF enforcement lands (M8).
-        let block = platform.apply_kill_switch(KillSwitchMode::Block).await;
-        assert!(
-            matches!(block, Err(PlatformError::Unsupported(_))),
-            "{block:?}"
-        );
+        // Block installs PF enforcement (fail-closed on the real host) and
+        // is idempotent; Restore removes it again; teardown stays a no-op
+        // after that. Note: while the block is active this machine loses
+        // all egress except loopback and the tunnel interface.
+        platform
+            .apply_kill_switch(KillSwitchMode::Block)
+            .await
+            .expect("block");
+        platform
+            .apply_kill_switch(KillSwitchMode::Block)
+            .await
+            .expect("block again (idempotent)");
+        platform
+            .apply_kill_switch(KillSwitchMode::Restore)
+            .await
+            .expect("restore");
 
         platform.teardown().await.expect("teardown");
         // A second teardown is an idempotent no-op.
