@@ -12,6 +12,7 @@ tobro-config = { path = "../tobro-config" }
 tobro-ipc = { path = "../tobro-ipc" }
 tobro-store = { path = "../tobro-store" }
 tobro-tor = { path = "../tobro-tor" }
+tobro-tun = { path = "../tobro-tun" }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

@@ -7903,6 +7903,7 @@ dependencies = [
  "tobro-ipc",
  "tobro-store",
  "tobro-tor",
+ "tobro-tun",
  "tokio",
  "tracing",
  "tracing-subscriber",

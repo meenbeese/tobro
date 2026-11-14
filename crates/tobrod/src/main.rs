@@ -20,6 +20,7 @@ pub(crate) mod redact;
 pub(crate) mod regional_policy;
 mod spike;
 mod supervisor;
+mod tun_manager;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,10 @@ struct RunArgs {
     /// Append logs to this file in addition to stderr (used by `tobroctl start`).
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
+    /// TUN helper IPC endpoint override (defaults to the platform endpoint
+    /// `/var/run/tobro-helper.sock` or the `tobro-helper` named pipe).
+    #[arg(long, value_name = "PATH")]
+    helper_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -151,6 +156,17 @@ async fn run_daemon(
         .with_context(|| format!("failed to open store at {}", db_path.display()))?;
 
     let (handle, supervisor_task) = supervisor::spawn();
+
+    // TUN wiring (M7): talk to the privileged helper when TUN mode is used.
+    // Until the routing engine lands, `tun.enabled` is rejected by config
+    // validation and this stays idle, but the helper availability probe and
+    // `tun.status` already work.
+    let tun = match args.helper_socket.clone() {
+        Some(endpoint) => tun_manager::TunManager::new(endpoint),
+        None => tun_manager::TunManager::with_default_endpoint(),
+    };
+    tun.probe().await;
+    tun_manager::spawn_supervisor_link(tun.clone(), handle.subscribe_events());
 
     let socket_path = args
         .socket
@@ -286,7 +302,8 @@ async fn run_daemon(
         Some(std::sync::Arc::clone(&kindness_stats)),
     )
     .with_log_buffer(log_ring)
-    .with_shutdown(Arc::clone(&shutdown_requested));
+    .with_shutdown(Arc::clone(&shutdown_requested))
+    .with_tun(tun.clone());
     let ipc_state = state_dir.clone();
     let ipc_cache = cache_dir.clone();
     let ipc_task = tokio::spawn(async move {
@@ -319,6 +336,9 @@ async fn run_daemon(
     tracing::info!("shutting down");
     let _ = handle.disconnect().await;
     let _ = handle.shutdown().await;
+    // Best-effort: restore networking (device, routes, DNS, kill switch)
+    // even on a hard daemon shutdown.
+    tun.teardown("daemon shutdown").await;
     if let Some((kindness, _kindness_events)) = kindness {
         tracing::info!("stopping kindness proxy");
         kindness.shutdown().await;

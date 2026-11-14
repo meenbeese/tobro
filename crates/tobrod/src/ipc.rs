@@ -248,6 +248,8 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     fn kindness_reset_stats(
         &self,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// TUN mode and privileged-helper status (`tun.status`).
+    fn tun_status(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// List hosted onion services.
     fn onion_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Create a hosted onion service.
@@ -388,9 +390,11 @@ fn config_effects(
     let network_changed = current.network != next.network;
     let bridges_changed = current.bridges != next.bridges;
     let outbound_proxy_changed = current.outbound_proxy != next.outbound_proxy;
-    // TUN config changes are reported but do not force a proxy restart: the
-    // TUN routing engine is not implemented yet (M7), so they have no runtime
-    // effect in this build.
+    // TUN config changes are converged through the privileged helper (M7
+    // wiring), not by a proxy restart. In this build `tun.enabled` is still
+    // rejected by config validation until the TUN routing engine lands, so
+    // the convergence stays a no-op in production; the flag feeds the
+    // config.apply effects for the UI.
     let tun_changed = current.tun != next.tun;
     let restart_required = listeners_changed
         || stream_changed
@@ -1039,6 +1043,8 @@ pub struct SupervisorControl {
     log_buffer: Option<crate::logs::LogBufferShared>,
     /// Clean-shutdown trigger for `daemon.shutdown` (wired to the main loop).
     shutdown: Option<Arc<tokio::sync::Notify>>,
+    /// TUN manager (privileged helper wiring); `None` in test controls.
+    tun: Option<crate::tun_manager::TunManager>,
 }
 
 impl std::fmt::Debug for SupervisorControl {
@@ -1075,7 +1081,15 @@ impl SupervisorControl {
             kindness_stats,
             log_buffer: None,
             shutdown: None,
+            tun: None,
         }
+    }
+
+    /// Attach the TUN manager (privileged helper wiring).
+    #[must_use]
+    pub fn with_tun(mut self, tun: crate::tun_manager::TunManager) -> Self {
+        self.tun = Some(tun);
+        self
     }
 
     /// Attach the log ring buffer used by `daemon.logs`.
@@ -1096,6 +1110,26 @@ impl SupervisorControl {
         let mut guard = self.outbound_sidecar.lock().await;
         if let Some(sidecar) = guard.take() {
             sidecar.stop().await;
+        }
+    }
+
+    /// Converge the TUN wiring after a saved config change (config.apply /
+    /// reload): apply when enabled, tear down when not. A convergence
+    /// failure is logged and visible via `tun.status`; it does not fail the
+    /// config save, which already succeeded.
+    async fn converge_tun_after_config_change(&self) {
+        let Some(tun) = &self.tun else {
+            return;
+        };
+        let config = match tobro_config::Config::load_or_default(&self.config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(%error, "could not load config for TUN convergence");
+                return;
+            }
+        };
+        if let Err(error) = tun.apply(&config.tun).await {
+            tracing::warn!(%error, "TUN convergence after a config change failed");
         }
     }
 
@@ -1197,6 +1231,18 @@ impl DaemonControl for SupervisorControl {
             )?;
         }
 
+        // TUN mode: apply the routing plan before Tor starts so traffic
+        // (and the tunnel) are ready together. Failure blocks the connect:
+        // enabling TUN and silently continuing in ports mode would ignore
+        // the user's explicit opt-in.
+        if config.tun.is_active()
+            && let Some(tun) = &self.tun
+        {
+            tun.apply(&config.tun)
+                .await
+                .map_err(|e| format!("TUN mode failed: {e}"))?;
+        }
+
         match self
             .handle
             .connect(state_dir, cache_dir, listeners)
@@ -1212,6 +1258,11 @@ impl DaemonControl for SupervisorControl {
     }
 
     async fn disconnect(&self) -> Result<(), String> {
+        // Tear the tunnel down first so networking returns while Tor is
+        // still winding down; with `tun.enabled = false` this is a no-op.
+        if let Some(tun) = &self.tun {
+            tun.teardown("disconnect").await;
+        }
         let res = self.handle.disconnect().await.map_err(|e| e.to_string());
         self.stop_outbound_sidecar().await;
         res
@@ -1243,11 +1294,13 @@ impl DaemonControl for SupervisorControl {
         let secrets = Arc::clone(&self.secrets);
         let snapshot = self.handle.snapshot();
         let running = is_runtime_active(&snapshot.state);
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             config_apply_patch(&path, &patch, running, &listeners, Some(secrets.as_ref()))
         })
         .await
-        .map_err(|e| format!("config task failed: {e}"))?
+        .map_err(|e| format!("config task failed: {e}"))??;
+        self.converge_tun_after_config_change().await;
+        Ok(result)
     }
 
     async fn reload_config(&self) -> Result<serde_json::Value, String> {
@@ -1259,7 +1312,7 @@ impl DaemonControl for SupervisorControl {
             snapshot.state,
             crate::lifecycle::State::Stopped | crate::lifecycle::State::Failed { .. }
         );
-        tokio::task::spawn_blocking(move || {
+        let reloaded = tokio::task::spawn_blocking(move || {
             let config = tobro_config::Config::load_or_default(&path)
                 .map_err(|e| format!("failed to load {}: {e}", path.display()))?;
             config
@@ -1335,7 +1388,9 @@ impl DaemonControl for SupervisorControl {
             Ok(result)
         })
         .await
-        .map_err(|e| format!("reload task failed: {e}"))?
+        .map_err(|e| format!("reload task failed: {e}"))?;
+        self.converge_tun_after_config_change().await;
+        reloaded
     }
 
     async fn bridges_test(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1445,6 +1500,17 @@ impl DaemonControl for SupervisorControl {
             "reset": true,
             "note": "served connection counters were cleared; the count starts over now",
         }))
+    }
+
+    async fn tun_status(&self) -> Result<serde_json::Value, String> {
+        Ok(match &self.tun {
+            Some(tun) => tun.status().to_json(),
+            None => json!({
+                "state": "unavailable",
+                "engine_available": false,
+                "note": "TUN wiring is not attached to this control context",
+            }),
+        })
     }
 
     async fn kindness_check(&self) -> Result<serde_json::Value, String> {
@@ -1670,6 +1736,14 @@ impl DaemonControl for SupervisorHandle {
 
     async fn kindness_reset_stats(&self) -> Result<serde_json::Value, String> {
         Err("kindness stats require daemon store context".to_owned())
+    }
+
+    async fn tun_status(&self) -> Result<serde_json::Value, String> {
+        Ok(json!({
+            "state": "unavailable",
+            "engine_available": false,
+            "note": "TUN status requires the full daemon supervisor context",
+        }))
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -2200,6 +2274,10 @@ pub async fn dispatch_daemon<C: DaemonControl>(
                 )),
             ),
         },
+        methods::TUN_STATUS => match control.tun_status().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(id, RpcError::internal(format!("tun.status failed: {e}"))),
+        },
         methods::ONION_LIST => match control.onion_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
@@ -2506,6 +2584,10 @@ mod daemon_tests {
             Ok(json!({ "ok": true, "action": "kindness.reset_stats", "reset": true }))
         }
 
+        async fn tun_status(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "state": "disabled", "engine_available": false }))
+        }
+
         async fn onion_list(&self) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "action": "onion.list", "services": [] }))
         }
@@ -2647,6 +2729,27 @@ mod daemon_tests {
         .await;
         let err = resp.error.expect("should error");
         assert_eq!(err.code, tobro_ipc::codes::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn tun_status_dispatches_after_handshake() {
+        let control = MockControl::new();
+        let (state_dir, cache_dir, listeners, started) = default_ctx();
+        let mut handshaken = true;
+        let resp = dispatch_daemon(
+            &control,
+            &state_dir,
+            &cache_dir,
+            &listeners,
+            started,
+            &mut handshaken,
+            req(1, methods::TUN_STATUS, None),
+        )
+        .await;
+        let value = resp.result.expect("tun.status should succeed");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["state"], "disabled");
+        assert_eq!(value["engine_available"], false);
     }
 
     #[tokio::test]

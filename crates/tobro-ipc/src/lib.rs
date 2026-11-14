@@ -99,6 +99,9 @@ pub mod methods {
     /// volatile current-connections count. No params, no secrets.
     pub const KINDNESS_RESET_STATS: &str = "kindness.reset_stats";
 
+    /// TUN mode and privileged-helper status (no params, no secrets).
+    pub const TUN_STATUS: &str = "tun.status";
+
     /// List hosted onion services.
     pub const ONION_LIST: &str = "onion.list";
     /// Create a hosted onion service.
@@ -157,6 +160,7 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::KINDNESS_STATUS
             | methods::KINDNESS_CHECK
             | methods::KINDNESS_RESET_STATS
+            | methods::TUN_STATUS
             | methods::ONION_LIST
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
@@ -187,6 +191,7 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::KINDNESS_STATUS
         | methods::KINDNESS_CHECK
         | methods::KINDNESS_RESET_STATS
+        | methods::TUN_STATUS
         | methods::ONION_LIST
         | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
         methods::LOGS => {

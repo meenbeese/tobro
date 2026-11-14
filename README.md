@@ -143,6 +143,40 @@ for the full headless guide (systemd/launchd examples included).
   `tobro-store`, `tobrod`, `tobroctl`.
 - **Non-goals:** mobile, relay/exit, `torrc` compatibility, bundled browser.
 
+## Platform support
+
+Tobro targets macOS, Windows, and Linux. Most features are cross-platform; the
+table below calls out where the underlying OS mechanism differs or where a
+feature is not (yet) available on a given OS.
+
+| Feature | macOS | Windows | Linux |
+|---|---|---|---|
+| Core Tor connectivity (Arti 2.8, connect/new identity) | ✅ | ✅ | ✅ |
+| SOCKS5 / HTTP CONNECT / DNS proxy listeners | ✅ | ✅ | ✅ |
+| Bridges & pluggable transports (obfs4, meek, webtunnel, snowflake, dnstt) | ✅ | ✅ | ✅ |
+| Moat + built-in bridge distribution | ✅ | ✅ | ✅ |
+| Onion services, client authorization, encrypted backups | ✅ | ✅ | ✅ |
+| Kindness Mode (snowflake proxy, eligibility check, stats) | ✅ | ✅ | ✅ |
+| Kindness pause: on battery power | ✅ (`pmset`) | ❌ (unknown, never pauses) | ✅ (`/sys/class/power_supply`) |
+| Kindness pause: metered connection | ❌ (unknown, never pauses) | ❌ (unknown, never pauses) | ✅ (NetworkManager) |
+| Local IPC to `tobrod` | Unix domain socket | Named pipe | Unix domain socket |
+| Secrets in the OS keychain (`keyring`) | Keychain | Credential Manager | Secret Service¹ |
+| Autostart + start-to-tray | LaunchAgent (`~/Library/LaunchAgents`) | Run key (`HKCU\…\Run`) | systemd user unit |
+| Tray-first GUI, floating logs window, settings | ✅ | ✅ | ✅ |
+| App lock (password, lock-on-idle/close) | ✅ | ✅ | ✅ |
+| App lock via OS auth (Touch ID / Windows Hello) | ❌ (planned; password fallback) | ❌ (planned; password fallback) | ❌ (planned; password fallback) |
+| Window capture protection | Best-effort | Best-effort | Best-effort (varies by DE/WM) |
+| Headless daemon + `tobroctl` | ✅ (launchd example) | ✅ | ✅ (systemd example) |
+| TUN mode + privileged helper (`tobro-helper`) | 🚧 M7 in progress (utun + PF_ROUTE + SC DNS) | 🚧 M7 in progress (wintun + iphlpapi) | 🚧 M7 in progress (netlink + TUN) |
+| System proxy integration / proxy env vars | ❌ (planned post-1.0) | ❌ (planned post-1.0) | ❌ (planned post-1.0) |
+
+¹ Requires a running Secret Service provider (GNOME Keyring, KWallet). When no
+keychain is available, secrets are not persisted.
+
+Pause rules for Kindness Mode are enforced only when the platform positively
+reports the condition, so `❌` above never stops bandwidth donation — the state
+is simply reported as "unknown" in the UI.
+
 ## Core state machine
 
 ```text

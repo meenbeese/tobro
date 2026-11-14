@@ -25,7 +25,7 @@
 9. [Testing strategy](#9-testing-strategy)
 10. [Security and privacy](#10-security-and-privacy)
 11. [Packaging, signing, and updates](#11-packaging-signing-and-updates)
-12. [Localization and accessibility](#12-localization-and-accessibility)
+12. [Accessibility](#12-accessibility)
 13. [Performance and resource budgets](#13-performance-and-resource-budgets)
 14. [Risks and mitigations](#14-risks-and-mitigations)
 15. [Open questions](#15-open-questions)
@@ -85,7 +85,7 @@ tobro is for:
 - v3 onion-service hosting, local port forwarding, client authorization, key import/export.
 - Kindness Mode (Snowflake proxy) with limits and statistics.
 - Tray agent, autostart, notifications, global shortcut, app lock, log viewer.
-- Localization, accessibility, signed installers, signed auto-updates.
+- Accessibility, signed installers, signed auto-updates.
 - Headless daemon and CLI.
 
 ### 2.4 Non-goals (1.0)
@@ -215,10 +215,9 @@ These are **not** parity requirements; they are replaced or dropped:
 | Toolchain | Stable Rust, 2024 edition | Pinned 1.100 | Arti 2.8 requires MSRV 1.92; the workspace pins 1.100 in `rust-toolchain.toml` |
 | Async runtime | Tokio | 1.54+ | Arti's default runtime; ecosystem standard |
 | Desktop shell | **Tauri 2** | 2.x | Small binaries, native WebView, Rust core, tray/updater/autostart plugins, no Chromium bundle |
-| UI | **React 19 + TypeScript + Vite** | React 19, Vite 7 | Mature ecosystem, fast iteration, strong typing, easy localization/accessibility |
+| UI | **React 19 + TypeScript + Vite** | React 19, Vite 7 | Mature ecosystem, fast iteration, strong typing, accessible |
 | Styling | **Tailwind CSS v4** + Radix primitives / shadcn-style components | — | Accessible primitives, consistent design system, no runtime CSS-in-JS |
 | UI state | **Zustand** + **TanStack Query** | — | Small, predictable local store; query/cache semantics for daemon state |
-| i18n | **i18next + react-i18next** | — | Mature, Weblate-friendly JSON, plurals, RTL |
 | Config format | **TOML** + `serde` | — | Human-readable, matches Arti conventions, easy import/export |
 | Persistence | **SQLite** via `sqlx` | — | Onion services, client-auth metadata, bridge history, stats; migrations |
 | Secrets | **OS keychain** via `keyring` | — | Keychain / Credential Manager / Secret Service; no plaintext passwords |
@@ -593,7 +592,6 @@ ui/
 │   ├── components/                # design system (Radix/shadcn-style)
 │   ├── hooks/                     # daemon queries/events
 │   ├── lib/                       # ipc client, formatters, validators
-│   ├── locales/                   # i18next JSON
 │   └── styles/
 └── tests/                         # unit + component + e2e
 ```
@@ -896,7 +894,7 @@ Status legend:
 | F-86 | Persistent notification | N/A | Tray status replaces it | — |
 | F-87 | First-run onboarding | Adapted | Permissions, proxy explanation, bridge choice | M4 |
 | F-88 | Help/About/version | Full | In-app + docs link | M4 |
-| F-89 | Localization | Full | i18next + Weblate | M7 |
+| F-89 | Localization | Deferred | i18next + Weblate | Post-1.0 |
 | F-90 | Themes/accessibility | Full | Light/dark/system, keyboard, screen reader | M4/M7 |
 | F-91 | Settings import/export | Full | TOML, secrets excluded | M2 |
 | F-92 | Update mechanism | Full | Signed Tauri updater | M8 |
@@ -1102,7 +1100,7 @@ Deliverables:
 - Signed updater manifest, staged rollout, rollback, minimum-version policy.
 - SBOM, license audit, `cargo deny`/`cargo vet`, dependency review.
 - External security review; fix critical/high findings.
-- Performance tuning to budgets; accessibility audit; localization freeze.
+- Performance tuning to budgets; accessibility audit.
 - User docs, FAQ, troubleshooting, privacy policy, security disclosure policy.
 - Release checklist and rollback drill.
 
@@ -1159,7 +1157,7 @@ With 2–3 engineers and normal review/QA overhead, expect **10–12 calendar mo
 | **Onion Host** | M5 | Reachable v3 service + client auth + backup/restore |
 | **Kindness** | M6 | Snowflake proxy serves traffic with limits and stats |
 | **Invisible** | M7 | TUN mode with zero DNS/IPv6 leaks and fail-closed kill switch |
-| **1.0** | M8 | Signed, notarized, reproducible, audited, localized |
+| **1.0** | M8 | Signed, notarized, reproducible, audited |
 
 ### 8.2 Release gates (all must pass)
 
@@ -1169,10 +1167,9 @@ With 2–3 engineers and normal review/QA overhead, expect **10–12 calendar mo
 4. **Quality:** crash-free sessions ≥ 99.5% in beta; no P1 bugs open.
 5. **Performance:** budgets in §13 met on baseline hardware.
 6. **Accessibility:** WCAG 2.2 AA audit passed for primary flows.
-7. **Localization:** top 10 locales ≥ 95% translated; no truncation in screenshots.
-8. **Packaging:** clean install/upgrade/uninstall on all supported OSes; signatures verified.
-9. **Docs:** user guide, troubleshooting, privacy policy, security policy published.
-10. **Rollback:** a signed previous release can be restored without data loss.
+7. **Packaging:** clean install/upgrade/uninstall on all supported OSes; signatures verified.
+8. **Docs:** user guide, troubleshooting, privacy policy, security policy published.
+9. **Rollback:** a signed previous release can be restored without data loss.
 
 ### 8.3 KPIs
 
@@ -1188,7 +1185,6 @@ With 2–3 engineers and normal review/QA overhead, expect **10–12 calendar mo
 | Installer size (per platform) | ≤ 60 MB | Release artifact |
 | Log secret-leak tests | 0 failures | Automated redaction suite |
 | Accessibility | WCAG 2.2 AA | Audit + automated checks |
-| Translation coverage (top 10 locales) | ≥ 95% | Weblate |
 | Critical CVE patch time | ≤ 7 days | Release records |
 
 ### 8.4 Definition of Done (per feature)
@@ -1246,7 +1242,6 @@ With 2–3 engineers and normal review/QA overhead, expect **10–12 calendar mo
 - Sleep/wake, network switch (Wi-Fi ↔ Ethernet), VPN coexistence, captive portals.
 - Long-haul: 72-hour soak with periodic new identity and onion service churn.
 - Accessibility: keyboard-only, screen reader (VoiceOver/NVDA/Orca), 200% zoom, high contrast.
-- Localization: pseudo-locale, RTL (Arabic/Hebrew), long strings (German), CJK.
 
 ---
 
@@ -1372,21 +1367,9 @@ With 2–3 engineers and normal review/QA overhead, expect **10–12 calendar mo
 
 ---
 
-## 12. Localization and accessibility
+## 12. Accessibility
 
-### 12.1 Localization
-
-- i18next JSON resources; one namespace per feature area; no concatenated sentences.
-- ICU-style pluralization and interpolation; avoid gendered/ambiguous strings.
-- Locale detection: system → user override; persist choice.
-- Weblate integration; translation memory; screenshot context for translators.
-- RTL support (Arabic, Hebrew, Persian); logical CSS properties; icon mirroring where meaningful.
-- Pseudo-localization in CI to catch truncation and hard-coded strings.
-- Date/time/number formatting via `Intl`; avoid hard-coded formats.
-- Do not translate technical identifiers (`obfs4`, `.onion`, bridge lines); provide translator notes.
-- Target top 10 locales at 1.0; community locales welcome.
-
-### 12.2 Accessibility
+### 12.1 Accessibility
 
 - WCAG 2.2 AA target: contrast, focus visible, keyboard operability, labels, error identification.
 - Semantic HTML, ARIA only where needed; Radix primitives for dialogs/menus/tabs.
@@ -1441,7 +1424,7 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 | R14 | Kindness Mode abuse/legal concerns | Low | Medium | Product + Security | Opt-in, limits, regional policy, Tor Project guidance, no exit traffic |
 | R15 | Update chain compromise | Low | Critical | Security + Release/Infra | Signed manifests, reproducible builds, staged rollout, key rotation plan |
 | R16 | Scope creep (relay, mobile, browser) | High | Medium | Product (owner) | Explicit non-goals; change control; milestone gates |
-| R17 | Localization/accessibility regressions | Medium | Low | Desktop + QA | CI checks, pseudo-locale, audits, translator context |
+| R17 | Accessibility regressions | Medium | Low | Desktop + QA | CI checks, audits |
 | R18 | Performance regression vs C Tor | Medium | Medium | Rust/Tor lead + QA | Benchmark in CI; profile; tune Arti config; accept and document gaps |
 | R19 | User confusion about "connected" vs "protected" | High | Medium | Product + Desktop | Distinct states, onboarding, system-routing indicator, honest copy |
 | R20 | Single maintainer/bus factor | Medium | High | Product (owner) | Documentation, ADRs, CI, release automation, upstream relationships |
@@ -1492,6 +1475,7 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 | 2026-11-07 | No telemetry | Privacy-first product principle | Accepted |
 | 2026-11-07 | WCAG 2.2 AA + top-10 locales at 1.0 | Accessibility and reach are release criteria | Accepted |
 | 2026-11-07 | GPL-3.0-only license | Chosen by project owner; copyleft, matches Orbot's licensing | Accepted |
+| 2026-11-13 | Localization deferred to post-1.0 | Descoped from M7/1.0 to focus on TUN mode and release hardening | Accepted |
 
 ---
 
@@ -1526,7 +1510,7 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 | `pref_proxy_ss` | `proxy.outbound.shadowsocks` | `sslocal` sidecar |
 | `pref_custom_torrc` | — | No raw torrc; typed advanced config |
 | `pref_enable_logging` | `advanced.log_level` | debug/trace |
-| `pref_default_locale` | `general.language` | i18next |
+| `pref_default_locale` | — | Deferred (localization is post-1.0) |
 | `pref_require_password` / `pref_auth_no_biometrics` | `ui.app_lock` | OS auth + password |
 | `pref_flag_secure` | `ui.capture_protection` | Best effort |
 | `pref_be_a_snowflake` | `kindness.enabled` | Snowflake proxy |
