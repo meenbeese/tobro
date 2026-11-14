@@ -47,7 +47,8 @@ pub use protocol::{
     DEFAULT_INTERFACE_NAME, DEFAULT_TUN_MTU, DnsConfig, HelperMessage, HelperRequest,
     HelperResponse, HelperStatus, KillSwitchMode, MAX_DEVICE_ADDRESSES, MAX_DNS_SERVERS,
     MAX_INTERFACE_NAME_LEN, MAX_ROUTES, MAX_TUN_MTU, MIN_TUN_MTU, PROTOCOL_VERSION, Prefix,
-    RouteSpec, TunDevice, TunnelPlan, is_usable_dns_server, reject_codes, validate_interface_name,
+    RouteSpec, TUNNEL_PREFIX_V4, TUNNEL_PREFIX_V6, TunDevice, TunnelPlan, is_usable_dns_server,
+    reject_codes, validate_interface_name,
 };
 pub use transport::{HelperStream, bind_listener, default_endpoint, open_stream};
 

@@ -8,6 +8,10 @@
 //! - Route convergence is idempotent: desired routes are added with
 //!   `NLM_F_REPLACE` and previously installed routes that the new plan no
 //!   longer wants are removed. The helper tracks only what it installed.
+//!   Global next-hop gateways are left for the kernel to resolve to the
+//!   physical interface; link-local gateways (which the kernel refuses to
+//!   resolve without one) get the output interface spelled out, looked up
+//!   through a route request first.
 //! - DNS replaces `/etc/resolv.conf` atomically (temp file + rename) after
 //!   backing the original up once per tunnel lifetime; teardown restores
 //!   it. A symlinked `resolv.conf` (systemd-resolved) is rejected instead
@@ -28,7 +32,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use rtnetlink::packet_route::address::AddressAttribute;
-use rtnetlink::packet_route::route::{RouteMessage, RouteProtocol, RouteScope, RouteType};
+use rtnetlink::packet_route::route::{
+    RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
+};
 use rtnetlink::{AddressMessageBuilder, Handle, LinkUnspec, RouteMessageBuilder};
 use tobro_tun::{DEFAULT_INTERFACE_NAME, DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
 
@@ -64,11 +70,19 @@ fn blackhole_metric(tun_default_metric: Option<u32>) -> u32 {
 
 /// Build the netlink route message for one [`RouteSpec`].
 ///
-/// Routes without a gateway point into the TUN device (`output_interface`);
-/// bypass routes point at a next-hop gateway, which the kernel resolves to
-/// the physical interface on its own.
-fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
+/// Routes without a gateway point into the TUN device (`output_interface`).
+/// Bypass routes point at a next-hop gateway; for most gateways the kernel
+/// resolves the physical output interface on its own, but a link-local
+/// gateway is interface-scoped and needs the output interface explicitly
+/// (`gateway_oif`, resolved by [`resolve_gateway_oif`]).
+fn route_message(spec: &RouteSpec, device_index: u32, gateway_oif: Option<u32>) -> RouteMessage {
     let destination = spec.destination;
+    let oif = match (spec.gateway, gateway_oif) {
+        // Device routes point into the TUN device.
+        (None, _) => Some(device_index),
+        // Link-local gateways need their scope spelled out.
+        (Some(_), oif) => oif,
+    };
     match destination.addr {
         IpAddr::V4(addr) => {
             let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
@@ -76,8 +90,8 @@ fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
                 .table_id(MAIN_TABLE_ID)
                 .scope(ROUTE_SCOPE)
                 .protocol(ROUTE_PROTOCOL);
-            if spec.gateway.is_none() {
-                builder = builder.output_interface(device_index);
+            if let Some(oif) = oif {
+                builder = builder.output_interface(oif);
             }
             if let Some(gateway) = spec.gateway {
                 builder = builder.gateway(v4(gateway));
@@ -93,8 +107,8 @@ fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
                 .table_id(MAIN_TABLE_ID)
                 .scope(ROUTE_SCOPE)
                 .protocol(ROUTE_PROTOCOL);
-            if spec.gateway.is_none() {
-                builder = builder.output_interface(device_index);
+            if let Some(oif) = oif {
+                builder = builder.output_interface(oif);
             }
             if let Some(gateway) = spec.gateway {
                 builder = builder.gateway(v6(gateway));
@@ -225,6 +239,40 @@ impl LinuxPlatform {
         Ok(link.header.index)
     }
 
+    /// The output interface the kernel would use to reach a link-local
+    /// gateway (an unprivileged route lookup). `None` when the gateway is
+    /// not link-local (the kernel resolves the interface itself) or no
+    /// route to it exists.
+    async fn resolve_gateway_oif(&self, spec: &RouteSpec) -> Result<Option<u32>, PlatformError> {
+        let Some(IpAddr::V6(gateway)) = spec.gateway.filter(
+            |gateway| matches!(gateway, IpAddr::V6(address) if address.is_unicast_link_local()),
+        ) else {
+            return Ok(None);
+        };
+        let lookup = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(gateway, 128)
+            .build();
+        let mut stream = self.handle.route().get(lookup).execute();
+        let message = stream
+            .try_next()
+            .await
+            .map_err(|error| PlatformError::Route(format!("netlink error: {error}")))?
+            .ok_or_else(|| {
+                PlatformError::Route(
+                    "cannot install a bypass route: its link-local gateway has no route \
+                     in the routing table (no egress interface for it)"
+                        .to_owned(),
+                )
+            })?;
+        Ok(message
+            .attributes
+            .into_iter()
+            .find_map(|attribute| match attribute {
+                RouteAttribute::Oif(index) => Some(index),
+                _ => None,
+            }))
+    }
+
     /// Assign one address if it is not already on the device (idempotent).
     async fn add_address_if_missing(
         &self,
@@ -341,7 +389,10 @@ impl LinuxPlatform {
             }
         }
         for spec in &state.installed_routes {
-            let message = route_message(spec, state.index);
+            // Best-effort: without a resolvable oif, delete by prefix alone
+            // (the kernel still identifies the route by it).
+            let oif = self.resolve_gateway_oif(spec).await.unwrap_or(None);
+            let message = route_message(spec, state.index, oif);
             if let Err(error) = self.handle.route().del(message).execute().await {
                 tracing::warn!("could not remove a tracked route: {error}");
             } else {
@@ -513,7 +564,8 @@ impl Platform for LinuxPlatform {
         // Add first (replace semantics), remove stale last: the system is
         // never left without the routes the plan wants.
         for spec in bypass_routes {
-            let message = route_message(spec, state.index);
+            let oif = self.resolve_gateway_oif(spec).await?;
+            let message = route_message(spec, state.index, oif);
             self.handle
                 .route()
                 .add(message)
@@ -525,7 +577,8 @@ impl Platform for LinuxPlatform {
                 })?;
         }
         for spec in routes {
-            let message = route_message(spec, state.index);
+            let oif = self.resolve_gateway_oif(spec).await?;
+            let message = route_message(spec, state.index, oif);
             self.handle
                 .route()
                 .add(message)
@@ -541,7 +594,12 @@ impl Platform for LinuxPlatform {
             if desired.contains(spec) {
                 continue;
             }
-            let message = route_message(spec, state.index);
+            // Re-resolve a link-local gateway's oif (the tunnel is up, but
+            // link-local reachability is untouched by it); when the
+            // resolution fails, delete without it — the prefix alone still
+            // identifies the route.
+            let oif = self.resolve_gateway_oif(spec).await.unwrap_or(None);
+            let message = route_message(spec, state.index, oif);
             self.handle
                 .route()
                 .del(message)
@@ -582,7 +640,12 @@ impl Platform for LinuxPlatform {
         Ok(())
     }
 
-    async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError> {
+    async fn apply_kill_switch(
+        &self,
+        mode: KillSwitchMode,
+        bypass_routes: &[RouteSpec],
+    ) -> Result<(), PlatformError> {
+        let _ = bypass_routes;
         let mut guard = self.state.lock().await;
         let state = guard.as_mut().ok_or_else(|| {
             PlatformError::KillSwitch(
@@ -681,6 +744,13 @@ mod tests {
         }
     }
 
+    fn v6_prefix(text: &str, prefix_len: u8) -> Prefix {
+        Prefix {
+            addr: IpAddr::V6(text.parse().expect("valid IPv6")),
+            prefix_len,
+        }
+    }
+
     #[test]
     fn resolv_conf_renders_one_nameserver_line_per_server() {
         let content = render_resolv_conf(&[
@@ -704,7 +774,7 @@ mod tests {
     #[test]
     fn device_routes_are_unicast_routes_into_the_device() {
         let route = spec(v4_prefix("10.111.222.0", 24), None, Some(50));
-        let message = route_message(&route, 7);
+        let message = route_message(&route, 7, None);
         assert_eq!(message.header.destination_prefix_length, 24);
         assert_eq!(
             message.header.table,
@@ -712,6 +782,13 @@ mod tests {
         );
         assert_eq!(message.header.scope, ROUTE_SCOPE);
         assert_eq!(message.header.protocol, ROUTE_PROTOCOL);
+        // A device route pins the output interface regardless of an oif for
+        // a gateway (it has none).
+        let attributes = message.attributes.clone();
+        assert!(matches!(
+            attributes.as_slice(),
+            [RouteAttribute::Oif(7), RouteAttribute::Priority(50)]
+        ));
     }
 
     #[test]
@@ -721,11 +798,30 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
             None,
         );
-        let message = route_message(&route, 7);
+        let message = route_message(&route, 7, None);
         assert_eq!(message.header.destination_prefix_length, 24);
         assert_eq!(message.header.scope, ROUTE_SCOPE);
         // Default metric: no priority attribute was set.
         assert_eq!(message.header.protocol, ROUTE_PROTOCOL);
+        // A global gateway needs no output interface (the kernel resolves
+        // it); a link-local gateway gets one spelled out.
+        let attributes = message.attributes.clone();
+        assert!(
+            !attributes
+                .iter()
+                .any(|attribute| matches!(attribute, RouteAttribute::Oif(_)))
+        );
+        let link_local = spec(
+            v6_prefix("fe80::", 128),
+            Some(IpAddr::V6("fe80::1".parse().expect("valid IPv6"))),
+            None,
+        );
+        let message = route_message(&link_local, 7, Some(3));
+        let attributes = message.attributes.clone();
+        assert!(matches!(
+            attributes.as_slice(),
+            [RouteAttribute::Oif(3), RouteAttribute::Gateway(_)]
+        ));
     }
 
     #[test]
@@ -738,7 +834,7 @@ mod tests {
             gateway: None,
             metric: None,
         };
-        let message = route_message(&route, 9);
+        let message = route_message(&route, 9, None);
         assert_eq!(message.header.destination_prefix_length, 32);
     }
 

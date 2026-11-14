@@ -67,7 +67,14 @@ pub trait Platform: Send + Sync {
     async fn apply_dns(&self, dns: &DnsConfig) -> Result<(), PlatformError>;
 
     /// Install or adjust the kill switch enforcement for the given mode.
-    async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError>;
+    /// `bypass_routes` are the plan's split-tunnel bypass destinations:
+    /// enforcement must permit traffic to them even while everything else is
+    /// blocked. Ignored by `Restore`.
+    async fn apply_kill_switch(
+        &self,
+        mode: KillSwitchMode,
+        bypass_routes: &[RouteSpec],
+    ) -> Result<(), PlatformError>;
 
     /// Remove everything this helper set up: device, routes, DNS settings,
     /// kill switch. Must be safe to call repeatedly (idempotent) and must
@@ -103,7 +110,11 @@ impl Platform for NullPlatform {
         Err(PlatformError::Unsupported(UNSUPPORTED_REASON.to_owned()))
     }
 
-    async fn apply_kill_switch(&self, _mode: KillSwitchMode) -> Result<(), PlatformError> {
+    async fn apply_kill_switch(
+        &self,
+        _mode: KillSwitchMode,
+        _bypass_routes: &[RouteSpec],
+    ) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported(UNSUPPORTED_REASON.to_owned()))
     }
 

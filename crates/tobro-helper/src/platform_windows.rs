@@ -20,13 +20,15 @@
 //!   library is loaded lazily on first use so `status`/`teardown` still work.
 //! - `KillSwitchMode::Block` installs persistent Windows Filtering Platform
 //!   filters through `tobro-osapi`'s WFP FFI (the helper never shells out,
-//!   §10.5): permit loopback and the tunnel adapter (matched by LUID), block
-//!   all other egress, per family. The objects live in the WFP store and
-//!   fail closed — they keep enforcing if the helper crashes — and teardown
-//!   removes them again by fixed key, never touching foreign filters.
+//!   §10.5): permit loopback, the tunnel adapter (matched by LUID), and each
+//!   split-tunnel bypass destination (remote-subnet permits), then block all
+//!   other egress, per family. The objects live in the WFP store and fail
+//!   closed — they keep enforcing if the helper crashes — and teardown
+//!   removes them by sweeping the dedicated sublayer, never touching
+//!   foreign filters.
 //! - Logs carry counts only, never addresses or destinations (§10.5).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
 use tobro_tun::{DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
@@ -62,6 +64,74 @@ fn osapi_route(spec: &RouteSpec, interface_index: u32) -> tobro_osapi::Route {
     }
 }
 
+/// The physical adapters' interface indices per family, resolved once at
+/// device creation — before any route is applied, so the per-family default
+/// route still resolves to the physical network. Bypass routes must pin
+/// these indices: a gateway route's row names its egress adapter, and
+/// pinning the wintun index would send bypass traffic back into the tunnel.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhysicalAdapters {
+    v4: Option<u32>,
+    v6: Option<u32>,
+}
+
+impl PhysicalAdapters {
+    /// The resolved index for a destination's family, if known.
+    fn for_family(&self, family: IpAddr) -> Option<u32> {
+        match family {
+            IpAddr::V4(_) => self.v4,
+            IpAddr::V6(_) => self.v6,
+        }
+    }
+}
+
+/// Resolve the physical adapters through iphlpapi (blocking; runs off the
+/// async core). A family with no connectivity resolves to `None`.
+fn resolve_physical_adapters() -> PhysicalAdapters {
+    let v4 = tobro_osapi::win_route::best_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .ok()
+        .flatten()
+        .map(|route| route.interface_index);
+    let v6 = tobro_osapi::win_route::best_route(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        .ok()
+        .flatten()
+        .map(|route| route.interface_index);
+    PhysicalAdapters { v4, v6 }
+}
+
+/// The bypass destinations as `(address, prefix length)` pairs for the WFP
+/// permit filters (the gateway is not part of a filter condition).
+fn bypass_pairs(bypass_routes: &[RouteSpec]) -> Vec<(IpAddr, u8)> {
+    bypass_routes
+        .iter()
+        .map(|spec| (spec.destination.addr, spec.destination.prefix_len))
+        .collect()
+}
+
+/// The interface index one route's row is built with: tunnel routes (no
+/// gateway) pin the adapter itself, bypass routes pin their family's
+/// physical adapter. Errors when a bypass route's family had no
+/// connectivity at device creation (the plan's gateway discovery and this
+/// resolution can disagree; failing is the honest answer — the traffic
+/// would otherwise be sent into the tunnel and, with a kill switch, be
+/// dropped entirely).
+fn route_row_index(
+    spec: &RouteSpec,
+    tunnel_index: u32,
+    physical: &PhysicalAdapters,
+) -> Result<u32, PlatformError> {
+    if spec.gateway.is_none() {
+        return Ok(tunnel_index);
+    }
+    physical.for_family(spec.destination.addr).ok_or_else(|| {
+        PlatformError::Route(
+            "cannot build a bypass route row: no physical adapter was discovered for this \
+             address family at device creation"
+                .to_owned(),
+        )
+    })
+}
+
 /// Device-scoped helper state: everything `teardown` must undo.
 struct DeviceState {
     /// The adapter's friendly name ("tobro" unless the plan names one).
@@ -73,6 +143,8 @@ struct DeviceState {
     wintun: Wintun,
     /// The IPv4 address configured at creation.
     applied_address: Prefix,
+    /// The physical adapters' indices per family (resolved at creation).
+    physical: PhysicalAdapters,
     /// Routes the helper installed (tunnel + bypass), for convergence.
     installed_routes: Vec<RouteSpec>,
     /// Whether WFP kill-switch filters are currently installed (the filters
@@ -124,7 +196,10 @@ impl WindowsPlatform {
     async fn remove_tracked_routes(&self, state: &mut DeviceState) -> usize {
         let mut removed = 0usize;
         for spec in state.installed_routes.drain(..) {
-            let route = osapi_route(&spec, state.index);
+            // A missing physical index falls back to the adapter index so a
+            // best-effort delete still targets the likely row.
+            let index = route_row_index(&spec, state.index, &state.physical).unwrap_or(state.index);
+            let route = osapi_route(&spec, index);
             match tobro_osapi::win_route::delete_route(&route) {
                 Ok(()) => removed += 1,
                 Err(error) => tracing::warn!("could not remove a tracked route: {error}"),
@@ -195,6 +270,14 @@ impl Platform for WindowsPlatform {
             })?;
             let index = u32::try_from(index)
                 .map_err(|_| PlatformError::Device("adapter index overflow".to_owned()))?;
+            // Resolve the physical adapters now, before any route of this
+            // tunnel lifetime exists: afterwards the per-family default
+            // route would resolve to the tunnel itself.
+            let physical = tokio::task::spawn_blocking(resolve_physical_adapters)
+                .await
+                .map_err(|error| {
+                    PlatformError::Device(format!("adapter discovery task failed: {error}"))
+                })?;
             *guard = Some(DeviceState {
                 name,
                 index,
@@ -204,6 +287,7 @@ impl Platform for WindowsPlatform {
                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     prefix_len: 0,
                 }),
+                physical,
                 installed_routes: Vec::new(),
                 kill_switch: false,
             });
@@ -248,6 +332,7 @@ impl Platform for WindowsPlatform {
 
         let desired: Vec<RouteSpec> = routes.iter().chain(bypass_routes.iter()).cloned().collect();
         let index = state.index;
+        let physical = state.physical;
         let additions: Vec<(RouteSpec, bool)> = bypass_routes
             .iter()
             .map(|spec| (spec.clone(), true))
@@ -255,7 +340,8 @@ impl Platform for WindowsPlatform {
             .collect();
         tokio::task::spawn_blocking(move || -> Result<(), PlatformError> {
             for (spec, bypass) in additions {
-                let route = osapi_route(&spec, index);
+                let row_index = route_row_index(&spec, index, &physical)?;
+                let route = osapi_route(&spec, row_index);
                 let kind = if bypass { "bypass" } else { "tunnel" };
                 match tobro_osapi::win_route::add_route(&route) {
                     Ok(()) => {}
@@ -293,7 +379,11 @@ impl Platform for WindowsPlatform {
             .collect();
         let mut removed = 0usize;
         for spec in &stale {
-            let route = osapi_route(spec, index);
+            // The row to delete was built with the index from its install
+            // time; a missing physical index falls back to the adapter
+            // index so the delete still targets the likely row.
+            let row_index = route_row_index(spec, index, &state.physical).unwrap_or(index);
+            let route = osapi_route(spec, row_index);
             match tobro_osapi::win_route::delete_route(&route) {
                 Ok(()) => removed += 1,
                 Err(error) => {
@@ -331,7 +421,11 @@ impl Platform for WindowsPlatform {
         Ok(())
     }
 
-    async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError> {
+    async fn apply_kill_switch(
+        &self,
+        mode: KillSwitchMode,
+        bypass_routes: &[RouteSpec],
+    ) -> Result<(), PlatformError> {
         // The kill switch follows device creation: there is always an
         // enforced adapter here.
         let mut guard = self.state.lock().await;
@@ -342,10 +436,11 @@ impl Platform for WindowsPlatform {
         })?;
         match mode {
             KillSwitchMode::Block => {
-                if state.kill_switch {
-                    tracing::info!("apply_kill_switch: WFP enforcement already active");
-                    return Ok(()); // idempotent
-                }
+                // The WFP apply is replace-semantics (the sublayer is swept
+                // first), so re-applying converges the enforcement with the
+                // current bypass set; no early return for an already-active
+                // kill switch.
+                let bypass = bypass_pairs(bypass_routes);
                 // The filters pin the adapter LUID, so read it fresh from
                 // the adapter (it changes when the adapter is recreated).
                 let adapter = state.reopen_adapter()?;
@@ -359,7 +454,7 @@ impl Platform for WindowsPlatform {
                             ))
                         })?;
                         engine
-                            .apply_kill_switch(tobro_osapi::wfp::adapter_luid(luid))
+                            .apply_kill_switch(tobro_osapi::wfp::adapter_luid(luid), &bypass)
                             .map_err(|error| {
                                 PlatformError::KillSwitch(format!(
                                     "could not install the WFP kill-switch filters: {error}"
@@ -445,6 +540,7 @@ impl Platform for WindowsPlatform {
             device,
             index: _,
             applied_address: _,
+            physical: _,
             installed_routes: _,
             kill_switch: _,
         } = state;

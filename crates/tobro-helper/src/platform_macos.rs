@@ -32,6 +32,7 @@
 //!   addresses or destinations (§10.5).
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tobro_tun::{DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
@@ -68,7 +69,7 @@ fn first_ipv4(addresses: &[Prefix]) -> Option<&Prefix> {
 /// Active PF kill-switch enforcement: the open `/dev/pf` session and the
 /// reference token that releases the PF enable on teardown.
 struct EnabledKillSwitch {
-    pf: tobro_osapi::pf::PfSession,
+    pf: Arc<tobro_osapi::pf::PfSession>,
     /// The `DIOCSTARTREF` release token, `None` when this apply did not
     /// enable PF: the rules were already loaded and PF was already running
     /// from a previous (possibly crashed) helper instance, so no reference
@@ -157,6 +158,43 @@ fn tobro_osapi_route(spec: &RouteSpec, interface_index: u32) -> tobro_osapi::Rou
         interface_index,
         metric: spec.metric,
     }
+}
+
+/// The interface index a route install should carry.
+///
+/// Tunnel routes point into the TUN device. Bypass routes leave through the
+/// physical network: for `RTF_GATEWAY` routes the kernel resolves the
+/// egress interface from the gateway address and ignores the given index —
+/// except for IPv6 link-local gateways, whose scope (`sin6_scope_id`) must
+/// name the egress interface: resolve it from the routing table (an
+/// unprivileged read). On a failed lookup fall back to the TUN index and
+/// let the kernel's answer surface on the add.
+fn route_interface_index(spec: &RouteSpec, tunnel_index: u32) -> u32 {
+    let Some(gateway) = spec.gateway else {
+        return tunnel_index;
+    };
+    let IpAddr::V6(gateway) = gateway else {
+        return tunnel_index;
+    };
+    if !gateway.is_unicast_link_local() {
+        return tunnel_index;
+    }
+    match tobro_osapi::bsd_route::route_lookup(IpAddr::V6(gateway)) {
+        Ok(Some(route)) => route.interface_index,
+        Ok(None) | Err(_) => {
+            tracing::warn!("could not resolve a link-local gateway's egress interface");
+            tunnel_index
+        }
+    }
+}
+
+/// The bypass destinations as `(address, prefix length)` pairs for the PF
+/// pass rules (the gateway is not part of a filter rule).
+fn bypass_pairs(bypass_routes: &[RouteSpec]) -> Vec<(IpAddr, u8)> {
+    bypass_routes
+        .iter()
+        .map(|spec| (spec.destination.addr, spec.destination.prefix_len))
+        .collect()
 }
 
 /// Run a blocking SystemConfiguration operation via `tobro-osapi`. CF
@@ -283,6 +321,7 @@ impl Platform for MacosPlatform {
             .collect();
         tokio::task::spawn_blocking(move || -> Result<(), PlatformError> {
             for (spec, bypass) in additions {
+                let index = route_interface_index(&spec, index);
                 let route = tobro_osapi_route(&spec, index);
                 let kind = if bypass { "bypass" } else { "tunnel" };
                 match tobro_osapi::bsd_route::add_route(&route) {
@@ -361,7 +400,11 @@ impl Platform for MacosPlatform {
         Ok(())
     }
 
-    async fn apply_kill_switch(&self, mode: KillSwitchMode) -> Result<(), PlatformError> {
+    async fn apply_kill_switch(
+        &self,
+        mode: KillSwitchMode,
+        bypass_routes: &[RouteSpec],
+    ) -> Result<(), PlatformError> {
         // The kill switch follows device creation: there is always an
         // enforced device here.
         let mut guard = self.state.lock().await;
@@ -372,21 +415,50 @@ impl Platform for MacosPlatform {
         })?;
         match mode {
             KillSwitchMode::Block => {
-                if state.kill_switch.is_some() {
-                    tracing::info!("apply_kill_switch: PF enforcement already active");
-                    return Ok(()); // idempotent
-                }
+                let bypass = bypass_pairs(bypass_routes);
                 let interface = state.name.clone();
+                if let Some(enforcement) = state.kill_switch.as_ref() {
+                    // Already enforced: reload the whole owned rule set with
+                    // the current bypass destinations on the same session.
+                    // No new enable reference is taken — the original apply
+                    // owns the one that exists, and PF stops only when all
+                    // references are gone.
+                    let pf = Arc::clone(&enforcement.pf);
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        pf.apply_kill_switch_rules(&interface, &bypass)
+                    })
+                    .await
+                    .map_err(|error| {
+                        PlatformError::KillSwitch(format!("kill switch task failed: {error}"))
+                    })?
+                    .map_err(|error| {
+                        PlatformError::KillSwitch(format!(
+                            "could not install the PF kill-switch rules: {error}"
+                        ))
+                    })?;
+                    tracing::info!("apply_kill_switch: PF enforcement reloaded ({loaded} rule(s))");
+                    return Ok(());
+                }
                 let enforcement = tokio::task::spawn_blocking(
                     move || -> Result<(EnabledKillSwitch, usize), PlatformError> {
-                        let pf = tobro_osapi::pf::PfSession::open().map_err(|error| {
+                        let pf = Arc::new(tobro_osapi::pf::PfSession::open().map_err(|error| {
                             PlatformError::KillSwitch(format!("could not open /dev/pf: {error}"))
-                        })?;
-                        let loaded = pf.apply_kill_switch_rules(&interface).map_err(|error| {
+                        })?);
+                        // Adopted vs fresh decides the enable reference
+                        // below, so it must be read before the rules are
+                        // (re)loaded.
+                        let adopted = pf.kill_switch_rules_installed().map_err(|error| {
                             PlatformError::KillSwitch(format!(
-                                "could not install the PF kill-switch rules: {error}"
+                                "could not query the packet filter rules: {error}"
                             ))
                         })?;
+                        let loaded =
+                            pf.apply_kill_switch_rules(&interface, &bypass)
+                                .map_err(|error| {
+                                    PlatformError::KillSwitch(format!(
+                                        "could not install the PF kill-switch rules: {error}"
+                                    ))
+                                })?;
                         // Take an enable reference only when needed. If the
                         // rules were already installed and PF is already
                         // running, that running reference may belong to a
@@ -395,7 +467,7 @@ impl Platform for MacosPlatform {
                         // leak one reference per crash cycle. PF stops only
                         // when *all* references are gone, which is exactly
                         // the fail-closed property the kill switch relies on.
-                        let token = if loaded > 0
+                        let token = if !adopted
                             || !pf.is_running().map_err(|error| {
                                 PlatformError::KillSwitch(format!(
                                     "could not query the packet filter state: {error}"
@@ -593,20 +665,21 @@ mod macos_integration {
         };
         platform.apply_dns(&dns).await.expect("dns");
 
-        // Block installs PF enforcement (fail-closed on the real host) and
-        // is idempotent; Restore removes it again; teardown stays a no-op
-        // after that. Note: while the block is active this machine loses
-        // all egress except loopback and the tunnel interface.
+        // Block installs PF enforcement (fail-closed on the real host),
+        // re-applying converges the bypass set; Restore removes it again;
+        // teardown stays a no-op after that. Note: while the block is
+        // active this machine loses all egress except loopback, the tunnel
+        // interface, and the bypass destinations.
         platform
-            .apply_kill_switch(KillSwitchMode::Block)
+            .apply_kill_switch(KillSwitchMode::Block, &bypass_routes)
             .await
             .expect("block");
         platform
-            .apply_kill_switch(KillSwitchMode::Block)
+            .apply_kill_switch(KillSwitchMode::Block, &[])
             .await
-            .expect("block again (idempotent)");
+            .expect("block again (converged)");
         platform
-            .apply_kill_switch(KillSwitchMode::Restore)
+            .apply_kill_switch(KillSwitchMode::Restore, &[])
             .await
             .expect("restore");
 

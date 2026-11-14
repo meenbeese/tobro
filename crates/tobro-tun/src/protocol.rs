@@ -38,6 +38,15 @@ pub const DEFAULT_TUN_MTU: u16 = 1500;
 /// name one. Platforms may adjust (macOS assigns `utunN`).
 pub const DEFAULT_INTERFACE_NAME: &str = "tobro0";
 
+/// The tunnel's reserved IPv4 addressing (`10.111.222.252/30`); the
+/// interception DNS resolver at `10.111.222.254` sits inside it. Bypass
+/// routes must never cover this subnet: its traffic belongs to the tunnel
+/// itself.
+pub const TUNNEL_PREFIX_V4: &str = "10.111.222.252/30";
+/// The tunnel's reserved IPv6 addressing (`fd6b:626f:6272:6f::/64`,
+/// containing the interception resolver at `...::2`).
+pub const TUNNEL_PREFIX_V6: &str = "fd6b:626f:6272:6f::/64";
+
 /// Longest accepted interface name (Linux `IFNAMSIZ - 1`).
 pub const MAX_INTERFACE_NAME_LEN: usize = 15;
 
@@ -263,6 +272,35 @@ impl Prefix {
     pub fn text(&self) -> String {
         format!("{}/{}", self.addr, self.prefix_len)
     }
+
+    /// True when `ip` belongs to this prefix (same address family).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                u32::from(addr) & v4_mask(self.prefix_len) == u32::from(net)
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                u128::from(addr) & v6_mask(self.prefix_len) == u128::from(net)
+            }
+            _ => false, // different families never nest
+        }
+    }
+
+    /// True when this prefix and `other` cover at least one shared address
+    /// (same family, neither strictly disjoint).
+    pub fn overlaps(&self, other: &Prefix) -> bool {
+        match (self.addr, other.addr) {
+            (IpAddr::V4(net), IpAddr::V4(other_net)) => {
+                let mask = v4_mask(self.prefix_len.min(other.prefix_len));
+                u32::from(net) & mask == u32::from(other_net) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(other_net)) => {
+                let mask = v6_mask(self.prefix_len.min(other.prefix_len));
+                u128::from(net) & mask == u128::from(other_net) & mask
+            }
+            _ => false, // different families never overlap
+        }
+    }
 }
 
 /// Dotted-quad mask for an IPv4 prefix length.
@@ -319,6 +357,87 @@ pub fn is_usable_dns_server(addr: &IpAddr) -> bool {
         }
         IpAddr::V6(a) => !a.is_loopback() && !a.is_unspecified() && !a.is_multicast(),
     }
+}
+
+/// Validate a split-tunnel bypass destination: it must be a real remote
+/// range that can leave the host, and it must not cover the tunnel's own
+/// wiring (the device's on-link subnets or the interception DNS servers).
+fn validate_bypass_destination(
+    index: usize,
+    destination: Prefix,
+    device_addresses: &[Prefix],
+    dns: &DnsConfig,
+) -> Result<(), HelperError> {
+    let invalid =
+        |reason: String| HelperError::Validation(format!("plan.bypass_routes[{index}]: {reason}"));
+    // Loopback, link-local, unspecified, and multicast/broadcast never leave
+    // the host, so "bypassing" them is either a no-op or a config bug.
+    let rejected = match destination.addr {
+        IpAddr::V4(a) => {
+            a.is_loopback()
+                || a.is_unspecified()
+                || a.is_link_local()
+                || a.is_multicast()
+                || a.is_broadcast()
+        }
+        IpAddr::V6(a) => {
+            a.is_loopback() || a.is_unspecified() || a.is_multicast() || a.is_unicast_link_local()
+        }
+    };
+    if rejected {
+        return Err(invalid(format!(
+            "{} is loopback/link-local/multicast/broadcast and cannot be a split-tunnel bypass destination",
+            destination.text()
+        )));
+    }
+    // The destination must not cover the tunnel's on-link subnets: those
+    // addresses belong to the tunnel device itself (including the reserved
+    // tunnel prefixes and the interception DNS resolver inside them).
+    for subnet in device_addresses {
+        if destination.overlaps(subnet) {
+            return Err(invalid(format!(
+                "{} overlaps the tunnel subnet {} (the tunnel's own addresses cannot be bypassed)",
+                destination.text(),
+                subnet.text()
+            )));
+        }
+    }
+    // ... and must not cover any resolver the tunnel points the system at.
+    for server in &dns.servers {
+        if destination.contains(*server) {
+            return Err(invalid(format!(
+                "{} covers the tunnel DNS resolver {server}",
+                destination.text()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a split-tunnel bypass gateway: it must sit outside the tunnel's
+/// own subnets and must not be loopback. Link-local gateways are allowed
+/// (IPv6 LANs commonly use them); the helper encodes the scope.
+fn validate_bypass_gateway(
+    index: usize,
+    gateway: IpAddr,
+    device_addresses: &[Prefix],
+) -> Result<(), HelperError> {
+    let invalid =
+        |reason: String| HelperError::Validation(format!("plan.bypass_routes[{index}]: {reason}"));
+    if gateway.is_loopback() {
+        return Err(invalid(
+            "the gateway must not be a loopback address".to_owned(),
+        ));
+    }
+    for subnet in device_addresses {
+        if subnet.contains(gateway) {
+            return Err(invalid(format!(
+                "gateway {gateway} is inside the tunnel subnet {} (bypass traffic must leave through the physical network)",
+                subnet.text()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The TUN device to create or reuse.
@@ -437,6 +556,7 @@ impl TunnelPlan {
             ("routes", &self.routes),
             ("bypass_routes", &self.bypass_routes),
         ] {
+            let bypass = section == "bypass_routes";
             for (i, route) in routes.iter().enumerate() {
                 route.destination.validate().map_err(|e| {
                     HelperError::Validation(format!("plan.{section}[{i}]: {}", strip_prefix(e)))
@@ -452,6 +572,17 @@ impl TunnelPlan {
                             "plan.{section}[{i}]: gateway {gateway} must match the destination address family"
                         )));
                     }
+                    if bypass {
+                        validate_bypass_gateway(i, gateway, &self.device.addresses)?;
+                    }
+                }
+                if bypass {
+                    validate_bypass_destination(
+                        i,
+                        route.destination,
+                        &self.device.addresses,
+                        &self.dns,
+                    )?;
                 }
             }
         }
@@ -571,6 +702,133 @@ mod tests {
         let hostile: Prefix =
             serde_json::from_str(r#"{"addr":"10.111.222.7","prefix_len":24}"#).expect("parse");
         assert!(hostile.validate().is_err());
+    }
+
+    #[test]
+    fn prefix_contains_and_overlaps() {
+        let net = Prefix::parse("10.111.222.0/24").expect("parse");
+        assert!(net.contains(IpAddr::V4(Ipv4Addr::new(10, 111, 222, 9))));
+        assert!(!net.contains(IpAddr::V4(Ipv4Addr::new(10, 111, 223, 9))));
+        assert!(!net.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        let tunnel = Prefix::parse(TUNNEL_PREFIX_V4).expect("parse");
+        assert!(tunnel.contains(IpAddr::V4(Ipv4Addr::new(10, 111, 222, 254))));
+        // The tunnel's /30 sits inside the /24: they overlap.
+        assert!(net.overlaps(&tunnel));
+
+        let v6 = Prefix::parse("2001:db8::/32").expect("parse");
+        assert!(v6.contains(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1
+        ))));
+        assert!(!v6.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        let v6_tunnel = Prefix::parse(TUNNEL_PREFIX_V6).expect("parse");
+        assert!(v6_tunnel.overlaps(&v6_tunnel));
+        assert!(!v6.overlaps(&v6_tunnel));
+        // Nested prefixes overlap.
+        let narrow = Prefix::parse("10.111.222.64/26").expect("parse");
+        assert!(narrow.overlaps(&net));
+        assert!(net.overlaps(&narrow));
+    }
+
+    #[test]
+    fn bypass_destinations_must_be_remote_ranges() {
+        let sample = sample_plan();
+        let addresses = sample.device.addresses.clone();
+        let dns = sample.dns.clone();
+        for (index, addr) in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 9, 9)), // link-local
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),   // multicast
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // link-local
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), // multicast
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = Prefix {
+                addr,
+                prefix_len: match addr {
+                    IpAddr::V4(_) => 24,
+                    IpAddr::V6(_) => 64,
+                },
+            };
+            assert!(
+                validate_bypass_destination(index, destination, &addresses, &dns).is_err(),
+                "{addr} must be rejected"
+            );
+        }
+        // A normal remote prefix is accepted.
+        validate_bypass_destination(
+            0,
+            Prefix::parse("192.0.2.0/24").expect("parse"),
+            &addresses,
+            &dns,
+        )
+        .expect("documented TEST-NET range must be accepted");
+    }
+
+    #[test]
+    fn bypass_destinations_must_not_cover_tunnel_wiring() {
+        let sample = sample_plan();
+        let addresses = sample.device.addresses.clone(); // 10.111.222.0/24
+        let dns = sample.dns.clone();
+        // Overlapping the device subnet is refused...
+        assert!(
+            validate_bypass_destination(
+                0,
+                Prefix::parse("10.111.0.0/16").expect("parse"),
+                &addresses,
+                &dns,
+            )
+            .is_err()
+        );
+        // ... as is covering a configured resolver (even outside the
+        // device subnets).
+        let dns_outside = DnsConfig {
+            servers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+        };
+        assert!(
+            validate_bypass_destination(
+                0,
+                Prefix::parse("9.9.0.0/16").expect("parse"),
+                &addresses,
+                &dns_outside,
+            )
+            .is_err()
+        );
+        // A disjoint remote prefix is fine.
+        validate_bypass_destination(
+            0,
+            Prefix::parse("198.51.100.0/24").expect("parse"),
+            &addresses,
+            &dns,
+        )
+        .expect("disjoint remote prefix must be accepted");
+    }
+
+    #[test]
+    fn bypass_gateways_must_sit_outside_the_tunnel() {
+        let sample = sample_plan();
+        let addresses = sample.device.addresses.clone(); // 10.111.222.0/24
+        // Inside the tunnel subnet.
+        assert!(
+            validate_bypass_gateway(0, IpAddr::V4(Ipv4Addr::new(10, 111, 222, 254)), &addresses)
+                .is_err()
+        );
+        // Loopback.
+        assert!(validate_bypass_gateway(0, IpAddr::V4(Ipv4Addr::LOCALHOST), &addresses).is_err());
+        assert!(validate_bypass_gateway(0, IpAddr::V6(Ipv6Addr::LOCALHOST), &addresses).is_err());
+        // Link-local LAN gateway: legitimate (IPv6 LANs), accepted.
+        validate_bypass_gateway(
+            0,
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            &addresses,
+        )
+        .expect("link-local gateway must be accepted");
+        validate_bypass_gateway(0, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), &addresses)
+            .expect("ordinary LAN gateway must be accepted");
     }
 
     #[test]

@@ -119,7 +119,11 @@ impl<P: Platform> HelperService<P> {
         if let Err(error) = self.platform.apply_dns(&plan.dns).await {
             return self.reject(error).await;
         }
-        if let Err(error) = self.platform.apply_kill_switch(plan.kill_switch).await {
+        if let Err(error) = self
+            .platform
+            .apply_kill_switch(plan.kill_switch, &plan.bypass_routes)
+            .await
+        {
             return self.reject(error).await;
         }
 
@@ -262,7 +266,11 @@ mod tests {
             Ok(())
         }
 
-        async fn apply_kill_switch(&self, _mode: KillSwitchMode) -> Result<(), PlatformError> {
+        async fn apply_kill_switch(
+            &self,
+            _mode: KillSwitchMode,
+            _bypass_routes: &[RouteSpec],
+        ) -> Result<(), PlatformError> {
             self.calls
                 .lock()
                 .unwrap()

@@ -9,14 +9,21 @@
 //!
 //! # Enforcement design
 //!
-//! Three rules are loaded into the **root filter ruleset** (empty anchor
-//! name). Anchor-only rules are never evaluated unless something references
-//! the anchor from the main ruleset, so the root ruleset is the only place
-//! rules are guaranteed to fire:
+//! A base set of three rules is loaded into the **root filter ruleset**
+//! (empty anchor name), plus one `pass` rule per split-tunnel bypass
+//! destination. Anchor-only rules are never evaluated unless something
+//! references the anchor from the main ruleset, so the root ruleset is the
+//! only place rules are guaranteed to fire:
 //!
 //! 1. `pass quick` on the loopback interface (both families);
 //! 2. `pass quick` on the tunnel interface (both families);
-//! 3. `block drop quick` outbound on every interface (both families).
+//! 3. `pass quick` out to each bypass destination (split tunneling: these
+//!    destinations leave through the physical network, so they must not be
+//!    dropped by rule 4);
+//! 4. `block drop quick` outbound on every interface (both families).
+//!
+//! All rules are `quick`, so the first match wins and ordering matters only
+//! in that every pass rule must precede the block rule.
 //!
 //! Egress-only blocking mirrors the Linux backend's blackhole-route
 //! insurance: replies and other inbound traffic are untouched, and only the
@@ -61,8 +68,9 @@ use libc::ENOENT;
 
 /// Label carried by every rule this module installs (max 63 bytes).
 const RULE_LABEL: &str = "tobro-ks";
-/// The number of rules one kill-switch enforcement consists of.
-const RULE_COUNT: usize = 3;
+/// The number of base rules one enforcement consists of, before the bypass
+/// pass rules.
+const BASE_RULE_COUNT: usize = 3;
 
 /// `PF_PASS`: accept matching packets (`pf_rule::action`).
 const PF_PASS: u8 = 0;
@@ -79,6 +87,10 @@ const PF_RULESET_FILTER: i32 = 1;
 const PF_ADDR_ADDRMASK: u8 = 0;
 /// `AF_UNSPEC`: a rule address matches both families (`pf_rule::af`).
 const AF_UNSPEC: u8 = 0;
+/// `AF_INET` (Darwin value): an IPv4 rule (`pf_rule::af`).
+const AF_INET: u8 = 2;
+/// `AF_INET6` (Darwin value): an IPv6 rule (`pf_rule::af`).
+const AF_INET6: u8 = 24;
 
 // ---------------------------------------------------------------------------
 // Structure transcriptions (net/pfvar.h, LP64). Sizes are asserted below.
@@ -538,30 +550,34 @@ impl PfSession {
         Ok(status.running != 0)
     }
 
-    /// Load the kill-switch rules into the root filter ruleset (idempotent).
+    /// Load the kill-switch rules into the root filter ruleset
+    /// (replace-semantics).
     ///
-    /// Returns the number of rules that were newly installed; `0` means the
-    /// exact [`RULE_COUNT`]-rule set was already present. Errors if the
-    /// ruleset contains rules this module does not own — those are never
-    /// clobbered.
-    pub fn apply_kill_switch_rules(&self, tunnel_interface: &str) -> io::Result<usize> {
+    /// Installs the base rule set plus one `pass` rule per split-tunnel
+    /// bypass destination (`(address, prefix length)` pairs) and returns the
+    /// number of rules enforced. The transaction is atomic: the whole owned
+    /// set is replaced inside one commit, so a changed bypass set can never
+    /// leave a half-updated enforcement. Errors if the ruleset contains
+    /// rules this module does not own — those are never clobbered.
+    pub fn apply_kill_switch_rules(
+        &self,
+        tunnel_interface: &str,
+        bypass: &[(std::net::IpAddr, u8)],
+    ) -> io::Result<usize> {
         let count = self.root_filter_rule_count()?;
-        if count == 0 {
-            self.load_rules(tunnel_interface)?;
-            return Ok(RULE_COUNT);
-        }
-        if !self.rules_are_ours(count)? {
+        if count > 0 && !self.rules_are_ours(count)? {
             return Err(clobber_error());
         }
-        if count as usize == RULE_COUNT {
-            return Ok(0);
-        }
-        // Our rules are present alongside more of our own (e.g. a crash
-        // mid-reload): replace the whole owned set inside a fresh
-        // transaction. Verified ours above, so nothing foreign is touched.
-        self.clear_rules()?;
-        self.load_rules(tunnel_interface)?;
-        Ok(RULE_COUNT)
+        self.load_rules(tunnel_interface, bypass)?;
+        Ok(BASE_RULE_COUNT + bypass.len())
+    }
+
+    /// Whether an enforcement is already present in the root filter
+    /// ruleset (every existing rule is ours). Count-only; used by the
+    /// helper to distinguish a fresh install from an adopted one.
+    pub fn kill_switch_rules_installed(&self) -> io::Result<bool> {
+        let count = self.root_filter_rule_count()?;
+        Ok(count > 0 && self.rules_are_ours(count)?)
     }
 
     /// Remove the kill-switch rules from the root filter ruleset
@@ -712,14 +728,18 @@ impl PfSession {
         self.call(DIOCADDRULE, &mut request)
     }
 
-    /// Install the three kill-switch rules in one transaction.
-    fn load_rules(&self, tunnel_interface: &str) -> io::Result<()> {
+    /// Install the kill-switch rules in one transaction.
+    fn load_rules(
+        &self,
+        tunnel_interface: &str,
+        bypass: &[(std::net::IpAddr, u8)],
+    ) -> io::Result<()> {
         let interface = validate_interface_name(tunnel_interface)?;
         let ticket = self.trans_begin()?;
         // A failed load commits nothing; the next `trans_begin` discards the
         // abandoned inactive rules (the kernel drains them on re-begin).
         let pool_ticket = self.begin_addrs()?;
-        for rule in build_rules(interface) {
+        for rule in build_rules(interface, bypass) {
             self.add_rule(&rule, ticket, pool_ticket)?;
         }
         self.trans_commit(ticket)
@@ -737,14 +757,18 @@ impl PfSession {
 // Rule construction
 // ---------------------------------------------------------------------------
 
-/// Build the three enforcement rules: pass loopback, pass the tunnel
-/// interface, block everything outbound.
-fn build_rules(tunnel_interface: &str) -> [PfRule; RULE_COUNT] {
-    [
-        pass_rule("lo0"),
-        pass_rule(tunnel_interface),
-        block_out_rule(),
-    ]
+/// Build the enforcement rules: pass loopback, pass the tunnel interface,
+/// pass each bypass destination, then block everything outbound. Every rule
+/// is `quick`; the block must come last so the passes win.
+fn build_rules(tunnel_interface: &str, bypass: &[(std::net::IpAddr, u8)]) -> Vec<PfRule> {
+    let mut rules = vec![pass_rule("lo0"), pass_rule(tunnel_interface)];
+    rules.extend(
+        bypass
+            .iter()
+            .map(|&(address, prefix_len)| bypass_pass_rule(address, prefix_len)),
+    );
+    rules.push(block_out_rule());
+    rules
 }
 
 /// A `pass quick` rule bound to an interface, both families, no ports, no
@@ -775,6 +799,76 @@ fn block_out_rule() -> PfRule {
         src: any_rule_addr(),
         dst: any_rule_addr(),
         ..PfRule::default()
+    }
+}
+
+/// A `pass quick` rule matching outbound traffic to one destination prefix
+/// (split-tunnel bypass): the block rule must not drop these packets on
+/// their way out through the physical network. Host bits in `address` are
+/// masked off defensively.
+fn bypass_pass_rule(address: std::net::IpAddr, prefix_len: u8) -> PfRule {
+    let (af, addr_cell, mask_cell): (u8, [u8; 16], [u8; 16]) = match address {
+        std::net::IpAddr::V4(addr) => {
+            let prefix_len = prefix_len.min(32);
+            let mask = mask_v4(prefix_len);
+            let masked = u32::from(addr) & mask;
+            (
+                AF_INET,
+                padded_cell(&masked.to_be_bytes()),
+                padded_cell(&mask.to_be_bytes()),
+            )
+        }
+        std::net::IpAddr::V6(addr) => {
+            let prefix_len = prefix_len.min(128);
+            let mask = mask_v6(prefix_len);
+            let masked = u128::from(addr) & mask;
+            (AF_INET6, masked.to_be_bytes(), mask.to_be_bytes())
+        }
+    };
+    PfRule {
+        action: PF_PASS,
+        direction: PF_OUT,
+        quick: 1,
+        af,
+        label: fill_label(),
+        src: any_rule_addr(),
+        dst: PfRuleAddr {
+            addr: PfAddrWrap {
+                v: PfAddrWrapValue {
+                    addr: PfAddr(addr_cell),
+                    mask: PfAddr(mask_cell),
+                },
+                addr_type: PF_ADDR_ADDRMASK,
+                ..PfAddrWrap::default()
+            },
+            ..PfRuleAddr::default()
+        },
+        ..PfRule::default()
+    }
+}
+
+/// Copy short address bytes into a zero-padded 16-byte `pf_addr` cell.
+fn padded_cell(bytes: &[u8]) -> [u8; 16] {
+    let mut cell = [0u8; 16];
+    cell[..bytes.len()].copy_from_slice(bytes);
+    cell
+}
+
+/// Dotted mask for an IPv4 prefix length.
+fn mask_v4(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    }
+}
+
+/// 128-bit mask for an IPv6 prefix length.
+fn mask_v6(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix_len))
     }
 }
 
@@ -857,8 +951,8 @@ mod tests {
 
     #[test]
     fn rules_are_well_formed() {
-        let rules = build_rules("utun4");
-        assert_eq!(rules.len(), RULE_COUNT);
+        let rules = build_rules("utun4", &[]);
+        assert_eq!(rules.len(), BASE_RULE_COUNT);
         // pass lo0
         assert_eq!(rules[0].action, PF_PASS);
         assert_eq!(rules[0].direction, PF_INOUT);
@@ -879,6 +973,67 @@ mod tests {
             assert_eq!(rule.src.addr.v.addr, PfAddr([0; 16]));
             assert_eq!(rule.src.addr.v.mask, PfAddr([0; 16]));
         }
+    }
+
+    #[test]
+    fn bypass_rules_are_pass_out_rules_before_the_block() {
+        let bypass = [
+            (
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 0)),
+                24u8,
+            ),
+            (
+                std::net::IpAddr::V6("2001:db8::".parse().expect("valid")),
+                32u8,
+            ),
+        ];
+        let rules = build_rules("utun4", &bypass);
+        assert_eq!(rules.len(), BASE_RULE_COUNT + bypass.len());
+
+        // The block stays last; the passes sit between the tunnel rule and it.
+        assert_eq!(rules[2].action, PF_PASS);
+        assert_eq!(rules[3].action, PF_PASS);
+        assert_eq!(rules[4].action, PF_DROP);
+        assert_eq!(rules[4].direction, PF_OUT);
+
+        // IPv4 bypass: pass, out, quick, AF_INET, dst = masked addr + mask.
+        let v4 = &rules[2];
+        assert_eq!(v4.action, PF_PASS);
+        assert_eq!(v4.direction, PF_OUT);
+        assert_eq!(v4.quick, 1);
+        assert_eq!(v4.af, AF_INET);
+        assert!(v4.ifname.iter().all(|byte| *byte == 0));
+        assert_eq!(v4.dst.addr.addr_type, PF_ADDR_ADDRMASK);
+        assert_eq!(&v4.dst.addr.v.addr.0[..4], &[192, 0, 2, 0]);
+        assert_eq!(&v4.dst.addr.v.mask.0[..4], &[255, 255, 255, 0]);
+
+        // IPv6 bypass: AF_INET6 with the full 128-bit cells.
+        let v6 = &rules[3];
+        assert_eq!(v6.af, AF_INET6);
+        assert_eq!(
+            v6.dst.addr.v.addr.0[..16],
+            "2001:db8::"
+                .parse::<std::net::Ipv6Addr>()
+                .expect("valid")
+                .octets()[..16]
+        );
+        // /32 = 32 leading ones.
+        assert_eq!(v6.dst.addr.v.mask.0[..5], [0xffu8, 0xff, 0xff, 0xff, 0x00]);
+
+        // Host bits in the bypass address are masked off.
+        let sloppy = [(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9)),
+            24u8,
+        )];
+        let rules = build_rules("utun4", &sloppy);
+        assert_eq!(&rules[2].dst.addr.v.addr.0[..4], &[192, 0, 2, 0]);
+        // Over-long prefix lengths are clamped.
+        let sloppy = [(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 0)),
+            99u8,
+        )];
+        let rules = build_rules("utun4", &sloppy);
+        assert_eq!(&rules[2].dst.addr.v.mask.0[..4], &[255, 255, 255, 255]);
     }
 
     #[test]

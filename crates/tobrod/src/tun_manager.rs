@@ -28,6 +28,7 @@
 //!   by the same helper-side cleanup. The manager's job is to notice the
 //!   loss (heartbeat) and record it.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,9 +38,12 @@ use std::time::Duration;
 use serde_json::json;
 use tobro_config::{KillSwitchPolicy, SplitDestination, TunConfig};
 use tobro_tun::{
-    DnsConfig, HelperError, HelperInfo, KillSwitchMode, Prefix, RouteSpec, TunDevice,
+    DnsConfig, HelperError, HelperInfo, KillSwitchMode, MAX_ROUTES, Prefix, RouteSpec, TunDevice,
     TunHelperClient, TunnelPlan,
 };
+// The tunnel's own addressing lives with the protocol (single source of
+// truth); the daemon re-exports it for consumers of this module.
+pub use tobro_tun::{TUNNEL_PREFIX_V4, TUNNEL_PREFIX_V6};
 use tokio::sync::Mutex;
 
 use crate::lifecycle::State;
@@ -47,13 +51,6 @@ use crate::supervisor::SupervisorEvent;
 
 // --- Tunnel addressing -----------------------------------------------------
 
-/// IPv4 address assigned to the TUN device (`10.111.222.252/30`, RFC 1918).
-/// The protocol requires host bits zeroed on device addresses, so the
-/// network address doubles as the interface address (the same form the
-/// `tobro-tun` protocol tests use).
-pub const TUNNEL_PREFIX_V4: &str = "10.111.222.252/30";
-/// IPv6 address assigned to the TUN device (randomly-chosen ULA).
-pub const TUNNEL_PREFIX_V6: &str = "fd6b:626f:6272:6f::/64";
 /// System resolver target for IPv4 while the tunnel is up: the address the
 /// routing engine will answer DNS on (interception; forwarded to the
 /// daemon's local DNS port). Never a loopback address (the helper rejects
@@ -109,6 +106,12 @@ pub struct ActiveTun {
     /// Domain exclude rules skipped because resolution failed (user's own
     /// rule names; daemon logs intentionally carry only counts).
     pub skipped_domains: Vec<String>,
+    /// Domain exclude rules (or CIDR rules, by their CIDR text) dropped
+    /// because the plan ran out of route capacity.
+    pub truncated_domains: Vec<String>,
+    /// Domain exclude rules whose resolved IPs were all unroutable (no
+    /// discovered gateway for their address family).
+    pub unroutable_domains: Vec<String>,
 }
 
 /// Located `tobro-helper` binary (informational; the installer owns install).
@@ -206,10 +209,15 @@ impl Gateways {
 /// Discover the pre-tunnel default gateways.
 ///
 /// Linux reads `/proc/net/{route,ipv6_route}` (unprivileged, no FFI, no
-/// unsafe). Other platforms report nothing yet: with exclude rules
-/// configured, plan building fails with a clear message instead of silently
-/// tunneling a destination the user asked to bypass. Gateway discovery for
-/// macOS/Windows lands with their split-tunnel engine work.
+/// unsafe); macOS asks the kernel through a `PF_ROUTE` socket `RTM_GET`
+/// ([`tobro_osapi::bsd_route`], unprivileged read); Windows asks
+/// iphlpapi's `GetBestRoute2` for the default route ([`tobro_osapi::win_route`],
+/// unprivileged). The blocking route queries run off the async core.
+///
+/// With exclude rules configured and no gateway for a family, CIDR plan
+/// building fails with a clear message instead of silently tunneling a
+/// destination the user asked to bypass; domain rules for that family are
+/// skipped (they keep tunneling — an availability loss, never a leak).
 pub(crate) async fn discover_gateways() -> Gateways {
     #[cfg(target_os = "linux")]
     {
@@ -220,7 +228,44 @@ pub(crate) async fn discover_gateways() -> Gateways {
         let v6 = default_gateway_v6_proc();
         Gateways { v4, v6 }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // The `PF_ROUTE` socket read blocks waiting for the kernel's reply.
+        let gateways = tokio::task::spawn_blocking(|| {
+            let gateway = |ipv4| {
+                tobro_osapi::bsd_route::default_route(ipv4)
+                    .ok()
+                    .flatten()
+                    .and_then(|route| route.gateway)
+            };
+            Gateways {
+                v4: gateway(true),
+                v6: gateway(false),
+            }
+        })
+        .await;
+        gateways.unwrap_or(Gateways { v4: None, v6: None })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `GetBestRoute2` with an unspecified destination resolves the
+        // system's default route per family.
+        let gateways = tokio::task::spawn_blocking(|| {
+            let gateway = |destination| {
+                tobro_osapi::win_route::best_route(destination)
+                    .ok()
+                    .flatten()
+                    .and_then(|route| route.next_hop)
+            };
+            Gateways {
+                v4: gateway(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                v6: gateway(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            }
+        })
+        .await;
+        gateways.unwrap_or(Gateways { v4: None, v6: None })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Gateways { v4: None, v6: None }
     }
@@ -279,8 +324,17 @@ fn default_gateway_v6_proc() -> Option<IpAddr> {
 /// Result notes from plan building (surfaced through status).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PlanNotes {
-    /// Domain rules skipped because resolution failed.
+    /// Domain rules skipped because resolution failed (and no last-known
+    /// IPs existed for them).
     pub skipped_domains: Vec<String>,
+    /// Domain rules skipped entirely because the plan ran out of route
+    /// capacity (`MAX_ROUTES` counts tunnel + bypass routes combined).
+    pub truncated_domains: Vec<String>,
+    /// Domain rules whose resolved IPs were all dropped because no gateway
+    /// was discovered for their address family (the family has no
+    /// connectivity): those destinations keep tunneling, which is the safe
+    /// direction.
+    pub unroutable_domains: Vec<String>,
 }
 
 /// Resolve a domain exclude rule to the IPs its bypass routes should cover.
@@ -353,6 +407,11 @@ pub(crate) async fn build_plan_with(
 
     let mut bypass_routes = Vec::new();
     let mut skipped_domains = Vec::new();
+    let mut truncated_domains = Vec::new();
+    let mut unroutable_domains = Vec::new();
+    // `MAX_ROUTES` counts tunnel and bypass routes together; the tunnel
+    // routes always exist, so the bypass set gets what remains.
+    let mut capacity = MAX_ROUTES.saturating_sub(routes.len());
     for (index, destination) in config
         .parse_exclude_rules()
         .map_err(|e| e.to_string())?
@@ -364,11 +423,15 @@ pub(crate) async fn build_plan_with(
                 let gateway = gateways.for_family(cidr.addr).ok_or_else(|| {
                     format!(
                         "tun.exclude_rules[{index}]: cannot route {} directly (split tunnel): \
-                         no default gateway for this address family was discovered on this \
-                         platform; gateway discovery is implemented on Linux in this build",
+                         no default gateway for this address family was discovered",
                         cidr.text
                     )
                 })?;
+                if capacity == 0 {
+                    truncated_domains.push(cidr.text.clone());
+                    continue;
+                }
+                capacity -= 1;
                 bypass_routes.push(RouteSpec {
                     destination: Prefix {
                         addr: cidr.addr,
@@ -380,7 +443,22 @@ pub(crate) async fn build_plan_with(
             }
             SplitDestination::Domain(domain) => match resolve_domain(&domain.name).await {
                 Ok(ips) => {
+                    let mut added = 0;
+                    let mut routable_exists = false;
                     for ip in ips {
+                        // A resolved IP without a discovered gateway for its
+                        // family cannot leave through the physical network.
+                        // Skip it (and keep tunneling) rather than installing
+                        // a pointless device route.
+                        let Some(gateway) = gateways.for_family(ip) else {
+                            continue;
+                        };
+                        routable_exists = true;
+                        if capacity == 0 {
+                            break;
+                        }
+                        capacity -= 1;
+                        added += 1;
                         bypass_routes.push(RouteSpec {
                             destination: Prefix {
                                 addr: ip,
@@ -389,9 +467,16 @@ pub(crate) async fn build_plan_with(
                                     IpAddr::V6(_) => 128,
                                 },
                             },
-                            gateway: gateways.for_family(ip),
+                            gateway: Some(gateway),
                             metric: None,
                         });
+                    }
+                    if added == 0 {
+                        if routable_exists {
+                            truncated_domains.push(domain.name.clone());
+                        } else {
+                            unroutable_domains.push(domain.name.clone());
+                        }
                     }
                 }
                 Err(_reason) => {
@@ -405,6 +490,12 @@ pub(crate) async fn build_plan_with(
                 }
             },
         }
+    }
+    if !truncated_domains.is_empty() {
+        tracing::warn!(
+            count = truncated_domains.len(),
+            "split-tunnel rules exceeded the route capacity; some destinations stay tunneled"
+        );
     }
 
     let plan = TunnelPlan {
@@ -420,16 +511,53 @@ pub(crate) async fn build_plan_with(
         },
     };
     plan.validate().map_err(|e| e.to_string())?;
-    Ok((plan, PlanNotes { skipped_domains }))
+    Ok((
+        plan,
+        PlanNotes {
+            skipped_domains,
+            truncated_domains,
+            unroutable_domains,
+        },
+    ))
 }
 
-/// Build the plan with production gateway discovery and resolution.
-pub(crate) async fn build_plan(config: &TunConfig) -> Result<(TunnelPlan, PlanNotes), String> {
-    let gateways = discover_gateways().await;
-    build_plan_with(config, &gateways, &|name| {
-        Box::pin(async move { resolve_domain_default(name).await })
-    })
-    .await
+/// Resolve one domain rule, keeping the last known IPs when the resolver
+/// fails: CDN rotation or a resolver hiccup must not silently shrink the
+/// bypass set mid-tunnel (a shrinking set pushes the dropped destinations
+/// back into the tunnel — and, with a kill switch, into a hard block). A
+/// successful resolution replaces the cached entry, so rotation converges.
+async fn resolve_with_cache(
+    name: &str,
+    cache: &Mutex<HashMap<String, Vec<IpAddr>>>,
+) -> Result<Vec<IpAddr>, String> {
+    match resolve_domain_default(name).await {
+        Ok(ips) => {
+            cache.lock().await.insert(name.to_owned(), ips.clone());
+            Ok(ips)
+        }
+        Err(error) => match cache.lock().await.get(name) {
+            Some(previous) => {
+                tracing::warn!(
+                    count = previous.len(),
+                    "split-tunnel domain resolution failed; keeping the last known addresses"
+                );
+                Ok(previous.clone())
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Production resolver factory: resolves through the system resolver and
+/// keeps last-known IPs in `cache` on failure (see [`resolve_with_cache`]).
+fn cached_resolver(
+    cache: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
+) -> impl Fn(&str) -> DomainResolver<'_> + Send + Sync {
+    move |name: &str| {
+        let cache = Arc::clone(&cache);
+        let name = name.to_owned();
+        Box::pin(async move { resolve_with_cache(&name, &cache).await }) as DomainResolver<'_>
+    }
 }
 
 // --- Manager ---------------------------------------------------------------
@@ -443,6 +571,16 @@ struct Inner {
     config: RwLock<Option<TunConfig>>,
     client: Mutex<Option<TunHelperClient>>,
     heartbeat_running: AtomicBool,
+    /// Physical gateways of the current tunnel lifetime (`None` until the
+    /// first successful discovery). Cached because a re-discovery while the
+    /// tunnel is applied would resolve to the tunnel itself (the helper's
+    /// device route wins), and a resolver-style "keep last known" is the
+    /// safe direction for gateways too. Cleared on teardown.
+    gateways: RwLock<Option<Gateways>>,
+    /// Last known resolved IPs per domain exclude rule, kept across applies
+    /// so a resolver failure cannot shrink the bypass set. Shared with the
+    /// resolver closures (`Arc` so a built plan's futures can own a handle).
+    domains: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
 }
 
 /// Last helper probe outcome.
@@ -471,6 +609,8 @@ impl TunManager {
                 config: RwLock::new(None),
                 client: Mutex::new(None),
                 heartbeat_running: AtomicBool::new(false),
+                gateways: RwLock::new(None),
+                domains: Arc::new(Mutex::new(HashMap::new())),
             }),
         }
     }
@@ -564,6 +704,42 @@ impl TunManager {
         }
     }
 
+    /// Build the plan for `config` with production gateway discovery and
+    /// domain resolution (cached for the tunnel's lifetime).
+    async fn build_plan(&self, config: &TunConfig) -> Result<(TunnelPlan, PlanNotes), String> {
+        let gateways = self.physical_gateways().await;
+        let resolver = cached_resolver(Arc::clone(&self.inner.domains));
+        build_plan_with(config, &gateways, &resolver).await
+    }
+
+    /// The pre-tunnel physical gateways, discovered once per tunnel
+    /// lifetime. Cached because a re-discovery while the tunnel is applied
+    /// would resolve to the tunnel itself (the helper's device route wins
+    /// the lookup); re-applies reuse the gateways from connect time.
+    /// Cleared on teardown so the next connect discovers fresh gateways.
+    async fn physical_gateways(&self) -> Gateways {
+        let gateways = {
+            let guard = self
+                .inner
+                .gateways
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard
+        };
+        if let Some(gateways) = gateways {
+            return gateways;
+        }
+        let discovered = discover_gateways().await;
+        if discovered.v4.is_some() || discovered.v6.is_some() {
+            *self
+                .inner
+                .gateways
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(discovered);
+        }
+        discovered
+    }
+
     /// Converge the system to `config`: apply a plan when TUN is enabled,
     /// tear down when it is not. Idempotent.
     ///
@@ -586,7 +762,7 @@ impl TunManager {
             self.teardown("tun disabled in config").await;
             return Ok(());
         }
-        let (plan, notes) = match build_plan(config).await {
+        let (plan, notes) = match self.build_plan(config).await {
             Ok(plan) => plan,
             Err(message) => {
                 self.set_phase(TunPhase::Error(format!(
@@ -618,6 +794,8 @@ impl TunManager {
             kill_switch: plan.kill_switch,
             bypass_routes: bypass_count,
             skipped_domains: notes.skipped_domains,
+            truncated_domains: notes.truncated_domains,
+            unroutable_domains: notes.unroutable_domains,
         })));
         self.ensure_heartbeat();
         Ok(())
@@ -638,6 +816,14 @@ impl TunManager {
             .await;
         // Drop the connection either way; the helper cleans up its end.
         *self.inner.client.lock().await = None;
+        // The tunnel is gone: next connect re-discovers fresh physical
+        // gateways and re-resolves the domain rules.
+        *self
+            .inner
+            .gateways
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.inner.domains.lock().await.clear();
         match result {
             Ok(_generation) => tracing::info!(reason, "TUN plan torn down"),
             Err(error) => tracing::warn!(
@@ -990,7 +1176,7 @@ mod tests {
         config.exclude_rules = vec![SplitRule::new("example.com")];
         let gateways = Gateways {
             v4: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            v6: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            v6: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
         };
         let resolve = static_resolver(vec![
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),

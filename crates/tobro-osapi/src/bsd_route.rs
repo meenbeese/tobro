@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use libc::{
     EEXIST, ESRCH, PF_ROUTE, RTA_DST, RTA_GATEWAY, RTA_NETMASK, RTF_DONE, RTF_GATEWAY, RTF_HOST,
-    RTF_STATIC, RTF_UP, RTM_ADD, RTM_DELETE, RTM_VERSION, SO_RCVTIMEO, SOCK_RAW, SOL_SOCKET,
+    RTF_STATIC, RTF_UP, RTM_ADD, RTM_DELETE, RTM_GET, RTM_VERSION, SO_RCVTIMEO, SOCK_RAW,
+    SOL_SOCKET,
 };
 
 use super::{Route, RouteError};
@@ -77,12 +78,47 @@ pub fn delete_route(route: &Route) -> Result<(), RouteError> {
     }
 }
 
+/// Look up the table entry the kernel would use to reach `destination`
+/// (longest-prefix match) and return it.
+///
+/// Reading the routing table through a `PF_ROUTE` socket needs no
+/// privileges; only modifications do. The returned [`Route`] carries the
+/// destination, the gateway (`None` for on-link/interface routes), and the
+/// interface index the entry egresses through. Metrics are not reported
+/// (BSD route metrics are not ordered on this platform).
+///
+/// The lookup for the unspecified address (`0.0.0.0` / `::`) resolves the
+/// system's default route for that family.
+pub fn route_lookup(destination: IpAddr) -> Result<Option<Route>, RouteError> {
+    let mut socket = RouteSocket::open()?;
+    let pid = sender_pid();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let message = build_lookup_message(seq, pid, destination)?;
+    let reply = socket.exchange(&message, seq, pid)?;
+    parse_route_reply(&reply)
+}
+
+/// The system's default route for one family (`0.0.0.0/0` or `::/0`).
+///
+/// `None` when no default route exists (no connectivity in that family).
+pub fn default_route(ipv4: bool) -> Result<Option<Route>, RouteError> {
+    let destination = if ipv4 {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    route_lookup(destination)
+}
+
 fn send_message(kind: i32, route: &Route) -> Result<(), RouteError> {
     let mut socket = RouteSocket::open()?;
     let pid = sender_pid();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let message = build_message(kind, seq, pid, route)?;
-    socket.exchange(&message, seq, pid)
+    let reply = socket.exchange(&message, seq, pid)?;
+    let (_, _, errno) = parse_reply(&reply)
+        .ok_or_else(|| RouteError::Invalid("malformed kernel routing reply".to_owned()))?;
+    errno_result(errno)
 }
 
 /// One `PF_ROUTE` socket, opened per operation and closed on drop.
@@ -120,7 +156,9 @@ impl RouteSocket {
 
     /// Send one message and wait for the kernel's acknowledgement, matching
     /// it by pid and sequence number. Unrelated messages are skipped.
-    fn exchange(&mut self, message: &[u8], seq: i32, pid: i32) -> Result<(), RouteError> {
+    /// Returns the matched reply message (its `rtm_errno` and sockaddrs
+    /// follow the header; the caller interprets them).
+    fn exchange(&mut self, message: &[u8], seq: i32, pid: i32) -> Result<Vec<u8>, RouteError> {
         self.0.write_all(message).map_err(RouteError::Io)?;
         let mut buf = vec![0u8; REPLY_BUFFER_SIZE];
         loop {
@@ -142,11 +180,12 @@ impl RouteSocket {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(RouteError::Io(error)),
             };
-            if let Some((reply_pid, reply_seq, errno)) = parse_reply(&buf[..read])
+            if let Some((reply_pid, reply_seq, _errno)) = parse_reply(&buf[..read])
                 && reply_pid == pid
                 && reply_seq == seq
             {
-                return errno_result(errno);
+                buf.truncate(read);
+                return Ok(buf);
             }
             // Unrelated routing traffic: keep reading.
         }
@@ -215,10 +254,15 @@ pub(crate) fn build_message(
         // Route into a device: link-layer gateway carrying the interface
         // index (the kernel resolves the device).
         None => payload.extend_from_slice(&link_sockaddr(route.interface_index)),
-        // Route via a next-hop gateway IP.
+        // Route via a next-hop gateway IP. The kernel resolves the egress
+        // interface from the gateway address itself (`rtm_index` is ignored for
+        // `RTF_GATEWAY` routes), so only a link-local gateway needs the
+        // interface index, encoded as the address's scope.
         Some(gateway) => match gateway {
             IpAddr::V4(addr) => payload.extend_from_slice(&ipv4_sockaddr(addr)),
-            IpAddr::V6(addr) => payload.extend_from_slice(&ipv6_sockaddr(addr)),
+            IpAddr::V6(addr) => {
+                payload.extend_from_slice(&ipv6_sockaddr_scoped(addr, route.interface_index))
+            }
         },
     }
     // IPv4 /32 entries are host routes (`RTF_HOST`, no netmask sockaddr);
@@ -289,6 +333,17 @@ fn ipv6_sockaddr(addr: Ipv6Addr) -> [u8; 28] {
     out
 }
 
+/// Encode an IPv6 gateway as a `sockaddr_in6`. A link-local gateway only
+/// identifies an interface together with its scope, so the interface index
+/// is written into `sin6_scope_id` (a global gateway needs no scope).
+fn ipv6_sockaddr_scoped(addr: Ipv6Addr, interface_index: u32) -> [u8; 28] {
+    let mut out = ipv6_sockaddr(addr);
+    if addr.is_unicast_link_local() {
+        out[24..28].copy_from_slice(&interface_index.to_ne_bytes());
+    }
+    out
+}
+
 /// Encode an interface route gateway as a `sockaddr_dl` (20 bytes) carrying
 /// the interface index.
 fn link_sockaddr(interface_index: u32) -> [u8; 20] {
@@ -297,6 +352,173 @@ fn link_sockaddr(interface_index: u32) -> [u8; 20] {
     out[1] = AF_LINK; // sdl_family
     out[2..4].copy_from_slice(&(interface_index.min(u16::MAX as u32) as u16).to_ne_bytes());
     out
+}
+
+/// Build an `RTM_GET` lookup message: destination only, so the kernel
+/// performs an unconstrained longest-prefix match (`rtm_index` unset).
+pub(crate) fn build_lookup_message(
+    seq: i32,
+    pid: i32,
+    destination: IpAddr,
+) -> Result<Vec<u8>, RouteError> {
+    let mut payload = Vec::with_capacity(28);
+    match destination {
+        IpAddr::V4(addr) => payload.extend_from_slice(&ipv4_sockaddr(addr)),
+        IpAddr::V6(addr) => payload.extend_from_slice(&ipv6_sockaddr(addr)),
+    }
+
+    let total = HEADER_LEN + payload.len();
+    let mut message = vec![0u8; total];
+    let mut header: libc::rt_msghdr = unsafe { mem::zeroed() };
+    header.rtm_msglen = total
+        .try_into()
+        .map_err(|_| RouteError::Invalid("route message too large".to_owned()))?;
+    header.rtm_version = RTM_VERSION as u8;
+    header.rtm_type = RTM_GET
+        .try_into()
+        .map_err(|_| RouteError::Invalid("bad message type".to_owned()))?;
+    header.rtm_flags = RTF_UP;
+    header.rtm_addrs = RTA_DST;
+    header.rtm_pid = pid;
+    header.rtm_seq = seq;
+    // SAFETY: `header` contains no pointers; copying its representation into
+    // the freshly allocated message buffer is a plain byte move of exactly
+    // `size_of::<rt_msghdr>()` bytes.
+    unsafe {
+        let header_bytes =
+            std::slice::from_raw_parts(std::ptr::addr_of!(header).cast::<u8>(), HEADER_LEN);
+        message[..HEADER_LEN].copy_from_slice(header_bytes);
+    }
+    message[HEADER_LEN..].copy_from_slice(&payload);
+    Ok(message)
+}
+
+/// Parse an `RTM_GET` reply into the table entry it describes. `None` when
+/// the kernel answered `ESRCH` (no matching entry).
+pub(crate) fn parse_route_reply(buf: &[u8]) -> Result<Option<Route>, RouteError> {
+    if buf.len() < HEADER_LEN {
+        return Err(RouteError::Invalid("routing reply too short".to_owned()));
+    }
+    // SAFETY: the buffer holds at least `size_of::<rt_msghdr>()` initialized
+    // bytes and `rt_msghdr` contains no pointers, so any bit pattern is valid.
+    let header: libc::rt_msghdr =
+        unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<libc::rt_msghdr>()) };
+    if header.rtm_version != RTM_VERSION as u8 {
+        return Err(RouteError::Invalid(
+            "unknown routing reply version".to_owned(),
+        ));
+    }
+    if header.rtm_errno == ESRCH {
+        return Ok(None);
+    }
+    if header.rtm_errno != 0 {
+        return Err(RouteError::Io(io::Error::from_raw_os_error(
+            header.rtm_errno,
+        )));
+    }
+
+    // Sockaddrs follow the header in `RTA_*` bit order (DST=1, GATEWAY=2,
+    // NETMASK=4, ... BRD=0x80); each is 4-byte aligned per `sa_len`.
+    let mut offset = HEADER_LEN;
+    let mut destination = None;
+    let mut gateway = None;
+    let mut netmask = None;
+    let mut bit = 1u32;
+    while bit <= 0x80 {
+        if header.rtm_addrs & (bit as i32) != 0 {
+            if offset >= buf.len() {
+                return Err(RouteError::Invalid("truncated routing reply".to_owned()));
+            }
+            let sa_len = usize::from(buf[offset]);
+            let size = sockaddr_size(sa_len);
+            if offset + sa_len > buf.len() {
+                return Err(RouteError::Invalid("truncated routing reply".to_owned()));
+            }
+            let sockaddr = &buf[offset..offset + sa_len];
+            match bit {
+                1 => destination = parse_sockaddr(sockaddr),
+                2 => gateway = parse_sockaddr(sockaddr),
+                4 => netmask = netmask_prefix_len(sockaddr),
+                _ => {}
+            }
+            offset += size;
+        }
+        bit <<= 1;
+    }
+
+    let destination = destination
+        .ok_or_else(|| RouteError::Invalid("routing reply carries no destination".to_owned()))?;
+    // A link-layer gateway (or no gateway at all) is an on-link route into
+    // the reply's interface.
+    let prefix_len = netmask.unwrap_or(match destination {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    });
+    Ok(Some(Route {
+        destination,
+        prefix_len,
+        gateway,
+        interface_index: u32::from(header.rtm_index),
+        metric: None,
+    }))
+}
+
+/// Padded on-wire size of a sockaddr with `sa_len`: 4-byte aligned, zero
+/// length occupies one `u32` slot (xnu's `ROUNDUP` with `sizeof(u32)`).
+fn sockaddr_size(sa_len: usize) -> usize {
+    if sa_len == 0 { 4 } else { (sa_len + 3) & !3 }
+}
+
+/// Parse an IP sockaddr (`sockaddr_in`/`sockaddr_in6` bytes). `None` for
+/// link-layer or foreign addresses (they mean an on-link route).
+fn parse_sockaddr(sockaddr: &[u8]) -> Option<IpAddr> {
+    if sockaddr.len() < 8 {
+        return None;
+    }
+    match sockaddr[1] {
+        AF_INET => Some(IpAddr::V4(Ipv4Addr::new(
+            sockaddr[4],
+            sockaddr[5],
+            sockaddr[6],
+            sockaddr[7],
+        ))),
+        AF_INET6 if sockaddr.len() >= 24 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&sockaddr[8..24]);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// Prefix length encoded by a netmask sockaddr (contiguous leading ones).
+/// `None` for foreign or non-contiguous masks.
+fn netmask_prefix_len(sockaddr: &[u8]) -> Option<u8> {
+    if sockaddr.len() < 8 {
+        return None;
+    }
+    match sockaddr[1] {
+        AF_INET => {
+            let mask = u32::from_be_bytes(sockaddr[4..8].try_into().ok()?);
+            contiguous_prefix_len(u128::from(mask) << 96, 32)
+        }
+        AF_INET6 if sockaddr.len() >= 24 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&sockaddr[8..24]);
+            contiguous_prefix_len(u128::from_be_bytes(octets), 128)
+        }
+        _ => None,
+    }
+}
+
+/// Prefix length of a contiguous leading-ones mask of `bits` width.
+fn contiguous_prefix_len(mask: u128, bits: u32) -> Option<u8> {
+    let ones = mask.leading_ones();
+    if ones <= bits && mask.count_ones() == ones {
+        Some(ones as u8)
+    } else {
+        None
+    }
 }
 
 /// The netmask of `prefix_len` for IPv4.
@@ -488,5 +710,146 @@ mod tests {
         let mut foreign = vec![0u8; HEADER_LEN];
         foreign[2] = 99; // unknown rtm_version
         assert!(parse_reply(&foreign).is_none());
+    }
+
+    #[test]
+    fn lookup_message_is_a_destination_only_rtm_get() {
+        let message =
+            build_lookup_message(5, 99, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))).expect("build");
+        assert_eq!(message[2], RTM_VERSION as u8);
+        assert_eq!(message[3], RTM_GET as u8);
+        assert_eq!(header_addrs(&message), RTA_DST);
+        // rtm_flags (offset 8) carries exactly RTF_UP.
+        assert_eq!(header_flags(&message), RTF_UP);
+        // rtm_index (offset 4..6) is unconstrained.
+        assert_eq!(
+            u16::from_ne_bytes(message[4..6].try_into().expect("bounds")),
+            0
+        );
+        // DST (16 bytes) is the only sockaddr.
+        assert_eq!(payload(&message).len(), 16);
+        let (pid, seq, errno) = parse_reply(&message).expect("parses back");
+        assert_eq!((pid, seq, errno), (99, 5, 0));
+    }
+
+    /// Build a synthetic `RTM_GET` reply: header plus sockaddrs in `RTA_*`
+    /// bit order.
+    fn lookup_reply(rtm_index: u16, errno: i32, sockaddrs: &[(i32, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0..2].copy_from_slice(&(HEADER_LEN as u16).to_ne_bytes());
+        buf[2] = RTM_VERSION as u8;
+        buf[3] = RTM_GET as u8;
+        buf[4..6].copy_from_slice(&rtm_index.to_ne_bytes());
+        buf[12..16].copy_from_slice(
+            &sockaddrs
+                .iter()
+                .fold(0i32, |acc, (bit, _)| acc | bit)
+                .to_ne_bytes(),
+        );
+        buf[24..28].copy_from_slice(&errno.to_ne_bytes());
+        for (_bit, sockaddr) in sockaddrs {
+            buf.extend_from_slice(sockaddr);
+            let pad = sockaddr.len().div_ceil(4) * 4 - sockaddr.len();
+            buf.extend(std::iter::repeat_n(0u8, pad));
+        }
+        let total = buf.len() as u16;
+        buf[0..2].copy_from_slice(&total.to_ne_bytes());
+        buf
+    }
+
+    #[test]
+    fn parse_route_reply_reads_the_default_v4_route() {
+        let dst = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+        let gateway = ipv4_sockaddr(Ipv4Addr::new(192, 168, 1, 1));
+        let mask = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED); // 0.0.0.0 => /0
+        let reply = lookup_reply(
+            11,
+            0,
+            &[
+                (RTA_DST, dst.to_vec()),
+                (RTA_GATEWAY, gateway.to_vec()),
+                (RTA_NETMASK, mask.to_vec()),
+            ],
+        );
+        let route = parse_route_reply(&reply).expect("parse").expect("a route");
+        assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(route.prefix_len, 0);
+        assert_eq!(
+            route.gateway,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+        assert_eq!(route.interface_index, 11);
+    }
+
+    #[test]
+    fn parse_route_reply_reads_link_gateways_as_on_link() {
+        let dst = ipv6_sockaddr(Ipv6Addr::UNSPECIFIED);
+        let link = link_sockaddr(7);
+        let mask = ipv6_sockaddr(Ipv6Addr::UNSPECIFIED);
+        let reply = lookup_reply(
+            7,
+            0,
+            &[
+                (RTA_DST, dst.to_vec()),
+                (RTA_GATEWAY, link.to_vec()),
+                (RTA_NETMASK, mask.to_vec()),
+            ],
+        );
+        let route = parse_route_reply(&reply).expect("parse").expect("a route");
+        assert_eq!(route.destination, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(route.gateway, None);
+        assert_eq!(route.interface_index, 7);
+    }
+
+    #[test]
+    fn parse_route_reply_maps_esrch_to_none() {
+        let dst = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+        let reply = lookup_reply(0, ESRCH, &[(RTA_DST, dst.to_vec())]);
+        assert_eq!(parse_route_reply(&reply).expect("parse"), None);
+    }
+
+    #[test]
+    fn ipv6_link_local_gateways_carry_their_scope() {
+        let scoped = ipv6_sockaddr_scoped(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 12);
+        assert_eq!(
+            &scoped[8..24],
+            &[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            u32::from_ne_bytes(scoped[24..28].try_into().expect("bounds")),
+            12
+        );
+        // A global gateway stays unscoped.
+        let global = ipv6_sockaddr_scoped(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 12);
+        assert!(global[24..28].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn netmasks_decode_to_prefix_lengths() {
+        assert_eq!(
+            netmask_prefix_len(&ipv4_sockaddr(prefix_mask_v4(24))),
+            Some(24)
+        );
+        assert_eq!(
+            netmask_prefix_len(&ipv4_sockaddr(prefix_mask_v4(0))),
+            Some(0)
+        );
+        assert_eq!(
+            netmask_prefix_len(&ipv6_sockaddr(prefix_mask_v6(64))),
+            Some(64)
+        );
+        // A non-contiguous mask is refused.
+        assert_eq!(
+            netmask_prefix_len(&ipv4_sockaddr(Ipv4Addr::new(255, 0, 255, 0))),
+            None
+        );
+    }
+
+    #[test]
+    fn truncated_replies_are_rejected() {
+        let dst = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+        let reply = lookup_reply(0, 0, &[(RTA_DST, dst.to_vec())]);
+        assert!(parse_route_reply(&reply[..reply.len() - 1]).is_err());
+        assert!(parse_route_reply(&reply[..HEADER_LEN + 2]).is_err());
     }
 }

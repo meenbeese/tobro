@@ -7901,6 +7901,7 @@ dependencies = [
  "tempfile",
  "tobro-config",
  "tobro-ipc",
+ "tobro-osapi",
  "tobro-store",
  "tobro-tor",
  "tobro-tun",
