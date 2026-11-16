@@ -47,6 +47,10 @@ pub mod pf;
 #[cfg(target_os = "macos")]
 pub mod sc_dns;
 
+/// Unix uid/gid lookups and socket ownership for the helper install (M7).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod unix_ids;
+
 /// Windows Filtering Platform (WFP) kill-switch enforcement (M7 T4c).
 #[cfg(target_os = "windows")]
 pub mod wfp;

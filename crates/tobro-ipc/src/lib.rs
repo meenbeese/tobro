@@ -101,6 +101,13 @@ pub mod methods {
 
     /// TUN mode and privileged-helper status (no params, no secrets).
     pub const TUN_STATUS: &str = "tun.status";
+    /// Install the privileged TUN helper (elevated; prompts for administrator
+    /// rights). No params; may block until the user answers the OS prompt.
+    pub const TUN_HELPER_INSTALL: &str = "tun.helper.install";
+    /// Stop, deregister, and remove the privileged TUN helper, restoring
+    /// routes/DNS first (elevated; prompts for administrator rights). No
+    /// params; may block until the user answers the OS prompt.
+    pub const TUN_HELPER_UNINSTALL: &str = "tun.helper.uninstall";
 
     /// List hosted onion services.
     pub const ONION_LIST: &str = "onion.list";
@@ -161,6 +168,8 @@ pub fn is_allowed_method(method: &str) -> bool {
             | methods::KINDNESS_CHECK
             | methods::KINDNESS_RESET_STATS
             | methods::TUN_STATUS
+            | methods::TUN_HELPER_INSTALL
+            | methods::TUN_HELPER_UNINSTALL
             | methods::ONION_LIST
             | methods::ONION_CREATE
             | methods::ONION_UPDATE
@@ -192,6 +201,8 @@ pub fn validate_params(method: &str, params: &Option<Value>) -> Result<(), RpcEr
         | methods::KINDNESS_CHECK
         | methods::KINDNESS_RESET_STATS
         | methods::TUN_STATUS
+        | methods::TUN_HELPER_INSTALL
+        | methods::TUN_HELPER_UNINSTALL
         | methods::ONION_LIST
         | methods::CLIENT_AUTH_LIST => validate_no_params(method, params),
         methods::LOGS => {

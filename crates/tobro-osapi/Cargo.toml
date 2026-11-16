@@ -15,6 +15,10 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 system-configuration = { workspace = true }
 
+# Linux: uid/gid lookups and socket-activation fd checks (`unix_ids`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 # Windows routing table FFI (iphlpapi CreateIpForwardEntry2/DeleteIpForwardEntry2)
 # and kill-switch FFI (Windows Filtering Platform / fwpuclnt).
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -17,6 +17,7 @@ fn main() -> ExitCode {
     init_logging();
     let endpoint = args
         .socket
+        .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default_endpoint()));
     let runtime = match tokio::runtime::Runtime::new() {
@@ -26,14 +27,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let exit = runtime.block_on(run(endpoint, args.idle_exit_secs));
+    let exit = runtime.block_on(run(endpoint, &args));
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     exit
 }
 
 /// Bind and serve until shutdown or the idle window expires.
-async fn run(endpoint: PathBuf, idle_secs: u64) -> ExitCode {
-    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+async fn run(endpoint: PathBuf, args: &Args) -> ExitCode {
+    let idle =
+        (args.idle_exit_secs > 0).then(|| std::time::Duration::from_secs(args.idle_exit_secs));
     let platform = match new_active_platform() {
         Ok(platform) => platform,
         Err(error) => {
@@ -43,7 +45,7 @@ async fn run(endpoint: PathBuf, idle_secs: u64) -> ExitCode {
     };
     let mut service = HelperService::new(platform);
 
-    let exit = serve(endpoint, &mut service, idle).await;
+    let exit = serve(endpoint, &mut service, args, idle).await;
     match exit {
         ServeExit::ShutdownSignal => {
             tracing::info!("shutting down on termination signal");
@@ -63,16 +65,18 @@ async fn run(endpoint: PathBuf, idle_secs: u64) -> ExitCode {
 /// Platform-specific bind + serve. Unix binds here (so startup failures are
 /// reported before the loop starts); Windows binds inside the loop because
 /// each pipe instance is consumed by a served client.
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn serve(
     endpoint: PathBuf,
     service: &mut HelperService<ActivePlatform>,
+    args: &Args,
     idle: Option<std::time::Duration>,
 ) -> ServeExit {
-    let listener = match tobro_tun::bind_listener(&endpoint).await {
-        Ok(listener) => listener,
-        Err(error) => return ServeExit::BindError(error.to_string()),
-    };
+    let listener =
+        match tobro_helper::prepare_listener(&endpoint, args.socket_group.as_deref()).await {
+            Ok(listener) => listener,
+            Err(error) => return ServeExit::BindError(error.to_string()),
+        };
     tracing::info!("listening on {}", endpoint.display());
     let exit = tobro_helper::serve_unix(listener, service, idle).await;
     // Best-effort socket cleanup; a stale file is also handled by the next
@@ -85,6 +89,7 @@ async fn serve(
 async fn serve(
     endpoint: PathBuf,
     service: &mut HelperService<ActivePlatform>,
+    _args: &Args,
     idle: Option<std::time::Duration>,
 ) -> ServeExit {
     tracing::info!("listening on {endpoint:?}");

@@ -97,8 +97,29 @@ enum Command {
         #[command(subcommand)]
         command: ClientAuthCommand,
     },
+    /// Install, remove, or inspect the privileged TUN helper.
+    ///
+    /// Install/uninstall run one OS privilege prompt (polkit / administrator
+    /// / UAC) and may block until the prompt is answered (bounded by the
+    /// daemon at 5 minutes). Uninstall restores routes and DNS first.
+    Helper {
+        #[command(subcommand)]
+        command: HelperCommand,
+    },
     /// Stream IPC notifications as JSON lines until Ctrl-C.
     Watch,
+}
+
+#[derive(Debug, Subcommand)]
+enum HelperCommand {
+    /// Install the helper into its privileged location and register it with
+    /// the OS service manager (elevated; shows a privilege prompt).
+    Install,
+    /// Stop, deregister, and remove the helper; any applied routes/DNS state
+    /// is restored first (elevated; shows a privilege prompt).
+    Uninstall,
+    /// Report the (non-elevated) install status; never prompts.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -692,6 +713,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Command::Start { .. } => unreachable!("handled before the IPC connection"),
+        Command::Helper { command } => match command {
+            HelperCommand::Install => {
+                eprintln!("asking the OS for administrator rights to install the helper…");
+                let result = client
+                    .call(tobro_ipc::methods::TUN_HELPER_INSTALL, None)
+                    .await?;
+                print_json(&result)?;
+            }
+            HelperCommand::Uninstall => {
+                eprintln!("asking the OS for administrator rights to remove the helper…");
+                let result = client
+                    .call(tobro_ipc::methods::TUN_HELPER_UNINSTALL, None)
+                    .await?;
+                print_json(&result)?;
+            }
+            HelperCommand::Status => {
+                let status = client.call(tobro_ipc::methods::TUN_STATUS, None).await?;
+                match status.get("helper_install") {
+                    Some(helper) => print_json(helper)?,
+                    None => print_json(&status)?,
+                }
+            }
+        },
         Command::Watch => watch(&mut client).await?,
     }
 

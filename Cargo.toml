@@ -13,6 +13,7 @@ resolver = "3"
 members = [
     "crates/tobro-config",
     "crates/tobro-helper",
+    "crates/tobro-install",
     "crates/tobro-ipc",
     "crates/tobro-osapi",
     "crates/tobro-store",
@@ -97,6 +98,8 @@ igd-next = { version = "0.18", default-features = false, features = ["io_sync"] 
 # --- TUN mode (M7 T4) -----------------------------------------------------
 # `tobro-osapi` is the only crate allowed `unsafe` (see its lib.rs docs).
 tobro-osapi = { path = "crates/tobro-osapi" }
+# Privileged-helper installer/uninstaller (M7: installer integration).
+tobro-install = { path = "crates/tobro-install" }
 # Linux backend: `tun2` creates the TUN device (safe ioctl wrapper, the
 # workspace forbids unsafe code); `rtnetlink` configures addressing, MTU,
 # link state, and routes via netlink so the helper never shells out (§10.5).

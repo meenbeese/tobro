@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 aes-gcm = "0.10"
 tobro-config = { path = "../tobro-config" }
+tobro-install = { workspace = true }
 tobro-ipc = { path = "../tobro-ipc" }
 tobro-osapi = { path = "../tobro-osapi" }
 tobro-store = { path = "../tobro-store" }

@@ -21,8 +21,9 @@
 //!   driven in tests (against the mock helper). The wiring and semantics are
 //!   complete; flipping the activation gate is a one-line config change once
 //!   the engine exists.
-//! - Helper installation and privilege prompts are the installer task; the
-//!   manager only talks to an already-running helper endpoint.
+//! - Helper installation and privilege prompts are the installer task
+//!   ([`crate::tun_install`] / the `tun.helper.*` IPC methods); the manager
+//!   only talks to an already-running helper endpoint.
 //! - Fail-closed kill-switch enforcement for a *dead helper* is the helper's
 //!   own exit path (idle window/shutdown teardown); a dead daemon is covered
 //!   by the same helper-side cleanup. The manager's job is to notice the
@@ -991,7 +992,25 @@ async fn connect_and_handshake(
 /// optional SHA-256 pin. The daemon never spawns the helper; installation
 /// and privilege prompts are the installer's job.
 fn helper_binary_status(config: Option<&TunConfig>) -> Option<HelperBinaryStatus> {
-    let config = config?;
+    let path = locate_helper_binary(config?)?;
+    let sha256_matches = config
+        .and_then(|c| c.helper_sha256_hex.as_ref())
+        .map(|expected| {
+            sha256_file_hex(&path)
+                .map(|actual| actual == *expected)
+                .unwrap_or(false)
+        });
+    Some(HelperBinaryStatus {
+        path: path.display().to_string(),
+        sha256_matches,
+    })
+}
+
+/// Locate the `tobro-helper` binary the way the daemon would look for it:
+/// config override, then sidecar/app-bundle locations. Shared with the
+/// installer (`tun_install`), which installs that binary into its privileged
+/// location.
+pub(crate) fn locate_helper_binary(config: &TunConfig) -> Option<PathBuf> {
     let mut search_dirs = Vec::new();
     if let Some(dir) = config.helper_dir.as_deref() {
         search_dirs.push(PathBuf::from(dir));
@@ -1004,7 +1023,7 @@ fn helper_binary_status(config: Option<&TunConfig>) -> Option<HelperBinaryStatus
         search_dirs.push(dir.join("../Resources"));
         search_dirs.push(dir.join("../Resources/binaries"));
     }
-    let located = crate::pt_supervisor::locate(&crate::pt_supervisor::LocateOptions {
+    crate::pt_supervisor::locate(&crate::pt_supervisor::LocateOptions {
         explicit_path: config.helper_path.as_ref().map(PathBuf::from),
         search_dirs,
         names: vec![
@@ -1012,16 +1031,8 @@ fn helper_binary_status(config: Option<&TunConfig>) -> Option<HelperBinaryStatus
             std::ffi::OsString::from("tobro-helper.exe"),
         ],
     })
-    .ok()?;
-    let sha256_matches = config.helper_sha256_hex.as_ref().map(|expected| {
-        sha256_file_hex(&located.path)
-            .map(|actual| actual == *expected)
-            .unwrap_or(false)
-    });
-    Some(HelperBinaryStatus {
-        path: located.path.display().to_string(),
-        sha256_matches,
-    })
+    .ok()
+    .map(|located| located.path)
 }
 
 /// SHA-256 of a file as lowercase hex; `None` when unreadable.

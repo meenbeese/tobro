@@ -20,6 +20,7 @@ pub(crate) mod redact;
 pub(crate) mod regional_policy;
 mod spike;
 mod supervisor;
+mod tun_install;
 mod tun_manager;
 
 use std::path::{Path, PathBuf};

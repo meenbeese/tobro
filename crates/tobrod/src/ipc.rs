@@ -250,6 +250,15 @@ pub trait DaemonControl: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// TUN mode and privileged-helper status (`tun.status`).
     fn tun_status(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Install the privileged TUN helper (elevated; prompts for
+    /// administrator rights). Long-running: the user must answer the OS
+    /// privilege prompt.
+    fn tun_helper_install(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
+    /// Stop, deregister, and remove the privileged TUN helper, restoring
+    /// routes/DNS first (elevated; prompts for administrator rights).
+    fn tun_helper_uninstall(
+        &self,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// List hosted onion services.
     fn onion_list(&self) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
     /// Create a hosted onion service.
@@ -1504,13 +1513,36 @@ impl DaemonControl for SupervisorControl {
 
     async fn tun_status(&self) -> Result<serde_json::Value, String> {
         Ok(match &self.tun {
-            Some(tun) => tun.status().to_json(),
+            Some(tun) => {
+                let mut value = tun.status().to_json();
+                // Merge the non-elevated installer status (which needs the
+                // config for source/pin); a broken config leaves the manager
+                // fields intact and skips the install block.
+                if let Ok(config) = tobro_config::Config::load_or_default(&self.config_path) {
+                    value["helper_install"] = crate::tun_install::status(&config.tun);
+                }
+                value
+            }
             None => json!({
                 "state": "unavailable",
                 "engine_available": false,
                 "note": "TUN wiring is not attached to this control context",
             }),
         })
+    }
+
+    async fn tun_helper_install(&self) -> Result<serde_json::Value, String> {
+        let Some(tun) = &self.tun else {
+            return Err("TUN wiring is not attached to this control context".to_owned());
+        };
+        crate::tun_install::install(&self.config_path, tun).await
+    }
+
+    async fn tun_helper_uninstall(&self) -> Result<serde_json::Value, String> {
+        let Some(tun) = &self.tun else {
+            return Err("TUN wiring is not attached to this control context".to_owned());
+        };
+        crate::tun_install::uninstall(&self.config_path, tun).await
     }
 
     async fn kindness_check(&self) -> Result<serde_json::Value, String> {
@@ -1744,6 +1776,14 @@ impl DaemonControl for SupervisorHandle {
             "engine_available": false,
             "note": "TUN status requires the full daemon supervisor context",
         }))
+    }
+
+    async fn tun_helper_install(&self) -> Result<serde_json::Value, String> {
+        Err("helper installation requires the full daemon supervisor context".to_owned())
+    }
+
+    async fn tun_helper_uninstall(&self) -> Result<serde_json::Value, String> {
+        Err("helper uninstallation requires the full daemon supervisor context".to_owned())
     }
 
     async fn onion_list(&self) -> Result<serde_json::Value, String> {
@@ -2278,6 +2318,23 @@ pub async fn dispatch_daemon<C: DaemonControl>(
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("tun.status failed: {e}"))),
         },
+        methods::TUN_HELPER_INSTALL => match control.tun_helper_install().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(
+                id,
+                RpcError::internal(format!("tun.helper.install failed: {}", redact_secrets(&e))),
+            ),
+        },
+        methods::TUN_HELPER_UNINSTALL => match control.tun_helper_uninstall().await {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(e) => RpcResponse::error(
+                id,
+                RpcError::internal(format!(
+                    "tun.helper.uninstall failed: {}",
+                    redact_secrets(&e)
+                )),
+            ),
+        },
         methods::ONION_LIST => match control.onion_list().await {
             Ok(value) => RpcResponse::success(id, value),
             Err(e) => RpcResponse::error(id, RpcError::internal(format!("onion.list failed: {e}"))),
@@ -2586,6 +2643,14 @@ mod daemon_tests {
 
         async fn tun_status(&self) -> Result<serde_json::Value, String> {
             Ok(json!({ "ok": true, "state": "disabled", "engine_available": false }))
+        }
+
+        async fn tun_helper_install(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "tun.helper.install", "actions": ["binary"] }))
+        }
+
+        async fn tun_helper_uninstall(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "ok": true, "action": "tun.helper.uninstall", "actions": [] }))
         }
 
         async fn onion_list(&self) -> Result<serde_json::Value, String> {

@@ -7778,6 +7778,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobro-install"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tobro-ipc"
 version = "0.0.0"
 dependencies = [
@@ -7900,6 +7911,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tobro-config",
+ "tobro-install",
  "tobro-ipc",
  "tobro-osapi",
  "tobro-store",

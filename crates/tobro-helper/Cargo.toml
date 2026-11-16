@@ -20,8 +20,11 @@ thiserror = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux TUN backend (T4a): device creation + netlink configuration.
+# `tobro-osapi` supplies uid/gid lookups and the socket-activation listener
+# used by the installed systemd units (`unix_ids`).
 tun2 = { workspace = true }
 rtnetlink = { workspace = true }
+tobro-osapi = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS TUN backend (T4b): utun device + SystemConfiguration DNS. Route
