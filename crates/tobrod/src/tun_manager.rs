@@ -5,8 +5,9 @@
 //!
 //! - Builds a validated [`TunnelPlan`] from the daemon's `[tun]` config:
 //!   tunnel device, default routes into the device, DNS interception
-//!   addresses, kill-switch policy, and split-tunnel bypass routes
-//!   (CIDR rules directly; domain rules resolved to IP prefixes first).
+//!   addresses, kill-switch policy, UDP policy, split-tunnel bypass routes
+//!   (CIDR rules directly; domain rules resolved to IP prefixes first), and
+//!   the loopback [`TunEndpoints`] the helper's routing engine forwards to.
 //! - Owns the single lock-step connection to the helper: connect + handshake
 //!   on demand, apply, converge on config changes, periodic heartbeat,
 //!   teardown on disconnect/shutdown.
@@ -15,12 +16,6 @@
 //!
 //! # What it deliberately does not do (yet)
 //!
-//! - The TUN routing engine (`tun2proxy`: TCP forwarding, DNS interception,
-//!   UDP policy) is a separate M7 task. Until it lands, `tun.enabled` is
-//!   rejected by config validation, so [`TunManager::apply`] can only be
-//!   driven in tests (against the mock helper). The wiring and semantics are
-//!   complete; flipping the activation gate is a one-line config change once
-//!   the engine exists.
 //! - Helper installation and privilege prompts are the installer task
 //!   ([`crate::tun_install`] / the `tun.helper.*` IPC methods); the manager
 //!   only talks to an already-running helper endpoint.
@@ -30,17 +25,17 @@
 //!   loss (heartbeat) and record it.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::json;
-use tobro_config::{KillSwitchPolicy, SplitDestination, TunConfig};
+use tobro_config::{KillSwitchPolicy, ProxyConfig, SplitDestination, TunConfig};
 use tobro_tun::{
-    DnsConfig, HelperError, HelperInfo, KillSwitchMode, MAX_ROUTES, Prefix, RouteSpec, TunDevice,
-    TunHelperClient, TunnelPlan,
+    DnsConfig, Forwarding, HelperError, HelperInfo, KillSwitchMode, MAX_ROUTES, Prefix, RouteSpec,
+    TunDevice, TunHelperClient, TunnelPlan, UdpPolicy,
 };
 // The tunnel's own addressing lives with the protocol (single source of
 // truth); the daemon re-exports it for consumers of this module.
@@ -53,12 +48,42 @@ use crate::supervisor::SupervisorEvent;
 // --- Tunnel addressing -----------------------------------------------------
 
 /// System resolver target for IPv4 while the tunnel is up: the address the
-/// routing engine will answer DNS on (interception; forwarded to the
+/// helper's routing engine intercepts DNS on (the reply is forwarded to the
 /// daemon's local DNS port). Never a loopback address (the helper rejects
 /// pointing the system resolver at loopback).
 pub const TUNNEL_DNS_V4: Ipv4Addr = Ipv4Addr::new(10, 111, 222, 254);
 /// IPv6 counterpart of [`TUNNEL_DNS_V4`].
 pub const TUNNEL_DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfd6b, 0x626f, 0x6272, 0x6f, 0, 0, 0, 2);
+
+/// The daemon's loopback listeners the helper's routing engine forwards the
+/// tunnel's traffic to.
+///
+/// The helper never reaches the network itself: TCP flows leave through the
+/// daemon's SOCKS5 listener (and so through Tor), and intercepted DNS goes to
+/// the daemon's local resolver. Both are loopback addresses, which the plan
+/// validates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunEndpoints {
+    /// The daemon's SOCKS5 listener (`proxy.socks_port` on loopback).
+    pub socks: SocketAddr,
+    /// The daemon's local DNS resolver (`proxy.dns_port` on loopback).
+    pub dns: SocketAddr,
+}
+
+impl TunEndpoints {
+    /// The endpoints implied by `[proxy]`.
+    ///
+    /// Both listeners always accept loopback connections, whether they bind
+    /// loopback-only (the default) or all interfaces (`bind_all_interfaces`,
+    /// an explicit opt-in for other devices): the engine targets loopback
+    /// either way.
+    pub fn from_proxy(proxy: &ProxyConfig) -> Self {
+        Self {
+            socks: SocketAddr::from((Ipv4Addr::LOCALHOST, proxy.socks_port)),
+            dns: SocketAddr::from((Ipv4Addr::LOCALHOST, proxy.dns_port)),
+        }
+    }
+}
 
 /// How often the heartbeat pings the helper while a plan is applied.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -69,8 +94,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq)]
 pub enum TunPhase {
     /// `tun.enabled = false` (or nothing applied yet): nothing privileged
-    /// has been requested. This is the only reachable phase in production
-    /// builds until the routing engine lands.
+    /// has been requested.
     Disabled,
     /// TUN was requested but no plan is currently applied (e.g. after a
     /// teardown).
@@ -138,8 +162,8 @@ pub struct TunStatus {
     pub helper: Option<HelperInfo>,
     /// Located helper binary (when a `[tun]` config has been observed).
     pub helper_binary: Option<HelperBinaryStatus>,
-    /// False until the TUN routing engine lands (M7). While false, config
-    /// validation rejects `tun.enabled` and nothing privileged runs.
+    /// Whether this build carries the TUN routing engine. Always true now
+    /// that the helper owns it (M7); kept in the status shape for clients.
     pub engine_available: bool,
 }
 
@@ -172,13 +196,6 @@ impl TunStatus {
             "error": match &self.phase {
                 TunPhase::Error(message) => Some(message.clone()),
                 _ => None,
-            },
-            "note": if self.engine_available {
-                None
-            } else {
-                Some(
-                    "the TUN routing engine is not implemented in this build; tun.enabled is rejected by config validation until it lands (planned in milestone M7)",
-                )
             },
         })
     }
@@ -363,8 +380,8 @@ async fn resolve_domain_default(name: &str) -> Result<Vec<IpAddr>, String> {
     Ok(ips)
 }
 
-/// Build the [`TunnelPlan`] for `config`, with injectable gateway knowledge
-/// and domain resolution (tests).
+/// Build the [`TunnelPlan`] for `config`, with injectable gateway knowledge,
+/// forwarding endpoints, and domain resolution (tests).
 ///
 /// Fails when a CIDR exclude rule has no matching-family gateway: silently
 /// tunneling a destination the user asked to bypass is the worse failure.
@@ -374,6 +391,7 @@ async fn resolve_domain_default(name: &str) -> Result<Vec<IpAddr>, String> {
 pub(crate) async fn build_plan_with(
     config: &TunConfig,
     gateways: &Gateways,
+    endpoints: TunEndpoints,
     resolve_domain: &(dyn Fn(&str) -> DomainResolver<'_> + Send + Sync),
 ) -> Result<(TunnelPlan, PlanNotes), String> {
     let v4_prefix = Prefix::parse(TUNNEL_PREFIX_V4).map_err(|error| error.to_string())?;
@@ -510,6 +528,16 @@ pub(crate) async fn build_plan_with(
             KillSwitchPolicy::Restore => KillSwitchMode::Restore,
             KillSwitchPolicy::Block => KillSwitchMode::Block,
         },
+        udp_policy: match config.udp_policy {
+            tobro_config::UdpPolicy::DnsOnly => UdpPolicy::DnsOnly,
+            tobro_config::UdpPolicy::BlockAll => UdpPolicy::BlockAll,
+        },
+        // The helper's engine forwards to the daemon's loopback listeners.
+        // A DNS target only exists when DNS is actually intercepted.
+        forwarding: Some(Forwarding {
+            socks: endpoints.socks,
+            dns: (config.udp_policy == tobro_config::UdpPolicy::DnsOnly).then_some(endpoints.dns),
+        }),
     };
     plan.validate().map_err(|e| e.to_string())?;
     Ok((
@@ -582,6 +610,9 @@ struct Inner {
     /// so a resolver failure cannot shrink the bypass set. Shared with the
     /// resolver closures (`Arc` so a built plan's futures can own a handle).
     domains: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
+    /// The daemon's loopback listeners, stored so a re-apply (helper
+    /// restart, heartbeat recovery) builds the same forwarding targets.
+    endpoints: RwLock<Option<TunEndpoints>>,
 }
 
 /// Last helper probe outcome.
@@ -612,6 +643,7 @@ impl TunManager {
                 heartbeat_running: AtomicBool::new(false),
                 gateways: RwLock::new(None),
                 domains: Arc::new(Mutex::new(HashMap::new())),
+                endpoints: RwLock::new(None),
             }),
         }
     }
@@ -661,6 +693,22 @@ impl TunManager {
             .clone()
     }
 
+    fn store_endpoints(&self, endpoints: TunEndpoints) {
+        *self
+            .inner
+            .endpoints
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(endpoints);
+    }
+
+    fn stored_endpoints(&self) -> Option<TunEndpoints> {
+        *self
+            .inner
+            .endpoints
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Current status snapshot (no I/O except the helper-binary lookup when
     /// a config has been observed).
     pub fn status(&self) -> TunStatus {
@@ -678,7 +726,7 @@ impl TunManager {
             helper_reachable: probe.reachable,
             helper: probe.info,
             helper_binary: helper_binary_status(config.as_ref()),
-            engine_available: false,
+            engine_available: true,
         }
     }
 
@@ -706,11 +754,15 @@ impl TunManager {
     }
 
     /// Build the plan for `config` with production gateway discovery and
-    /// domain resolution (cached for the tunnel's lifetime).
+    /// domain resolution (cached for the tunnel's lifetime), forwarding to
+    /// the stored daemon endpoints.
     async fn build_plan(&self, config: &TunConfig) -> Result<(TunnelPlan, PlanNotes), String> {
+        let endpoints = self.stored_endpoints().ok_or_else(|| {
+            "no forwarding endpoints were provided; the helper has nothing to forward to".to_owned()
+        })?;
         let gateways = self.physical_gateways().await;
         let resolver = cached_resolver(Arc::clone(&self.inner.domains));
-        build_plan_with(config, &gateways, &resolver).await
+        build_plan_with(config, &gateways, endpoints, &resolver).await
     }
 
     /// The pre-tunnel physical gateways, discovered once per tunnel
@@ -744,21 +796,20 @@ impl TunManager {
     /// Converge the system to `config`: apply a plan when TUN is enabled,
     /// tear down when it is not. Idempotent.
     ///
-    /// # Errors
-    ///
-    /// Plan building or the helper rejected the request. The previous plan
-    /// (if any) stays applied — the helper keeps system state converged to
-    /// what it last accepted, which is never half of a new plan.
-    /// Converge the TUN wiring to `config`. Idempotent: apply a plan when
-    /// TUN is enabled, tear down when it is not.
+    /// `endpoints` are the daemon's loopback listeners the helper's routing
+    /// engine forwards to; they are stored so a later re-apply reuses them.
     ///
     /// # Errors
     ///
-    /// Plan building or the helper rejected the request. The previous plan
-    /// (if any) stays applied — the helper keeps system state converged to
-    /// what it last accepted, which is never half of a new plan.
-    pub async fn apply(&self, config: &TunConfig) -> Result<(), String> {
+    /// Plan building or the helper rejected the request. A rejected apply
+    /// leaves no half-configured state: the helper rolls back to a torn-down
+    /// system (the device is recreated per apply, so a failed convergence
+    /// cannot keep the previous plan either), and the phase reports the
+    /// error. A later apply (config change, Tor restart, or supervisor
+    /// retry) converges again.
+    pub async fn apply(&self, config: &TunConfig, endpoints: TunEndpoints) -> Result<(), String> {
         self.store_config(config.clone());
+        self.store_endpoints(endpoints);
         if !config.is_active() {
             self.teardown("tun disabled in config").await;
             return Ok(());
@@ -841,10 +892,13 @@ impl TunManager {
         let Some(config) = self.stored_config() else {
             return;
         };
+        let Some(endpoints) = self.stored_endpoints() else {
+            return;
+        };
         if !config.is_active() || matches!(self.phase(), TunPhase::Active(_) | TunPhase::Disabled) {
             return;
         }
-        if let Err(error) = self.apply(&config).await {
+        if let Err(error) = self.apply(&config, endpoints).await {
             tracing::warn!(%error, "TUN re-apply failed");
         }
     }
@@ -1096,6 +1150,11 @@ mod tests {
         |_| Box::pin(async { Err("resolver disabled in test".to_owned()) }) as DomainResolver<'_>
     }
 
+    /// Fixed loopback endpoints (the daemon's default listener ports).
+    fn endpoints() -> TunEndpoints {
+        TunEndpoints::from_proxy(&ProxyConfig::default())
+    }
+
     fn static_resolver(addresses: Vec<IpAddr>) -> impl Fn(&str) -> DomainResolver<'_> {
         move |_| {
             let addresses = addresses.clone();
@@ -1107,9 +1166,10 @@ mod tests {
     async fn plan_builds_the_default_tunnel_state() {
         let mut config = enabled_config();
         config.udp_policy = UdpPolicy::BlockAll;
-        let (plan, notes) = build_plan_with(&config, &Gateways::default(), &no_resolver())
-            .await
-            .expect("default plan must build");
+        let (plan, notes) =
+            build_plan_with(&config, &Gateways::default(), endpoints(), &no_resolver())
+                .await
+                .expect("default plan must build");
 
         assert_eq!(plan.device.name, "");
         assert_eq!(plan.device.mtu, tobro_config::DEFAULT_TUN_MTU);
@@ -1136,16 +1196,25 @@ mod tests {
         assert_eq!(plan.kill_switch, KillSwitchMode::Restore);
         assert!(plan.bypass_routes.is_empty());
         assert!(notes.skipped_domains.is_empty());
+        // BlockAll: the engine forwards TCP but relays no DNS.
+        assert_eq!(plan.udp_policy, tobro_tun::UdpPolicy::BlockAll);
+        let forwarding = plan.forwarding.expect("the plan must carry forwarding");
+        assert_eq!(forwarding.socks, endpoints().socks);
+        assert!(forwarding.dns.is_none());
     }
 
     #[tokio::test]
     async fn plan_maps_the_block_kill_switch_policy() {
         let mut config = enabled_config();
         config.kill_switch = KillSwitchPolicy::Block;
-        let (plan, _) = build_plan_with(&config, &Gateways::default(), &no_resolver())
+        let (plan, _) = build_plan_with(&config, &Gateways::default(), endpoints(), &no_resolver())
             .await
             .expect("plan must build");
         assert_eq!(plan.kill_switch, KillSwitchMode::Block);
+        // DnsOnly: the engine relays intercepted DNS to the daemon's resolver.
+        assert_eq!(plan.udp_policy, tobro_tun::UdpPolicy::DnsOnly);
+        let forwarding = plan.forwarding.expect("the plan must carry forwarding");
+        assert_eq!(forwarding.dns, Some(endpoints().dns));
     }
 
     #[tokio::test]
@@ -1159,7 +1228,7 @@ mod tests {
             v4: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
             v6: Some(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
         };
-        let (plan, notes) = build_plan_with(&config, &gateways, &no_resolver())
+        let (plan, notes) = build_plan_with(&config, &gateways, endpoints(), &no_resolver())
             .await
             .expect("plan must build");
         assert_eq!(plan.bypass_routes.len(), 2);
@@ -1174,7 +1243,7 @@ mod tests {
     async fn cidr_rules_fail_without_a_discovered_gateway() {
         let mut config = enabled_config();
         config.exclude_rules = vec![SplitRule::new("192.0.2.0/24")];
-        let error = build_plan_with(&config, &Gateways::default(), &no_resolver())
+        let error = build_plan_with(&config, &Gateways::default(), endpoints(), &no_resolver())
             .await
             .expect_err("no gateway: must fail instead of tunneling the rule");
         assert!(error.contains("tun.exclude_rules[0]"), "{error}");
@@ -1193,7 +1262,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         ]);
-        let (plan, notes) = build_plan_with(&config, &gateways, &resolve)
+        let (plan, notes) = build_plan_with(&config, &gateways, endpoints(), &resolve)
             .await
             .expect("plan must build");
         assert_eq!(plan.bypass_routes.len(), 2);
@@ -1219,7 +1288,7 @@ mod tests {
             v4: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
             v6: None,
         };
-        let (plan, notes) = build_plan_with(&config, &gateways, &no_resolver())
+        let (plan, notes) = build_plan_with(&config, &gateways, endpoints(), &no_resolver())
             .await
             .expect("domain rules must not block the plan");
         assert!(plan.bypass_routes.is_empty());
@@ -1248,14 +1317,17 @@ mod tests {
 
         // A disabled config never touches the helper.
         manager
-            .apply(&disabled_config())
+            .apply(&disabled_config(), endpoints())
             .await
             .expect("disabled is a no-op");
         assert_eq!(manager.status().phase, TunPhase::Disabled);
         assert_eq!(helper.state().lock().unwrap().handshakes, 0);
 
         // Applying an enabled config applies the plan.
-        manager.apply(&enabled_config()).await.expect("apply");
+        manager
+            .apply(&enabled_config(), endpoints())
+            .await
+            .expect("apply");
         let status = manager.status();
         let TunPhase::Active(active) = &status.phase else {
             panic!("expected an active phase, got {:?}", status.phase);
@@ -1303,7 +1375,7 @@ mod tests {
 
         let manager = manager_for(&dir);
         let error = manager
-            .apply(&enabled_config())
+            .apply(&enabled_config(), endpoints())
             .await
             .expect_err("rejected plan must fail");
         assert!(
@@ -1324,7 +1396,10 @@ mod tests {
         let (dir, helper) = mock_helper().await;
         let path = dir.path().join("helper.sock");
         let manager = manager_for(&dir);
-        manager.apply(&enabled_config()).await.expect("apply");
+        manager
+            .apply(&enabled_config(), endpoints())
+            .await
+            .expect("apply");
 
         // Restart the helper: the daemon's connection dies and the new
         // helper starts with no plan applied.
@@ -1371,12 +1446,12 @@ mod tests {
     }
 
     #[test]
-    fn status_json_carries_phase_and_note() {
+    fn status_json_carries_phase_and_engine_availability() {
         let manager = TunManager::with_default_endpoint();
         let json = manager.status().to_json();
         assert_eq!(json["state"], "disabled");
-        assert_eq!(json["engine_available"], false);
-        assert!(json["note"].is_string());
+        assert_eq!(json["engine_available"], true);
+        assert!(json.get("note").is_none());
         assert_eq!(json["helper_reachable"], serde_json::Value::Null);
     }
 

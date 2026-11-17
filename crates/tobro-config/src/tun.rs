@@ -1,13 +1,14 @@
 //! TUN mode configuration (M7, plan §4.7).
 //!
 //! System-wide routing without leaks: a privileged helper creates a TUN
-//! device, routes and DNS are configured, and TCP traffic is forwarded
-//! through the Tor proxy. This module ships the **schema** ahead of the
-//! engine so UI/IPC/config plumbing can be validated early:
+//! device, routes and DNS are configured, and traffic is forwarded through
+//! the Tor proxy (TCP via the daemon's SOCKS5 listener, DNS interception via
+//! its local resolver).
 //!
-//! - [`TunConfig::enabled`] is rejected by [`TunConfig::validate`] until the
-//!   privileged helper and TUN routing engine are implemented (planned in
-//!   milestone M7), so enabling it can never be silently ignored.
+//! - [`TunConfig::enabled`] opts in to system-wide routing. Enabling it
+//!   requires the privileged helper and its routing engine; without them the
+//!   daemon's `tun.apply` fails loudly rather than silently ignoring the
+//!   setting.
 //! - Split tunneling is destination-based only (CIDR prefixes and domain
 //!   suffixes). Per-app routing is out of scope on desktop: app identity is
 //!   unreliable (plan F-17).
@@ -308,9 +309,9 @@ fn parse_domain(text: &str) -> Result<SplitDomain, String> {
 /// TUN mode configuration (M7, plan §4.7).
 ///
 /// Defaults to fully disabled; TUN mode is an explicit opt-in that requires
-/// the privileged helper (`tobro-helper`) and the TUN routing engine, which
-/// are not implemented in this build yet (planned in milestone M7), so
-/// [`TunConfig::enabled`] is rejected by [`TunConfig::validate`] until then.
+/// the privileged helper (`tobro-helper`) with its routing engine. Enabling it
+/// is allowed by validation, and a missing helper or engine fails loudly at
+/// apply time instead of being silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TunConfig {
@@ -362,8 +363,7 @@ impl Default for TunConfig {
 }
 
 impl TunConfig {
-    /// True when TUN mode is requested (still gated by `validate` in this
-    /// build until the M7 engine lands).
+    /// True when TUN mode is requested.
     pub fn is_active(&self) -> bool {
         self.enabled
     }
@@ -440,12 +440,6 @@ impl TunConfig {
                 )));
             }
         }
-        if self.enabled {
-            return Err(ConfigError::Invalid(
-                "tun.enabled is not implemented in this build (planned in milestone M7): system-wide routing requires the privileged helper and the TUN routing engine. Keep tun.enabled = false; all other tun.* fields already validate."
-                    .to_owned(),
-            ));
-        }
         Ok(())
     }
 
@@ -487,19 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn tun_enabled_is_gated_until_the_engine_exists() {
+    fn tun_can_be_enabled() {
         let mut config = Config::default();
         config.tun.enabled = true;
-        let err = config
+        config
             .validate()
-            .expect_err("enabled TUN must be rejected in this build");
-        let message = match err {
-            ConfigError::Invalid(message) => message,
-            other => panic!("unexpected error: {other:?}"),
-        };
-        assert!(message.contains("tun.enabled"), "{message}");
-        assert!(message.contains("not implemented"), "{message}");
-        assert!(message.contains("M7"), "{message}");
+            .expect("enabling TUN must validate: the engine exists");
+        assert!(config.tun.is_active());
+        assert!(config.tun.summary().starts_with("tun"));
     }
 
     #[test]
@@ -737,9 +726,7 @@ destination = "*.internal.example.org"
         config.tun.udp_policy = UdpPolicy::BlockAll;
         config.tun.kill_switch = KillSwitchPolicy::Block;
         config.tun.validate().expect("policies must validate");
-        // The summary of a disabled TUN says "off"; enabling shows the knobs
-        // (enabled=true is still gated by validate until the engine exists,
-        // but the summary itself must describe the requested behavior).
+        // The summary of a disabled TUN says "off"; enabling shows the knobs.
         config.tun.enabled = true;
         assert!(config.tun.summary().contains("BlockAll"));
         assert!(config.tun.summary().contains("Block"));

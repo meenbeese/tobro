@@ -416,6 +416,8 @@ mod unix_tests {
                 servers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
             },
             kill_switch: KillSwitchMode::Block,
+            udp_policy: tobro_tun::UdpPolicy::default(),
+            forwarding: None,
         }
     }
 

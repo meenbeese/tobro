@@ -452,7 +452,7 @@ Phase 1 (1.0): **proxy mode**.
 Phase 2 (post-1.0, opt-in): **TUN mode**.
 
 - A privileged helper (`tobro-helper`) creates a TUN device and configures routes/DNS; the unprivileged daemon speaks a narrow local protocol to it.
-- `tun2proxy` (userspace TCP/IP via `netstack-smoltcp`) forwards TCP; UDP handling is scoped (DNS first, QUIC best-effort/blocked with explanation).
+- The helper carries the routing engine (`netstack-smoltcp`): TCP flows are terminated locally and dialed through the daemon's loopback SOCKS5 listener (so all payloads leave via Tor); DNS on port 53 is intercepted and relayed to the daemon's local resolver; other UDP is dropped. The helper never talks to the network itself.
 - Split tunneling by destination CIDR/domain, not by app (desktop app identity is unreliable). Browser profiles remain the recommended per-app isolation mechanism.
 - Kill switch: if the helper or Tor dies, remove routes and block traffic (fail closed) until the user disables the mode.
 - Platform privileges:
@@ -1476,6 +1476,7 @@ Measurement: CI benchmarks on fixed runners for regressions; manual baseline on 
 | 2026-11-07 | WCAG 2.2 AA + top-10 locales at 1.0 | Accessibility and reach are release criteria | Accepted |
 | 2026-11-07 | GPL-3.0-only license | Chosen by project owner; copyleft, matches Orbot's licensing | Accepted |
 | 2026-11-13 | Localization deferred to post-1.0 | Descoped from M7/1.0 to focus on TUN mode and release hardening | Accepted |
+| 2026-11-16 | TUN routing engine runs inside the privileged helper | The helper already owns the TUN device; the engine only connects to the daemon's loopback SOCKS5/DNS listeners, so the daemon stays unprivileged and the helper never becomes a general-purpose proxy | Accepted |
 
 ---
 

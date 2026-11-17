@@ -8,9 +8,11 @@
 
 use tobro_tun::{
     HelperRequest, HelperResponse, HelperStatus, KillSwitchMode, PROTOCOL_VERSION, TunnelPlan,
+    reject_codes,
 };
 
-use crate::platform::{Platform, PlatformError};
+use crate::engine::{EngineConfig, EngineHandle};
+use crate::platform::{CreatedDevice, Platform, PlatformError};
 
 /// The helper's state machine + dispatch. Generic over the privileged
 /// backend so tests can drive it with a recording platform.
@@ -18,6 +20,8 @@ pub struct HelperService<P: Platform> {
     platform: P,
     state: HelperStatus,
     last_plan: Option<TunnelPlan>,
+    /// The routing engine, when one is running (or a device is parked).
+    engine: Option<EngineHandle>,
 }
 
 impl<P: Platform> std::fmt::Debug for HelperService<P> {
@@ -28,6 +32,7 @@ impl<P: Platform> std::fmt::Debug for HelperService<P> {
             .field("platform", &std::any::type_name::<P>())
             .field("state", &self.state)
             .field("last_plan_applied", &self.last_plan.is_some())
+            .field("engine_running", &self.engine.is_some())
             .finish()
     }
 }
@@ -39,6 +44,7 @@ impl<P: Platform> HelperService<P> {
             platform,
             state: HelperStatus::default(),
             last_plan: None,
+            engine: None,
         }
     }
 
@@ -105,10 +111,16 @@ impl<P: Platform> HelperService<P> {
             };
         }
 
-        let interface = match self.platform.create_device(&plan.device).await {
-            Ok(interface) => interface,
+        // Stop the previous engine before touching the system: it owns the
+        // previous device, and closing that device (interface included) is
+        // what lets the platform create a fresh one under the same name.
+        self.stop_engine().await;
+
+        let created = match self.platform.create_device(&plan.device).await {
+            Ok(created) => created,
             Err(error) => return self.reject(error).await,
         };
+        let interface = created.interface.clone();
         if let Err(error) = self
             .platform
             .apply_routes(&interface, &plan.routes, &plan.bypass_routes)
@@ -125,6 +137,11 @@ impl<P: Platform> HelperService<P> {
             .await
         {
             return self.reject(error).await;
+        }
+        // The engine consumes the device; on failure the device is dropped
+        // and the rollback below tears the system back down.
+        if let Err(error) = self.start_engine(created, &plan) {
+            return self.reject_engine(error).await;
         }
 
         self.state.generation += 1;
@@ -143,6 +160,43 @@ impl<P: Platform> HelperService<P> {
         }
     }
 
+    /// Hand the device's packet I/O to the routing engine.
+    ///
+    /// A plan without forwarding still keeps the device: it is parked, so the
+    /// interface stays up and every packet is dropped (fail closed) instead
+    /// of escaping unproxied.
+    fn start_engine(
+        &mut self,
+        created: CreatedDevice,
+        plan: &TunnelPlan,
+    ) -> Result<(), std::io::Error> {
+        let Some(packet_io) = created.packet_io else {
+            // Test backends return no packet I/O; nothing can be forwarded.
+            tracing::warn!("apply_plan: the platform returned no packet I/O; traffic is dropped");
+            return Ok(());
+        };
+        let engine = match plan.forwarding {
+            Some(forwarding) => EngineHandle::spawn(
+                packet_io,
+                EngineConfig {
+                    forwarding,
+                    udp_policy: plan.udp_policy,
+                    mtu: plan.device.mtu,
+                },
+            )?,
+            None => EngineHandle::park(packet_io),
+        };
+        self.engine = Some(engine);
+        Ok(())
+    }
+
+    /// Stop the routing engine and wait until its device is closed.
+    async fn stop_engine(&mut self) {
+        if let Some(engine) = self.engine.take() {
+            engine.stop().await;
+        }
+    }
+
     /// A privileged step failed: roll back everything best-effort so the
     /// system is not left half-configured, then report the failure.
     async fn reject(&mut self, error: PlatformError) -> HelperResponse {
@@ -154,12 +208,26 @@ impl<P: Platform> HelperService<P> {
         }
     }
 
+    /// The engine could not start (not a platform failure: the plan was fine,
+    /// the helper could not honor it). Roll back and report an internal error.
+    async fn reject_engine(&mut self, error: std::io::Error) -> HelperResponse {
+        tracing::warn!("apply_plan: the routing engine failed to start: {error}; rolling back");
+        self.rollback().await;
+        HelperResponse::Rejected {
+            code: reject_codes::INTERNAL,
+            message: format!("could not start the routing engine: {error}"),
+        }
+    }
+
     /// Best-effort teardown after a partial apply. The helper never leaves
     /// a device, routes, DNS, or a kill switch behind on failure.
     async fn rollback(&mut self) {
         if let Err(error) = self.platform.teardown().await {
             tracing::warn!("rollback failed: {error} (system may need manual cleanup)");
         }
+        // The device (and its interface) goes last, after the platform has
+        // undone everything it can still see.
+        self.stop_engine().await;
         self.state.generation += 1;
         self.state.active = false;
         self.state.interface = None;
@@ -173,6 +241,9 @@ impl<P: Platform> HelperService<P> {
         tracing::info!("request: teardown");
         match self.platform.teardown().await {
             Ok(()) => {
+                // Routes and DNS are gone; now close the device (and with it
+                // the interface) by stopping the engine.
+                self.stop_engine().await;
                 self.state.generation += 1;
                 self.state.active = false;
                 self.state.interface = None;
@@ -200,7 +271,7 @@ impl<P: Platform> HelperService<P> {
 /// logs).
 fn plan_summary(plan: &TunnelPlan) -> String {
     format!(
-        "device(name_set={}, addresses={}, mtu={}), routes={}, bypass_routes={}, dns_servers={}, kill_switch={:?}",
+        "device(name_set={}, addresses={}, mtu={}), routes={}, bypass_routes={}, dns_servers={}, kill_switch={:?}, udp={:?}, forwarding={}",
         !plan.device.name.is_empty(),
         plan.device.addresses.len(),
         plan.device.mtu,
@@ -208,6 +279,12 @@ fn plan_summary(plan: &TunnelPlan) -> String {
         plan.bypass_routes.len(),
         plan.dns.servers.len(),
         plan.kill_switch,
+        plan.udp_policy,
+        if plan.forwarding.is_some() {
+            "set"
+        } else {
+            "none"
+        },
     )
 }
 
@@ -243,9 +320,14 @@ mod tests {
 
     #[async_trait]
     impl Platform for RecordingPlatform {
-        async fn create_device(&self, _device: &TunDevice) -> Result<String, PlatformError> {
+        async fn create_device(&self, _device: &TunDevice) -> Result<CreatedDevice, PlatformError> {
             self.calls.lock().unwrap().push("create_device".to_owned());
-            Ok("tobro0".to_owned())
+            // No packet I/O: the service skips the routing engine (its own
+            // tests drive a real netstack over an in-memory link).
+            Ok(CreatedDevice {
+                interface: "tobro0".to_owned(),
+                packet_io: None,
+            })
         }
 
         async fn apply_routes(
@@ -307,6 +389,11 @@ mod tests {
                 servers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
             },
             kill_switch: KillSwitchMode::Block,
+            udp_policy: tobro_tun::UdpPolicy::DnsOnly,
+            forwarding: Some(tobro_tun::Forwarding {
+                socks: "127.0.0.1:9050".parse().expect("valid SOCKS address"),
+                dns: Some("127.0.0.1:9053".parse().expect("valid DNS address")),
+            }),
         }
     }
 
@@ -464,9 +551,12 @@ mod tests {
         let summary = plan_summary(&plan());
         assert!(!summary.contains("10.111"), "{summary}");
         assert!(!summary.contains("9.9.9.9"), "{summary}");
+        assert!(!summary.contains("127.0.0.1"), "{summary}");
         assert!(summary.contains("routes=1"), "{summary}");
         assert!(summary.contains("dns_servers=1"), "{summary}");
         assert!(summary.contains("mtu=1500"), "{summary}");
+        assert!(summary.contains("forwarding=set"), "{summary}");
+        assert!(summary.contains("udp=DnsOnly"), "{summary}");
     }
 
     #[tokio::test]

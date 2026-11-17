@@ -35,10 +35,10 @@ use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::route::{
     RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
-use rtnetlink::{AddressMessageBuilder, Handle, LinkUnspec, RouteMessageBuilder};
+use rtnetlink::{AddressMessageBuilder, Handle, RouteMessageBuilder};
 use tobro_tun::{DEFAULT_INTERFACE_NAME, DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
 
-use crate::platform::{Platform, PlatformError};
+use crate::platform::{CreatedDevice, Platform, PlatformError};
 
 /// System resolver configuration managed while the tunnel is up.
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
@@ -173,10 +173,13 @@ fn render_resolv_conf(servers: &[IpAddr]) -> String {
 }
 
 /// Device-scoped helper state: everything `teardown` must undo.
+///
+/// The device handle itself is *not* stored here: the routing engine owns it
+/// (the service starts/stops the engine around device creation), so this is
+/// only the bookkeeping the OS does not clean up by itself.
 struct DeviceState {
     name: String,
     index: u32,
-    device: tun2::AsyncDevice,
     /// Routes the helper installed (tunnel + bypass), for convergence and
     /// removal. Bypass routes carry their gateway; device routes do not.
     installed_routes: Vec<RouteSpec>,
@@ -470,76 +473,76 @@ fn read_dns_backup() -> Result<Option<String>, PlatformError> {
 
 #[async_trait]
 impl Platform for LinuxPlatform {
-    async fn create_device(&self, device: &TunDevice) -> Result<String, PlatformError> {
+    async fn create_device(&self, device: &TunDevice) -> Result<CreatedDevice, PlatformError> {
         let name = effective_name(device);
         let mut guard = self.state.lock().await;
 
-        // A plan that changes the interface resets the device-scoped state;
-        // the DNS backup is carried over so teardown can still restore it.
-        let mut carried_dns_backup: Option<Option<String>> = None;
-        if let Some(existing) = guard.take() {
-            if existing.name == name {
-                *guard = Some(existing);
-            } else {
-                carried_dns_backup = existing.dns_backup.clone();
-                tracing::info!(
-                    "device changed: removing {} tracked route(s) from the previous device",
-                    existing.tracked_route_count()
-                );
-                self.remove_tracked_routes(&existing).await;
-                drop(existing.device);
+        // The previous device is already closed (the service stops the
+        // engine, which owns packet I/O, before converging to a new plan):
+        // its interface and device routes went away with it. Bypass routes,
+        // though, are pinned to the physical link and outlive it, so remove
+        // the ones the previous plan installed. Carry the state the kernel
+        // does not clean up — the resolver backup and the kill-switch
+        // insurance routes (blackholes have no output interface and outlive
+        // a device).
+        let (carried_dns_backup, carried_blackholes) = match guard.as_mut() {
+            Some(state) => {
+                let mut removed = 0usize;
+                for spec in state
+                    .installed_routes
+                    .iter()
+                    .filter(|spec| spec.gateway.is_some())
+                {
+                    let oif = self.resolve_gateway_oif(spec).await.unwrap_or(None);
+                    let message = route_message(spec, state.index, oif);
+                    match self.handle.route().del(message).execute().await {
+                        Ok(()) => removed += 1,
+                        Err(error) => {
+                            tracing::warn!("could not remove a stale bypass route: {error}");
+                        }
+                    }
+                }
+                if removed > 0 {
+                    tracing::info!("create_device: removed {removed} stale bypass route(s)");
+                }
+                (state.dns_backup.clone(), state.blackholes.clone())
             }
-        }
+            None => (None, Vec::new()),
+        };
 
-        let device_exists = guard.is_some();
-        if !device_exists {
-            tracing::info!(
-                "creating the TUN device (name_set={}, addresses={}, mtu={})",
-                !device.name.is_empty(),
-                device.addresses.len(),
-                device.mtu
-            );
-            // No address/netmask here: addressing is applied via netlink.
-            let mut config = tun2::Configuration::default();
-            config.tun_name(&name).mtu(device.mtu).up();
-            let tun = tun2::create_as_async(&config).map_err(|error| {
-                PlatformError::Device(format!("could not create the TUN device: {error}"))
-            })?;
+        tracing::info!(
+            "creating the TUN device (name_set={}, addresses={}, mtu={})",
+            !device.name.is_empty(),
+            device.addresses.len(),
+            device.mtu
+        );
+        // No address/netmask here: addressing is applied via netlink.
+        let mut config = tun2::Configuration::default();
+        config.tun_name(&name).mtu(device.mtu).up();
+        let tun = tun2::create_as_async(&config).map_err(|error| {
+            PlatformError::Device(format!("could not create the TUN device: {error}"))
+        })?;
 
-            let index = self.link_index(&name).await?;
-            *guard = Some(DeviceState {
-                name: name.clone(),
-                index,
-                device: tun,
-                installed_routes: Vec::new(),
-                blackholes: Vec::new(),
-                tun_default_metric: None,
-                dns_backup: carried_dns_backup,
-            });
-        }
+        let index = self.link_index(&name).await?;
+        *guard = Some(DeviceState {
+            name: name.clone(),
+            index,
+            installed_routes: Vec::new(),
+            blackholes: carried_blackholes,
+            tun_default_metric: None,
+            dns_backup: carried_dns_backup,
+        });
 
-        // Converge device configuration (also on reuse: a changed plan may
-        // adjust MTU or addresses). MTU and link state go in one RTM_NEWLINK.
         let state = guard
             .as_mut()
             .ok_or_else(|| PlatformError::Device("internal: device state missing".to_owned()))?;
-        self.handle
-            .link()
-            .change(
-                LinkUnspec::new_with_index(state.index)
-                    .mtu(u32::from(device.mtu))
-                    .up()
-                    .build(),
-            )
-            .execute()
-            .await
-            .map_err(|error| {
-                PlatformError::Device(format!("could not set the MTU/link state: {error}"))
-            })?;
         self.converge_addresses(state.index, &device.addresses)
             .await?;
 
-        Ok(name)
+        Ok(CreatedDevice {
+            interface: name,
+            packet_io: Some(tun),
+        })
     }
 
     async fn apply_routes(
@@ -662,6 +665,12 @@ impl Platform for LinuxPlatform {
                     );
                     return Ok(());
                 };
+                // A re-apply may carry insurance from a previous plan whose
+                // default route had a different metric: replace the tracked
+                // set instead of accumulating routes at stale metrics.
+                if !state.blackholes.is_empty() {
+                    self.remove_tracked_routes_for_blackholes(state).await;
+                }
                 let metric = blackhole_metric(Some(tun_metric));
                 let mut blackholes = Vec::with_capacity(2);
                 for ipv4 in [true, false] {
@@ -702,9 +711,9 @@ impl Platform for LinuxPlatform {
         let tracked = state.tracked_route_count();
         let removed = self.remove_tracked_routes(&state).await;
         Self::restore_dns(&mut state);
-        // Dropping the device closes it; the kernel then removes the
-        // interface and its device routes.
-        drop(state.device);
+        // The device itself is closed by the service (it stops the routing
+        // engine after this teardown); the kernel then removes the interface
+        // and its device routes.
         tracing::info!(
             "teardown: done ({tracked} tracked route(s), {removed} removed successfully)"
         );
@@ -884,8 +893,9 @@ mod linux_integration {
             }],
             mtu: 1400,
         };
-        let name = platform.create_device(&device).await.expect("create");
-        assert_eq!(name, "tobro-test");
+        let created = platform.create_device(&device).await.expect("create");
+        assert_eq!(created.interface, "tobro-test");
+        let name = created.interface.clone();
 
         let default_route = RouteSpec {
             destination: Prefix {

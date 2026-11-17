@@ -31,8 +31,9 @@
 //!
 //! # Status
 //!
-//! Protocol only in this milestone: the helper binary itself, the platform
-//! TUN backends, and the routing engine land in the following M7 tasks.
+//! The protocol, the helper binary, the platform TUN backends, and the
+//! routing engine (M7) are all in place; the engine itself lives in
+//! `tobro-helper` and consumes the plan's forwarding configuration.
 
 mod client;
 mod codec;
@@ -44,11 +45,11 @@ pub use client::{AppliedPlan, HelperInfo, TunHelperClient};
 pub use codec::HelperCodec;
 pub use mock::{MockHelper, MockReply, MockResponder, MockState};
 pub use protocol::{
-    DEFAULT_INTERFACE_NAME, DEFAULT_TUN_MTU, DnsConfig, HelperMessage, HelperRequest,
+    DEFAULT_INTERFACE_NAME, DEFAULT_TUN_MTU, DnsConfig, Forwarding, HelperMessage, HelperRequest,
     HelperResponse, HelperStatus, KillSwitchMode, MAX_DEVICE_ADDRESSES, MAX_DNS_SERVERS,
     MAX_INTERFACE_NAME_LEN, MAX_ROUTES, MAX_TUN_MTU, MIN_TUN_MTU, PROTOCOL_VERSION, Prefix,
-    RouteSpec, TUNNEL_PREFIX_V4, TUNNEL_PREFIX_V6, TunDevice, TunnelPlan, is_usable_dns_server,
-    reject_codes, validate_interface_name,
+    RouteSpec, TUNNEL_PREFIX_V4, TUNNEL_PREFIX_V6, TunDevice, TunnelPlan, UdpPolicy,
+    is_usable_dns_server, reject_codes, validate_interface_name,
 };
 pub use transport::{HelperStream, bind_listener, default_endpoint, open_stream};
 
@@ -136,6 +137,11 @@ mod tests {
                 servers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
             },
             kill_switch: KillSwitchMode::Block,
+            udp_policy: UdpPolicy::DnsOnly,
+            forwarding: Some(Forwarding {
+                socks: "127.0.0.1:9050".parse().expect("valid SOCKS address"),
+                dns: Some("127.0.0.1:9053".parse().expect("valid DNS address")),
+            }),
         }
     }
 
@@ -287,10 +293,8 @@ mod tests {
         let error = client.handshake().await.expect_err("must mismatch");
         assert!(matches!(
             error,
-            HelperError::IncompatibleVersion {
-                helper: 2,
-                client: 1
-            }
+            HelperError::IncompatibleVersion { helper, client }
+                if helper == PROTOCOL_VERSION + 1 && client == PROTOCOL_VERSION
         ));
         helper.shutdown().await;
         Ok(())

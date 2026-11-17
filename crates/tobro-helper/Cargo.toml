@@ -9,34 +9,37 @@ publish.workspace = true
 [dependencies]
 tobro-tun = { path = "../tobro-tun" }
 
-async-trait = { workspace = true }
-clap = { workspace = true }
+# TUN routing engine (M7): the userspace netstack (`netstack-smoltcp`) and
+# the `tun2` device wrapper it is fed from run on every platform because the
+# engine is platform-independent (the privileged backends differ only in how
+# the device is created).
 futures = { workspace = true }
+netstack-smoltcp = { workspace = true }
+tun2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux TUN backend (T4a): device creation + netlink configuration.
 # `tobro-osapi` supplies uid/gid lookups and the socket-activation listener
 # used by the installed systemd units (`unix_ids`).
-tun2 = { workspace = true }
 rtnetlink = { workspace = true }
 tobro-osapi = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS TUN backend (T4b): utun device + SystemConfiguration DNS. Route
 # manipulation goes through the audited FFI in `tobro-osapi`.
-tun2 = { workspace = true }
 tobro-osapi = { workspace = true }
 system-configuration = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows TUN backend (T4c): wintun device via tun2; adapter management
 # (index/DNS/MTU/delete) via wintun-bindings; routes via `tobro-osapi`.
-tun2 = { workspace = true }
 tobro-osapi = { workspace = true }
 wintun-bindings = { workspace = true }
 

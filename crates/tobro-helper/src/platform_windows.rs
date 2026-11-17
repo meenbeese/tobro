@@ -5,9 +5,9 @@
 //!
 //! - The device is a wintun adapter created through `tun2`; addressing and
 //!   MTU are set at creation (tun2 calls `set_network_addresses_tuple` with
-//!   our address + netmask and no gateway). Like macOS, a changed address on
-//!   a reused device is refused with a teardown-first error; MTU is
-//!   converged via the adapter.
+//!   our address + netmask and no gateway). Every apply gets a fresh adapter:
+//!   the service stops the routing engine (which owns the device) first, and
+//!   closing the last wintun handle removes the adapter.
 //! - The adapter index and DNS settings are managed through
 //!   `wintun-bindings` by re-opening the adapter by name (DNS set on our own
 //!   adapter is cleaned up automatically when the adapter is deleted, so no
@@ -35,7 +35,7 @@ use tobro_tun::{DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
 use tun2::AbstractDevice;
 use wintun_bindings::Wintun;
 
-use crate::platform::{Platform, PlatformError};
+use crate::platform::{CreatedDevice, Platform, PlatformError};
 
 /// Derive the netmask for an IPv4 prefix length (tun2 expects a mask IP).
 fn prefix_mask(prefix_len: u8) -> Ipv4Addr {
@@ -133,22 +133,24 @@ fn route_row_index(
 }
 
 /// Device-scoped helper state: everything `teardown` must undo.
+///
+/// The device handle itself is *not* stored here: the routing engine owns it
+/// (the service starts/stops the engine around device creation).
 struct DeviceState {
     /// The adapter's friendly name ("tobro" unless the plan names one).
     name: String,
     /// The adapter's Win32 interface index.
     index: u32,
-    device: tun2::AsyncDevice,
     /// The loaded wintun driver library (re-opening the adapter needs it).
     wintun: Wintun,
-    /// The IPv4 address configured at creation.
-    applied_address: Prefix,
     /// The physical adapters' indices per family (resolved at creation).
     physical: PhysicalAdapters,
     /// Routes the helper installed (tunnel + bypass), for convergence.
     installed_routes: Vec<RouteSpec>,
     /// Whether WFP kill-switch filters are currently installed (the filters
     /// themselves are key-based, so only the presence bit is tracked).
+    /// Carried across device recreation: the filters outlive the adapter and
+    /// must be removed by a later apply/teardown.
     kill_switch: bool,
 }
 
@@ -211,106 +213,121 @@ impl WindowsPlatform {
 
 #[async_trait]
 impl Platform for WindowsPlatform {
-    async fn create_device(&self, device: &TunDevice) -> Result<String, PlatformError> {
+    async fn create_device(&self, device: &TunDevice) -> Result<CreatedDevice, PlatformError> {
         let mut guard = self.state.lock().await;
 
-        // A reused device is kept as-is (address/MTU converge below where
-        // the OS allows it).
-        if guard.is_none() {
-            let name = if device.name.is_empty() {
-                "tobro".to_owned()
-            } else {
-                device.name.clone()
-            };
-            let wintun_path = tobro_osapi::win_route::default_wintun_path();
-            let wintun = tokio::task::spawn_blocking(move || {
-                tobro_osapi::win_route::load_wintun(wintun_path.as_os_str())
-            })
-            .await
-            .map_err(|error| PlatformError::Device(format!("driver load task failed: {error}")))?
-            .map_err(|error| {
-                PlatformError::Device(format!(
-                    "could not load the wintun driver from beside the helper binary: {error}"
-                ))
-            })?;
-
-            // tun2 addresses the adapter at creation: first IPv4 address +
-            // netmask, no gateway (destination stays unset). Without a plan
-            // address tun2's defaults apply.
-            let ipv4 = first_ipv4(&device.addresses).copied();
-            let mut config = tun2::Configuration::default();
-            config.tun_name(&name).mtu(device.mtu).up();
-            if let Some(prefix) = &ipv4 {
-                let IpAddr::V4(address) = prefix.addr else {
-                    return Err(PlatformError::Device(
-                        "internal: non-IPv4 address selected".to_owned(),
-                    ));
-                };
-                if prefix.prefix_len > 32 {
-                    return Err(PlatformError::Device(format!(
-                        "prefix length {} does not fit an IPv4 address",
-                        prefix.prefix_len
-                    )));
+        // The previous adapter is already gone: the service stops the engine
+        // (which owns packet I/O) before converging to a new plan, and closing
+        // a created wintun adapter removes it. So this always creates a fresh
+        // adapter. Keep the previous state until the new device exists, so a
+        // failed creation can still be torn down (routes, WFP enforcement).
+        let wintun = match guard.as_ref() {
+            Some(state) => {
+                let mut removed = 0usize;
+                for spec in state
+                    .installed_routes
+                    .iter()
+                    .filter(|spec| spec.gateway.is_some())
+                {
+                    // A missing physical index falls back to the adapter index
+                    // so a best-effort delete still targets the likely row.
+                    let index =
+                        route_row_index(spec, state.index, &state.physical).unwrap_or(state.index);
+                    match tobro_osapi::win_route::delete_route(&osapi_route(spec, index)) {
+                        Ok(()) => removed += 1,
+                        Err(error) => {
+                            tracing::warn!("could not remove a stale bypass route: {error}");
+                        }
+                    }
                 }
-                config
-                    .address(address)
-                    .netmask(prefix_mask(prefix.prefix_len));
+                if removed > 0 {
+                    tracing::info!("create_device: removed {removed} stale bypass route(s)");
+                }
+                std::sync::Arc::clone(&state.wintun)
             }
-            tracing::info!(
-                "creating the wintun adapter (name_set={}, addresses={}, mtu={})",
-                !device.name.is_empty(),
-                device.addresses.len(),
-                device.mtu
-            );
-            let tun = tun2::create_as_async(&config).map_err(|error| {
-                PlatformError::Device(format!("could not create the wintun adapter: {error}"))
-            })?;
-            let index = tun.tun_index().map_err(|error| {
-                PlatformError::Device(format!("adapter has no interface index: {error}"))
-            })?;
-            let index = u32::try_from(index)
-                .map_err(|_| PlatformError::Device("adapter index overflow".to_owned()))?;
-            // Resolve the physical adapters now, before any route of this
-            // tunnel lifetime exists: afterwards the per-family default
-            // route would resolve to the tunnel itself.
-            let physical = tokio::task::spawn_blocking(resolve_physical_adapters)
+            None => {
+                let wintun_path = tobro_osapi::win_route::default_wintun_path();
+                tokio::task::spawn_blocking(move || {
+                    tobro_osapi::win_route::load_wintun(wintun_path.as_os_str())
+                })
                 .await
                 .map_err(|error| {
-                    PlatformError::Device(format!("adapter discovery task failed: {error}"))
-                })?;
-            *guard = Some(DeviceState {
-                name,
-                index,
-                device: tun,
-                wintun,
-                applied_address: ipv4.unwrap_or(Prefix {
-                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    prefix_len: 0,
-                }),
-                physical,
-                installed_routes: Vec::new(),
-                kill_switch: false,
-            });
-        }
+                    PlatformError::Device(format!("driver load task failed: {error}"))
+                })?
+                .map_err(|error| {
+                    PlatformError::Device(format!(
+                        "could not load the wintun driver from beside the helper binary: {error}"
+                    ))
+                })?
+            }
+        };
 
-        // Converge what can be converged on reuse: MTU (addressing is
-        // creation-time on Windows).
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| PlatformError::Device("internal: device state missing".to_owned()))?;
-        if let Some(prefix) = first_ipv4(&device.addresses)
-            && state.applied_address != *prefix
-        {
-            return Err(PlatformError::Device(
-                "Windows cannot re-address a live wintun adapter; tear down first (the helper will recreate it on the next apply)".to_owned(),
-            ));
+        let name = if device.name.is_empty() {
+            "tobro".to_owned()
+        } else {
+            device.name.clone()
+        };
+
+        // tun2 addresses the adapter at creation: first IPv4 address +
+        // netmask, no gateway (destination stays unset). Without a plan
+        // address tun2's defaults apply.
+        let ipv4 = first_ipv4(&device.addresses).copied();
+        let mut config = tun2::Configuration::default();
+        config.tun_name(&name).mtu(device.mtu).up();
+        if let Some(prefix) = &ipv4 {
+            let IpAddr::V4(address) = prefix.addr else {
+                return Err(PlatformError::Device(
+                    "internal: non-IPv4 address selected".to_owned(),
+                ));
+            };
+            if prefix.prefix_len > 32 {
+                return Err(PlatformError::Device(format!(
+                    "prefix length {} does not fit an IPv4 address",
+                    prefix.prefix_len
+                )));
+            }
+            config
+                .address(address)
+                .netmask(prefix_mask(prefix.prefix_len));
         }
-        let mtu = usize::from(device.mtu);
-        let adapter = state.reopen_adapter()?;
-        adapter.set_mtu(mtu).map_err(|error| {
-            PlatformError::Device(format!("could not set the adapter MTU: {error}"))
+        tracing::info!(
+            "creating the wintun adapter (name_set={}, addresses={}, mtu={})",
+            !device.name.is_empty(),
+            device.addresses.len(),
+            device.mtu
+        );
+        let tun = tun2::create_as_async(&config).map_err(|error| {
+            PlatformError::Device(format!("could not create the wintun adapter: {error}"))
         })?;
-        Ok(state.name.clone())
+        let index = tun.tun_index().map_err(|error| {
+            PlatformError::Device(format!("adapter has no interface index: {error}"))
+        })?;
+        let index = u32::try_from(index)
+            .map_err(|_| PlatformError::Device("adapter index overflow".to_owned()))?;
+        // Resolve the physical adapters now, before any route of this tunnel
+        // lifetime exists: afterwards the per-family default route would
+        // resolve to the tunnel itself.
+        let physical = tokio::task::spawn_blocking(resolve_physical_adapters)
+            .await
+            .map_err(|error| {
+                PlatformError::Device(format!("adapter discovery task failed: {error}"))
+            })?;
+        // Carry what the adapter does not take with it: the WFP enforcement
+        // outlives the adapter and must be removed by a later apply/teardown.
+        let kill_switch = guard.as_ref().is_some_and(|state| state.kill_switch);
+        *guard = Some(DeviceState {
+            name: name.clone(),
+            index,
+            wintun,
+            physical,
+            installed_routes: Vec::new(),
+            kill_switch,
+        });
+
+        Ok(CreatedDevice {
+            interface: name,
+            packet_io: Some(tun),
+        })
     }
 
     async fn apply_routes(
@@ -531,36 +548,19 @@ impl Platform for WindowsPlatform {
                 tracing::info!("teardown: kill-switch enforcement removed");
             }
         }
-        // Deconstruct the state: drop the device (ends the wintun session),
-        // then delete the adapter — its addressing and DNS settings
-        // disappear with it.
+        // Deconstruct the state. The adapter itself is removed when the
+        // service stops the engine (which owns the device) right after this
+        // teardown: closing the last wintun handle deletes the adapter, and
+        // its addressing and DNS settings go with it.
         let DeviceState {
             name,
             wintun,
-            device,
             index: _,
-            applied_address: _,
             physical: _,
             installed_routes: _,
             kill_switch: _,
         } = state;
-        drop(device);
-        let delete_result = match wintun_bindings::Adapter::open(&wintun, &name) {
-            Ok(adapter) => match std::sync::Arc::try_unwrap(adapter) {
-                Ok(adapter) => adapter.delete().map_err(|error| {
-                    PlatformError::Device(format!("could not delete the wintun adapter: {error}"))
-                }),
-                Err(_) => Err(PlatformError::Device(
-                    "the wintun adapter is still referenced by another handle".to_owned(),
-                )),
-            },
-            Err(error) => Err(PlatformError::Device(format!(
-                "could not re-open the wintun adapter: {error}"
-            ))),
-        };
-        if let Err(error) = delete_result {
-            tracing::warn!("teardown: {error}");
-        }
+        drop((name, wintun));
         tracing::info!(
             "teardown: done ({tracked} tracked route(s), {removed} removed successfully)"
         );

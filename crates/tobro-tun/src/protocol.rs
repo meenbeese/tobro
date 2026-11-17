@@ -5,7 +5,7 @@
 //! before sending) and again by the helper on receipt; the helper must treat
 //! decoded values as untrusted until validated.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,12 @@ use crate::HelperError;
 
 /// Helper protocol version. Bumped on incompatible changes; the handshake
 /// rejects mismatches instead of guessing.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 adds the routing engine's forwarding configuration to the plan
+/// ([`TunnelPlan::forwarding`] / [`TunnelPlan::udp_policy`]): a v2 daemon
+/// requires a v2 helper because a v1 helper would apply a plan it cannot
+/// actually forward traffic for.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest number of routes (tunnel + bypass combined) accepted in a plan.
 pub const MAX_ROUTES: usize = 512;
@@ -488,6 +493,80 @@ pub struct DnsConfig {
     pub servers: Vec<IpAddr>,
 }
 
+/// UDP handling policy for the routing engine (mirrors `[tun] udp_policy`).
+///
+/// Tor (Arti) carries no UDP, so UDP can only be intercepted locally (DNS) or
+/// dropped. There is deliberately no "forward UDP directly" option: that
+/// would leak destinations outside the tunnel and defeat the milestone goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpPolicy {
+    /// Intercept DNS queries (any UDP destination port 53) and relay them to
+    /// the daemon's local DNS resolver ([`Forwarding::dns`]); drop all other
+    /// UDP. QUIC/WebRTC-capable applications fall back to TCP. Default.
+    #[default]
+    DnsOnly,
+    /// Drop all UDP, including DNS interception. Only TCP connections work.
+    BlockAll,
+}
+
+/// Where the routing engine forwards the tunnel's traffic: the daemon's
+/// local listeners, on loopback only.
+///
+/// The helper (running as root/system) never talks to the network directly;
+/// every forwarded byte leaves through the unprivileged daemon's Tor
+/// listeners. Loopback-only addresses are validated because a non-loopback
+/// target would make the privileged helper an open proxy reachable from
+/// other machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forwarding {
+    /// The daemon's local SOCKS5 listener (also carries HTTP CONNECT).
+    /// TCP flows from the tunnel are forwarded here via SOCKS5 CONNECT.
+    pub socks: SocketAddr,
+    /// The daemon's local UDP DNS resolver. Required by
+    /// [`UdpPolicy::DnsOnly`] plans (the interception target); absent for
+    /// `BlockAll` plans, where nothing is relayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<SocketAddr>,
+}
+
+impl Forwarding {
+    /// Validate: loopback-only, non-zero ports. Decoded values are untrusted.
+    pub fn validate(&self) -> Result<(), HelperError> {
+        let invalid = |what: &str, reason: String| {
+            HelperError::Validation(format!("plan.forwarding.{what}: {reason}"))
+        };
+        if !self.socks.ip().is_loopback() {
+            return Err(invalid(
+                "socks",
+                format!(
+                    "{} must be a loopback address (the helper only forwards to the local daemon)",
+                    self.socks.ip()
+                ),
+            ));
+        }
+        if self.socks.port() == 0 {
+            return Err(invalid("socks", "the port must not be 0".to_owned()));
+        }
+        if let Some(dns) = self.dns {
+            if !dns.ip().is_loopback() {
+                return Err(invalid(
+                    "dns",
+                    format!(
+                        "{} must be a loopback address (the helper only forwards to the local daemon)",
+                        dns.ip()
+                    ),
+                ));
+            }
+            if dns.port() == 0 {
+                return Err(invalid("dns", "the port must not be 0".to_owned()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The complete desired routing state. This is the only privileged payload:
 /// the helper converges the system to it, so crash recovery is a plain
 /// re-send rather than a replay of deltas.
@@ -505,6 +584,20 @@ pub struct TunnelPlan {
     pub dns: DnsConfig,
     /// Kill switch behavior for the tunnel lifetime.
     pub kill_switch: KillSwitchMode,
+    /// UDP handling policy for the routing engine.
+    #[serde(default, skip_serializing_if = "is_default_udp_policy")]
+    pub udp_policy: UdpPolicy,
+    /// Where the routing engine forwards the tunnel's traffic. `None` is a
+    /// fail-closed plan: the device is up but nothing reads it, so traffic is
+    /// dropped rather than forwarded (diagnostics/tests only; the daemon
+    /// always sets forwarding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding: Option<Forwarding>,
+}
+
+/// Serde helper: serializes the default UDP policy as absent (wire noise).
+fn is_default_udp_policy(policy: &UdpPolicy) -> bool {
+    *policy == UdpPolicy::default()
 }
 
 impl TunnelPlan {
@@ -616,6 +709,20 @@ impl TunnelPlan {
                 return Err(HelperError::Validation(format!(
                     "plan.dns.servers[{i}]: {server} is not a usable system-wide resolver address (loopback/link-local/multicast/unspecified are rejected)"
                 )));
+            }
+        }
+        // Forwarding endpoints are loopback-only (the helper only ever talks
+        // to the local daemon) and must be consistent with the UDP policy.
+        if let Some(forwarding) = &self.forwarding {
+            forwarding
+                .validate()
+                .map_err(|e| HelperError::Validation(strip_prefix(e)))?;
+            if self.udp_policy == UdpPolicy::DnsOnly && forwarding.dns.is_none() {
+                return Err(HelperError::Validation(
+                    "plan.forwarding: a dns_only UDP policy requires a DNS forwarding target \
+                     (the intercepted resolver traffic needs somewhere to go)"
+                        .to_owned(),
+                ));
             }
         }
         Ok(())
@@ -889,7 +996,93 @@ mod tests {
                 servers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
             },
             kill_switch: KillSwitchMode::Block,
+            udp_policy: UdpPolicy::default(),
+            forwarding: Some(loopback_forwarding()),
         }
+    }
+
+    /// Loopback forwarding endpoints as the daemon sends them.
+    fn loopback_forwarding() -> Forwarding {
+        Forwarding {
+            socks: "127.0.0.1:9050".parse().expect("valid socket address"),
+            dns: Some("127.0.0.1:9053".parse().expect("valid socket address")),
+        }
+    }
+
+    #[test]
+    fn forwarding_endpoints_must_be_loopback_with_ports() {
+        let mut plan = sample_plan();
+        plan.validate().expect("loopback forwarding must validate");
+
+        // Non-loopback SOCKS target: the helper must never act as a network
+        // proxy for other machines.
+        plan.forwarding = Some(Forwarding {
+            socks: "192.0.2.1:9050".parse().expect("valid socket address"),
+            dns: plan.forwarding.as_ref().and_then(|f| f.dns),
+        });
+        assert!(plan.validate().is_err());
+
+        // Non-loopback DNS target.
+        let mut plan = sample_plan();
+        plan.forwarding = Some(Forwarding {
+            socks: "127.0.0.1:9050".parse().expect("valid socket address"),
+            dns: Some("192.0.2.1:53".parse().expect("valid socket address")),
+        });
+        assert!(plan.validate().is_err());
+
+        // Port 0 is never a real listener.
+        let mut plan = sample_plan();
+        plan.forwarding = Some(Forwarding {
+            socks: "127.0.0.1:0".parse().expect("valid socket address"),
+            dns: plan.forwarding.as_ref().and_then(|f| f.dns),
+        });
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn dns_only_policy_requires_a_dns_forwarding_target() {
+        let mut plan = sample_plan();
+        plan.forwarding = Some(Forwarding {
+            socks: plan.forwarding.as_ref().expect("set").socks,
+            dns: None,
+        });
+        let error = plan.validate().expect_err("dns_only without DNS target");
+        assert!(error.to_string().contains("forwarding"), "{error}");
+
+        // BlockAll plans may omit the DNS target: nothing is relayed anyway.
+        plan.udp_policy = UdpPolicy::BlockAll;
+        plan.validate().expect("block_all without DNS target");
+    }
+
+    #[test]
+    fn plans_without_forwarding_still_validate() {
+        // A fail-closed plan (device up, nothing reads it) is legal; the
+        // daemon always sets forwarding, tests and diagnostics may not.
+        let mut plan = sample_plan();
+        plan.forwarding = None;
+        plan.validate().expect("no forwarding must validate");
+    }
+
+    #[test]
+    fn plan_wire_format_keeps_the_new_fields_optional() {
+        // v2 JSON with forwarding round-trips.
+        let plan = sample_plan();
+        let json = serde_json::to_string(&plan).expect("serialize");
+        let decoded: TunnelPlan = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, plan);
+        assert_eq!(decoded.udp_policy, UdpPolicy::DnsOnly);
+        assert!(decoded.forwarding.is_some());
+        // The default UDP policy is omitted from the wire, and a plan without
+        // forwarding (v1-shaped, or a fail-closed diagnostic plan) still
+        // decodes to the defaults.
+        let mut value = serde_json::to_value(&plan).expect("to value");
+        let object = value.as_object_mut().expect("a plan is an object");
+        assert!(object.remove("forwarding").is_some());
+        assert!(object.remove("udp_policy").is_none(), "{json}");
+        let decoded: TunnelPlan =
+            serde_json::from_value(value).expect("deserialize without forwarding");
+        assert_eq!(decoded.forwarding, None);
+        assert_eq!(decoded.udp_policy, UdpPolicy::DnsOnly);
     }
 
     #[test]

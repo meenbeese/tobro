@@ -12,6 +12,31 @@ use async_trait::async_trait;
 
 use tobro_tun::{DnsConfig, KillSwitchMode, RouteSpec, TunDevice, reject_codes};
 
+/// What creating a TUN device produced.
+///
+/// The helper service owns the packet I/O and hands it to the routing engine
+/// ([`crate::engine`]); the platform keeps only the bookkeeping teardown
+/// needs (routes, DNS backup, kill switch). This split keeps the device's
+/// lifetime in one place: stopping the engine closes it.
+pub struct CreatedDevice {
+    /// The actual interface name, which may differ from the requested one
+    /// (macOS assigns `utunN`).
+    pub interface: String,
+    /// Packet I/O for the routing engine. `None` only in test backends: a
+    /// real device is always returned so traffic has somewhere to go.
+    pub packet_io: Option<tun2::AsyncDevice>,
+}
+
+impl std::fmt::Debug for CreatedDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print device handles; the name is not sensitive.
+        f.debug_struct("CreatedDevice")
+            .field("interface", &self.interface)
+            .field("has_packet_io", &self.packet_io.is_some())
+            .finish()
+    }
+}
+
 /// Errors a privileged operation can produce, mapped to protocol rejection
 /// codes so the client gets actionable answers.
 #[derive(Debug, thiserror::Error)]
@@ -49,10 +74,14 @@ impl PlatformError {
 /// The privileged primitives. Five calls, all taking validated types.
 #[async_trait]
 pub trait Platform: Send + Sync {
-    /// Create the TUN device (or reuse the existing one) and assign its
-    /// addresses. Returns the actual interface name, which may differ from
-    /// the requested one (macOS assigns `utunN`).
-    async fn create_device(&self, device: &TunDevice) -> Result<String, PlatformError>;
+    /// Create a fresh TUN device and assign its addresses. Returns the actual
+    /// interface name (which may differ from the requested one; macOS assigns
+    /// `utunN`) and the packet I/O the service hands to the routing engine.
+    ///
+    /// The previous device is already closed when this is called: the service
+    /// stops the engine (which owns packet I/O) before converging to a new
+    /// plan, so backends always create a new device instead of reusing one.
+    async fn create_device(&self, device: &TunDevice) -> Result<CreatedDevice, PlatformError>;
 
     /// Converge the route table: `routes` point into the tunnel at
     /// `interface`, `bypass_routes` point at real gateways.
@@ -93,7 +122,7 @@ const UNSUPPORTED_REASON: &str =
 
 #[async_trait]
 impl Platform for NullPlatform {
-    async fn create_device(&self, _device: &TunDevice) -> Result<String, PlatformError> {
+    async fn create_device(&self, _device: &TunDevice) -> Result<CreatedDevice, PlatformError> {
         Err(PlatformError::Unsupported(UNSUPPORTED_REASON.to_owned()))
     }
 

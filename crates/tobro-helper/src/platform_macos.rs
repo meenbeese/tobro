@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use tobro_tun::{DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice};
 use tun2::AbstractDevice;
 
-use crate::platform::{Platform, PlatformError};
+use crate::platform::{CreatedDevice, Platform, PlatformError};
 
 /// Derive the destination (peer) address tun2 expects for a point-to-point
 /// utun device: address + 1, or the address itself for /32.
@@ -85,21 +85,22 @@ impl std::fmt::Debug for EnabledKillSwitch {
 }
 
 /// Device-scoped helper state: everything `teardown` must undo.
+///
+/// The device handle itself is *not* stored here: the routing engine owns it
+/// (the service starts/stops the engine around device creation).
 struct DeviceState {
     /// The actual interface name the kernel assigned (`utunN`).
     name: String,
     /// The interface's kernel index (used for route installation).
     index: u32,
-    device: tun2::AsyncDevice,
-    /// The IPv4 address configured at creation; a plan that asks for a
-    /// different one is refused (macOS cannot re-address a live utun).
-    applied_address: Prefix,
     /// Routes the helper installed (tunnel + bypass), for convergence.
     installed_routes: Vec<RouteSpec>,
     /// The global DNS key backup: `None` = not backed up yet; `Some(None)` =
     /// the key did not exist; `Some(Some(xml))` = the previous value.
     dns_backup: Option<Option<Vec<u8>>>,
-    /// PF enforcement installed by `KillSwitchMode::Block`.
+    /// PF enforcement installed by `KillSwitchMode::Block`. Carried across
+    /// device recreation: the rules outlive the utun and must be removed by
+    /// a later apply/teardown.
     kill_switch: Option<EnabledKillSwitch>,
 }
 
@@ -216,82 +217,98 @@ where
 
 #[async_trait]
 impl Platform for MacosPlatform {
-    async fn create_device(&self, device: &TunDevice) -> Result<String, PlatformError> {
+    async fn create_device(&self, device: &TunDevice) -> Result<CreatedDevice, PlatformError> {
         let mut guard = self.state.lock().await;
 
-        // The requested name is advisory on macOS: the kernel always assigns
-        // `utunN`. A device the helper already owns is reused.
-        if guard.is_none() {
-            // tun2 requires the first IPv4 address up front (SIOCAIFADDR at
-            // creation); without one its defaults apply.
-            let ipv4 = first_ipv4(&device.addresses).copied();
-            let mut config = tun2::Configuration::default();
-            config.mtu(device.mtu).up();
-            if let Some(prefix) = &ipv4 {
-                let IpAddr::V4(address) = prefix.addr else {
-                    return Err(PlatformError::Device(
-                        "internal: non-IPv4 address selected".to_owned(),
-                    ));
-                };
-                if prefix.prefix_len > 32 {
-                    return Err(PlatformError::Device(format!(
-                        "prefix length {} does not fit an IPv4 address",
-                        prefix.prefix_len
-                    )));
-                }
-                config
-                    .address(address)
-                    .netmask(prefix_mask(prefix.prefix_len))
-                    .destination(peer_address(address, prefix.prefix_len));
+        // The kernel always assigns `utunN`; every apply gets a fresh utun
+        // (the previous one was closed when the service stopped the engine).
+        // tun2 requires the first IPv4 address up front (SIOCAIFADDR at
+        // creation); without one its defaults apply.
+        let ipv4 = first_ipv4(&device.addresses).copied();
+        let mut config = tun2::Configuration::default();
+        config.mtu(device.mtu).up();
+        if let Some(prefix) = &ipv4 {
+            let IpAddr::V4(address) = prefix.addr else {
+                return Err(PlatformError::Device(
+                    "internal: non-IPv4 address selected".to_owned(),
+                ));
+            };
+            if prefix.prefix_len > 32 {
+                return Err(PlatformError::Device(format!(
+                    "prefix length {} does not fit an IPv4 address",
+                    prefix.prefix_len
+                )));
             }
-            // No name: the kernel assigns `utunN` (a non-utun name is
-            // rejected by tun2 on macOS).
-            tracing::info!(
-                "creating the utun device (addresses={}, mtu={})",
-                device.addresses.len(),
-                device.mtu
-            );
-            let tun = tun2::create_as_async(&config).map_err(|error| {
-                PlatformError::Device(format!("could not create the utun device: {error}"))
-            })?;
-            let name = tun.tun_name().map_err(|error| {
-                PlatformError::Device(format!("utun device has no name: {error}"))
-            })?;
-            let index = tun.tun_index().map_err(|error| {
-                PlatformError::Device(format!("utun device has no index: {error}"))
-            })?;
-            let index = u32::try_from(index)
-                .map_err(|_| PlatformError::Device("utun index overflow".to_owned()))?;
-            *guard = Some(DeviceState {
-                name: name.clone(),
-                index,
-                device: tun,
-                applied_address: ipv4.unwrap_or(Prefix {
-                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    prefix_len: 0,
-                }),
-                installed_routes: Vec::new(),
-                dns_backup: None,
-                kill_switch: None,
-            });
+            config
+                .address(address)
+                .netmask(prefix_mask(prefix.prefix_len))
+                .destination(peer_address(address, prefix.prefix_len));
         }
-
-        // Converge what can be converged on reuse (MTU only; addressing is
-        // creation-time on macOS).
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| PlatformError::Device("internal: device state missing".to_owned()))?;
-        state.device.set_mtu(device.mtu).map_err(|error| {
-            PlatformError::Device(format!("could not set the device MTU: {error}"))
+        // No name: the kernel assigns `utunN` (a non-utun name is
+        // rejected by tun2 on macOS).
+        tracing::info!(
+            "creating the utun device (addresses={}, mtu={})",
+            device.addresses.len(),
+            device.mtu
+        );
+        let tun = tun2::create_as_async(&config).map_err(|error| {
+            PlatformError::Device(format!("could not create the utun device: {error}"))
         })?;
-        if let Some(prefix) = first_ipv4(&device.addresses)
-            && state.applied_address != *prefix
-        {
-            return Err(PlatformError::Device(
-                "macOS cannot re-address a live utun device; tear down first (the helper will recreate it on the next apply)".to_owned(),
-            ));
+        let name = tun
+            .tun_name()
+            .map_err(|error| PlatformError::Device(format!("utun device has no name: {error}")))?;
+        let index = tun
+            .tun_index()
+            .map_err(|error| PlatformError::Device(format!("utun device has no index: {error}")))?;
+        let index = u32::try_from(index)
+            .map_err(|_| PlatformError::Device("utun index overflow".to_owned()))?;
+
+        // Carry the state a new device does not reset: the resolver backup
+        // and the PF enforcement both outlive the utun, and so do the bypass
+        // routes (they leave through the physical link; tunnel routes go with
+        // the interface). Remove the previous plan's bypass routes before
+        // dropping its bookkeeping.
+        let mut previous = guard.take();
+        if let Some(state) = previous.as_mut() {
+            let stale: Vec<(RouteSpec, u32)> = state
+                .installed_routes
+                .iter()
+                .filter(|spec| spec.gateway.is_some())
+                .map(|spec| (spec.clone(), route_interface_index(spec, state.index)))
+                .collect();
+            if !stale.is_empty() {
+                let removed = tokio::task::spawn_blocking(move || -> usize {
+                    let mut removed = 0usize;
+                    for (spec, index) in stale {
+                        match tobro_osapi::bsd_route::delete_route(&tobro_osapi_route(&spec, index))
+                        {
+                            Ok(()) => removed += 1,
+                            Err(error) => {
+                                tracing::warn!("could not remove a stale bypass route: {error}");
+                            }
+                        }
+                    }
+                    removed
+                })
+                .await
+                .unwrap_or(0);
+                tracing::info!("create_device: removed {removed} stale bypass route(s)");
+            }
         }
-        Ok(state.name.clone())
+        let dns_backup = previous.as_mut().and_then(|state| state.dns_backup.take());
+        let kill_switch = previous.as_mut().and_then(|state| state.kill_switch.take());
+        *guard = Some(DeviceState {
+            name: name.clone(),
+            index,
+            installed_routes: Vec::new(),
+            dns_backup,
+            kill_switch,
+        });
+
+        Ok(CreatedDevice {
+            interface: name,
+            packet_io: Some(tun),
+        })
     }
 
     async fn apply_routes(
@@ -589,14 +606,14 @@ impl Platform for MacosPlatform {
                 tracing::warn!("teardown: could not remove the PF enforcement: {error}");
             }
         }
-        // Restore DNS best-effort, then drop the device: closing the utun
-        // makes the kernel remove the interface and its device routes.
+        // Restore DNS best-effort. The utun itself is closed by the service
+        // (it stops the routing engine after this teardown), which makes the
+        // kernel remove the interface and its device routes.
         let backup = state.dns_backup.take();
         let restore = sc_blocking(move || tobro_osapi::sc_dns::restore_dns(backup)).await;
         if let Err(error) = restore {
             tracing::warn!("teardown: {error}");
         }
-        drop(state.device);
         tracing::info!(
             "teardown: done ({tracked} tracked route(s), {removed} removed successfully)"
         );
@@ -625,8 +642,13 @@ mod macos_integration {
             }],
             mtu: 1400,
         };
-        let name = platform.create_device(&device).await.expect("create");
-        assert!(name.starts_with("utun"), "{name}");
+        let created = platform.create_device(&device).await.expect("create");
+        assert!(
+            created.interface.starts_with("utun"),
+            "{}",
+            created.interface
+        );
+        let name = created.interface.clone();
 
         let default_route = RouteSpec {
             destination: Prefix {

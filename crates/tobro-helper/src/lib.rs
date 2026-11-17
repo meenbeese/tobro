@@ -22,16 +22,21 @@
 //!
 //! # Skeleton status
 //!
-//! The protocol loop, peer gating, state machine, and dispatch are complete.
-//! The privileged platform backends ([`Platform`]) are per-OS: Linux has the
-//! real TUN/netlink backend ([`LinuxPlatform`], T4a), macOS the utun
-//! backend ([`MacosPlatform`], T4b), Windows the wintun backend
-//! ([`WindowsPlatform`], T4c). Any other platform still gets
+//! The protocol loop, peer gating, state machine, dispatch, the per-OS
+//! privileged backends ([`Platform`]), and the routing engine ([`engine`])
+//! are complete. Linux has the real TUN/netlink backend ([`LinuxPlatform`],
+//! T4a), macOS the utun backend ([`MacosPlatform`], T4b), Windows the wintun
+//! backend ([`WindowsPlatform`], T4c). Any other platform still gets
 //! [`NullPlatform`], which rejects privileged operations with `UNSUPPORTED`.
+//!
+//! The engine ([`engine::EngineHandle`]) terminates the tunnel's TCP flows
+//! through the daemon's loopback SOCKS5 listener, relays intercepted DNS to
+//! the daemon's local resolver, and applies the plan's UDP policy.
 //!
 //! "Runs only while TUN is enabled" is honored by [`Args::idle_exit_secs`]:
 //! the helper exits cleanly when no client connects within the window.
 
+pub mod engine;
 pub mod platform;
 #[cfg(target_os = "linux")]
 pub mod platform_linux;

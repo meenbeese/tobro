@@ -1137,7 +1137,13 @@ impl SupervisorControl {
                 return;
             }
         };
-        if let Err(error) = tun.apply(&config.tun).await {
+        if let Err(error) = tun
+            .apply(
+                &config.tun,
+                crate::tun_manager::TunEndpoints::from_proxy(&config.proxy),
+            )
+            .await
+        {
             tracing::warn!(%error, "TUN convergence after a config change failed");
         }
     }
@@ -1241,15 +1247,20 @@ impl DaemonControl for SupervisorControl {
         }
 
         // TUN mode: apply the routing plan before Tor starts so traffic
-        // (and the tunnel) are ready together. Failure blocks the connect:
-        // enabling TUN and silently continuing in ports mode would ignore
-        // the user's explicit opt-in.
+        // (and the tunnel) are ready together. The helper's engine forwards
+        // to the daemon's loopback listeners, which Tor serves once it is
+        // up; flows attempted before then fail closed. Failure blocks the
+        // connect: enabling TUN and silently continuing in ports mode would
+        // ignore the user's explicit opt-in.
         if config.tun.is_active()
             && let Some(tun) = &self.tun
         {
-            tun.apply(&config.tun)
-                .await
-                .map_err(|e| format!("TUN mode failed: {e}"))?;
+            tun.apply(
+                &config.tun,
+                crate::tun_manager::TunEndpoints::from_proxy(&config.proxy),
+            )
+            .await
+            .map_err(|e| format!("TUN mode failed: {e}"))?;
         }
 
         match self
