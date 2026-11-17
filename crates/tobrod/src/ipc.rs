@@ -400,9 +400,9 @@ fn config_effects(
     let bridges_changed = current.bridges != next.bridges;
     let outbound_proxy_changed = current.outbound_proxy != next.outbound_proxy;
     // TUN config changes are converged through the privileged helper (M7
-    // wiring), not by a proxy restart. In this build `tun.enabled` is still
-    // rejected by config validation until the TUN routing engine lands, so
-    // the convergence stays a no-op in production; the flag feeds the
+    // wiring), not by a proxy restart: a running tunnel is applied/updated or
+    // torn down after the config is saved, and a stopped daemon applies the
+    // stored `tun.enabled` on the next connect. The flag feeds the
     // config.apply effects for the UI.
     let tun_changed = current.tun != next.tun;
     let restart_required = listeners_changed

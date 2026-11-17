@@ -9,7 +9,7 @@
 //! |---|---|---|---|---|
 //! | Linux | `/usr/local/bin/tobro-helper` | systemd system units | socket activation (`tobro-helper.socket` starts the helper on the first IPC connection; the idle window stops it again) | `pkexec` (polkit) |
 //! | macOS | `/Library/PrivilegedHelperTools/tobro-helper` | LaunchDaemon plist | run-at-load + relaunch on crash; idle window stops it; re-start needs one elevated `launchctl kickstart` | `osascript` administrator prompt |
-//! | Windows | `%ProgramFiles%\Tobro\helper\tobro-helper.exe` | Windows service (demand start) | the daemon starts/stops it (`SERVICE_START`/`SERVICE_STOP` granted to interactive users at install) | UAC via `Start-Process -Verb RunAs` |
+//! | Windows | `%ProgramFiles%\Tobro\helper\tobro-helper.exe` (+ `wintun.dll`) | Windows service (demand start) | the daemon starts/stops it (`SERVICE_START`/`SERVICE_STOP` granted to interactive users at install) | UAC via `Start-Process -Verb RunAs` |
 //!
 //! Every privileged step runs as **one generated script** through the
 //! platform's elevation mechanism — the OS privilege prompt is the UI. The
@@ -237,6 +237,9 @@ pub struct InstallStatus {
     pub target_binary: String,
     /// When a pin is configured: whether the installed binary matches it.
     pub sha256_matches: Option<bool>,
+    /// Windows only: whether `wintun.dll` is installed next to the helper.
+    /// `None` on platforms that do not use the wintun driver.
+    pub wintun_installed: Option<bool>,
 }
 
 impl InstallStatus {
@@ -249,12 +252,19 @@ impl InstallStatus {
             service_running: None,
             target_binary: String::new(),
             sha256_matches: None,
+            wintun_installed: None,
         }
     }
 
     /// Installed end to end (binary present and registered).
     pub fn installed(&self) -> bool {
         self.binary_installed && self.service_registered
+    }
+
+    /// Whether the Windows wintun driver is installed (`false` when the
+    /// platform does not use it).
+    pub fn wintun_installed(&self) -> bool {
+        self.wintun_installed.unwrap_or(false)
     }
 
     /// JSON form for the `tun.status` payload.
@@ -267,6 +277,7 @@ impl InstallStatus {
             "service_running": self.service_running,
             "target_binary": self.target_binary,
             "sha256_matches": self.sha256_matches,
+            "wintun_installed": self.wintun_installed,
         })
     }
 }
@@ -290,6 +301,11 @@ pub enum InstallError {
     /// The source helper binary does not exist.
     #[error("the helper binary was not found at {0}")]
     SourceMissing(String),
+    /// The Windows wintun driver library is missing next to the source helper.
+    #[error(
+        "the wintun driver library was not found at {0}; packaged builds ship wintun.dll next to tobro-helper (Windows builds require it for TUN device creation)"
+    )]
+    WintunMissing(String),
     /// The source binary does not match the configured SHA-256 pin.
     #[error(
         "helper binary does not match the configured SHA-256 pin (expected {expected}, got {actual}); refusing to install a binary the user pinned"

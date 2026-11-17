@@ -7878,6 +7878,7 @@ dependencies = [
  "libc",
  "system-configuration",
  "thiserror 2.0.21",
+ "tokio",
  "windows-sys 0.61.2",
  "wintun-bindings",
 ]

@@ -17,6 +17,12 @@ import {
   setCaptureProtectionEnabled,
 } from "./captureProtection";
 import { readGlobalShortcut, applyGlobalShortcut } from "./globalShortcut";
+import {
+  readTunnelMode,
+  setTunnelMode,
+  TUNNEL_MODE_EVENT,
+  TUNNEL_MODE_KEY,
+} from "./tunnelMode";
 
 const POWER_USER_KEY = "tobro.powerUser.enabled";
 
@@ -41,6 +47,7 @@ interface ConfigEffects {
   listeners_changed?: boolean;
   stream_changed?: boolean;
   network_changed?: boolean;
+  tun_changed?: boolean;
   runtime_active?: boolean;
   warnings?: string[];
 }
@@ -223,6 +230,105 @@ interface ProxyPorts {
   config_path?: string;
 }
 
+// --- TUN / full-device VPN (M7) -------------------------------------------
+
+type TunKillSwitch = "restore" | "block";
+type TunUdpPolicy = "dns_only" | "block_all";
+
+interface TunRuleDraft {
+  destination: string;
+  comment: string;
+}
+
+interface TunSettings {
+  enabled: boolean;
+  kill_switch: TunKillSwitch;
+  udp_policy: TunUdpPolicy;
+  mtu: string;
+  exclude_rules: TunRuleDraft[];
+}
+
+const EMPTY_TUN: TunSettings = {
+  enabled: false,
+  kill_switch: "restore",
+  udp_policy: "dns_only",
+  mtu: "1500",
+  exclude_rules: [],
+};
+
+const TUN_MIN_MTU = 576;
+const TUN_MAX_MTU = 65521;
+
+interface TunInstallStatus {
+  platform?: string;
+  installed?: boolean;
+  binary_installed?: boolean;
+  service_registered?: boolean;
+  service_running?: boolean | null;
+  target_binary?: string;
+  sha256_matches?: boolean | null;
+  wintun_installed?: boolean | null;
+  note?: string;
+}
+
+interface TunStatusView {
+  endpoint?: string;
+  state?: string;
+  engine_available?: boolean;
+  helper_reachable?: boolean | null;
+  helper?: {
+    protocol_version?: number;
+    helper_version?: string;
+  } | null;
+  helper_binary?: {
+    path?: string;
+    sha256_matches?: boolean | null;
+  } | null;
+  active?: {
+    interface?: string;
+    generation?: number;
+    kill_switch?: string;
+    bypass_routes?: number;
+    skipped_domains?: number;
+  } | null;
+  error?: string | null;
+  helper_install?: TunInstallStatus | null;
+  note?: string;
+}
+
+function describeTunInstall(install?: TunInstallStatus | null): string {
+  if (!install) return "Helper install status is unavailable.";
+  const platform = install.platform ? `${install.platform}: ` : "";
+  if (install.installed) {
+    const running =
+      install.service_running === true
+        ? "service running"
+        : install.service_running === false
+          ? "service registered (not running)"
+          : "service registered";
+    return `${platform}privileged helper installed (${running}).`;
+  }
+  if (install.binary_installed) {
+    return `${platform}helper binary present, but its service is not registered. Reinstall the helper.`;
+  }
+  return `${platform}privileged helper not installed.`;
+}
+
+function describeTunState(status: TunStatusView | null): string {
+  if (!status) return "";
+  if (status.state === "active") {
+    const iface = status.active?.interface
+      ? ` on ${status.active.interface}`
+      : "";
+    return `Tunnel active${iface}.`;
+  }
+  if (status.state === "error") return "Tunnel error.";
+  if (status.helper_reachable === true) return "Helper reachable; tunnel idle.";
+  if (status.helper_reachable === false)
+    return "Helper not reachable; the tunnel is idle.";
+  return "Tunnel idle (helper not probed yet).";
+}
+
 type PortField = "socks_port" | "http_port" | "dns_port";
 
 const BIND_ALL_WARNING =
@@ -308,6 +414,12 @@ function summarizeEffects(effects?: ConfigEffects): string[] {
   if (effects.stream_changed) lines.push("Stream isolation settings changed.");
   if (effects.network_changed)
     lines.push("Network/StreamPrefs defaults changed.");
+  if (effects.tun_changed)
+    lines.push(
+      effects.runtime_active
+        ? "TUN settings changed; a running tunnel is updated or torn down now."
+        : "TUN settings changed; they apply on the next connection.",
+    );
   if (effects.restart_required) {
     lines.push(
       effects.runtime_active
@@ -336,10 +448,11 @@ export interface SettingsProps {
 export type AdvancedSettingsProps = SettingsProps;
 
 type SettingsTab =
-  "general" | "node" | "onion" | "clientAuth" | "kindness" | "advanced";
+  "general" | "node" | "tun" | "onion" | "clientAuth" | "kindness" | "advanced";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "general", label: "General" },
   { id: "node", label: "Node Configuration" },
+  { id: "tun", label: "TUN Mode" },
   { id: "onion", label: "Onion Services" },
   { id: "clientAuth", label: "Client Authorization" },
   { id: "kindness", label: "Kindness Mode" },
@@ -393,6 +506,7 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
     general: null,
     node: null,
+    tun: null,
     onion: null,
     clientAuth: null,
     kindness: null,
@@ -432,6 +546,19 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
   const [networkBusy, setNetworkBusy] = useState(false);
   const [networkMessage, setNetworkMessage] = useState("");
   const [networkError, setNetworkError] = useState("");
+
+  // TUN / full-device VPN (M7): config knobs + privileged helper status.
+  const [tun, setTun] = useState<TunSettings>(EMPTY_TUN);
+  const [tunDirty, setTunDirty] = useState(false);
+  const [tunBusy, setTunBusy] = useState(false);
+  const [tunError, setTunError] = useState("");
+  const [tunMessage, setTunMessage] = useState("");
+  const [tunStatus, setTunStatus] = useState<TunStatusView | null>(null);
+  const [tunStatusBusy, setTunStatusBusy] = useState(false);
+  const [tunStatusError, setTunStatusError] = useState("");
+  const [tunHelperBusy, setTunHelperBusy] = useState(false);
+  const [tunHelperError, setTunHelperError] = useState("");
+  const [tunHelperMessage, setTunHelperMessage] = useState("");
 
   // Outbound proxy (F-18/F-19)
   const [outbound, setOutbound] =
@@ -795,10 +922,264 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyNetworkFromConfig(cfg);
       applyOutboundFromConfig(cfg);
       applyKindnessFromConfig(cfg);
+      applyTunFromConfig(cfg);
       return cfg;
     } catch {
       // best-effort; listener loading may still work from local config
       return null;
+    }
+  }
+
+  function applyTunFromConfig(config: unknown) {
+    const t = (config as { tun?: Record<string, unknown> } | null)?.tun;
+    if (!t || typeof t !== "object") {
+      // The device-mode toggle lives outside the daemon too; keep it as the
+      // source of truth when this build/config has no `[tun]` block.
+      setTun({ ...EMPTY_TUN, enabled: readTunnelMode() === "device" });
+      setTunDirty(false);
+      return;
+    }
+    const rawRules = Array.isArray(t.exclude_rules) ? t.exclude_rules : [];
+    const rules: TunRuleDraft[] = rawRules
+      .filter(
+        (r): r is Record<string, unknown> =>
+          Boolean(r) && typeof r === "object",
+      )
+      .map((r) => ({
+        destination: typeof r.destination === "string" ? r.destination : "",
+        comment: typeof r.comment === "string" ? r.comment : "",
+      }));
+    setTun({
+      enabled: t.enabled === true,
+      kill_switch: t.kill_switch === "block" ? "block" : "restore",
+      udp_policy: t.udp_policy === "block_all" ? "block_all" : "dns_only",
+      mtu:
+        typeof t.mtu === "number" && Number.isFinite(t.mtu)
+          ? String(t.mtu)
+          : String(EMPTY_TUN.mtu),
+      exclude_rules: rules,
+    });
+    setTunDirty(false);
+    setTunError("");
+    setTunMessage("");
+  }
+
+  async function loadTunSettings() {
+    const cfg = await loadConfigState();
+    if (cfg == null) {
+      // Daemon unreachable: fall back to the locally stored mode.
+      setTun((prev) => ({ ...prev, enabled: readTunnelMode() === "device" }));
+    }
+  }
+
+  // Keep the main-window mode toggle aligned when a loaded/applied config
+  // carries a different `tun.enabled` value.
+  function syncTunnelModeFromConfig(config: unknown) {
+    const t = (config as { tun?: { enabled?: unknown } } | null)?.tun;
+    if (t && typeof t.enabled === "boolean") {
+      setTunnelMode(t.enabled ? "device" : "ports");
+    }
+  }
+
+  async function loadTunStatus() {
+    setTunStatusBusy(true);
+    setTunStatusError("");
+    try {
+      const status = await invoke<TunStatusView>("daemon_tun_status");
+      setTunStatus(status);
+      if (status?.helper_install?.note) {
+        setTunStatusError(status.helper_install.note);
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setTunStatusError(message);
+      setTunStatus(null);
+      log(`TUN status failed: ${message}`, "error");
+    } finally {
+      setTunStatusBusy(false);
+    }
+  }
+
+  function onTunChange<K extends keyof TunSettings>(
+    key: K,
+    value: TunSettings[K],
+  ) {
+    setTun((prev) => ({ ...prev, [key]: value }));
+    setTunDirty(true);
+    setTunError("");
+    setTunMessage("");
+  }
+
+  function addTunRule() {
+    setTun((prev) => ({
+      ...prev,
+      exclude_rules: [...prev.exclude_rules, { destination: "", comment: "" }],
+    }));
+    setTunDirty(true);
+    setTunError("");
+    setTunMessage("");
+  }
+
+  function updateTunRule(
+    index: number,
+    field: keyof TunRuleDraft,
+    value: string,
+  ) {
+    setTun((prev) => ({
+      ...prev,
+      exclude_rules: prev.exclude_rules.map((rule, i) =>
+        i === index ? { ...rule, [field]: value } : rule,
+      ),
+    }));
+    setTunDirty(true);
+    setTunError("");
+    setTunMessage("");
+  }
+
+  function removeTunRule(index: number) {
+    setTun((prev) => ({
+      ...prev,
+      exclude_rules: prev.exclude_rules.filter((_, i) => i !== index),
+    }));
+    setTunDirty(true);
+    setTunError("");
+    setTunMessage("");
+  }
+
+  async function onSaveTun(e?: FormEvent) {
+    e?.preventDefault();
+    setTunBusy(true);
+    setTunError("");
+    setTunMessage("");
+    try {
+      const mtu = Number.parseInt(tun.mtu, 10);
+      if (
+        !/^\d+$/.test(tun.mtu.trim()) ||
+        !Number.isInteger(mtu) ||
+        mtu < TUN_MIN_MTU ||
+        mtu > TUN_MAX_MTU
+      ) {
+        throw new Error(
+          `MTU must be an integer between ${TUN_MIN_MTU} and ${TUN_MAX_MTU} bytes.`,
+        );
+      }
+      const rules = tun.exclude_rules
+        .map((rule) => ({
+          destination: rule.destination.trim(),
+          comment: rule.comment.trim(),
+        }))
+        .filter((rule) => rule.destination.length > 0 || rule.comment.length);
+      const missing = rules.findIndex((rule) => !rule.destination);
+      if (missing >= 0) {
+        throw new Error(
+          `Split-tunnel rule ${missing + 1}: destination is required (CIDR or domain).`,
+        );
+      }
+      const result = await invoke<ConfigResponse>("daemon_apply_config", {
+        patch: {
+          tun: {
+            enabled: tun.enabled,
+            kill_switch: tun.kill_switch,
+            udp_policy: tun.udp_policy,
+            mtu,
+            // An explicit array replaces the stored list (removals apply).
+            exclude_rules: rules.map((rule) =>
+              rule.comment
+                ? { destination: rule.destination, comment: rule.comment }
+                : { destination: rule.destination },
+            ),
+          },
+        },
+      });
+      if (result.config) setCurrentConfig(result.config);
+      if (typeof result.path === "string") setConfigPath(result.path);
+      applyTunFromConfig(result.config ?? null);
+      // Keep the main-window mode toggle in sync with the daemon config.
+      setTunnelMode(tun.enabled ? "device" : "ports");
+      const warnings = result.effects?.warnings ?? [];
+      const msg = summarizeEffects(result.effects).join(" ");
+      setTunMessage(
+        warnings.length
+          ? `${msg} Warnings: ${warnings.join(" | ")}`
+          : msg || "Saved.",
+      );
+      log(
+        `TUN settings saved (enabled=${tun.enabled}, kill_switch=${tun.kill_switch}, udp=${tun.udp_policy}, mtu=${mtu}, rules=${rules.length})`,
+      );
+      onApplied?.();
+      void loadTunStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setTunError(message);
+      log(`TUN settings save failed: ${message}`, "error");
+    } finally {
+      setTunBusy(false);
+    }
+  }
+
+  async function onInstallTunHelper() {
+    setTunHelperBusy(true);
+    setTunHelperError("");
+    setTunHelperMessage("Waiting for the operating system's privilege prompt…");
+    log("TUN helper install requested (an OS privilege prompt may appear)");
+    try {
+      const report = await invoke<{
+        target_binary?: string;
+        actions?: string[];
+        note?: string;
+      }>("daemon_tun_helper_install");
+      setTunHelperMessage(
+        report?.note ??
+          `Helper installed${report?.target_binary ? ` at ${report.target_binary}` : ""}.`,
+      );
+      log(
+        `TUN helper installed${report?.target_binary ? ` (${report.target_binary})` : ""}`,
+      );
+      await loadTunStatus();
+      void loadTunSettings();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setTunHelperError(message);
+      setTunHelperMessage("");
+      log(`TUN helper install failed: ${message}`, "error");
+    } finally {
+      setTunHelperBusy(false);
+    }
+  }
+
+  async function onUninstallTunHelper() {
+    if (
+      !window.confirm(
+        "Uninstall the privileged TUN helper?\n\nThis tears down any active tunnel, stops and removes the helper service, and removes the installed helper binary. Full-device VPN will not work until it is installed again.",
+      )
+    ) {
+      return;
+    }
+    setTunHelperBusy(true);
+    setTunHelperError("");
+    setTunHelperMessage("Waiting for the operating system's privilege prompt…");
+    log("TUN helper uninstall requested (an OS privilege prompt may appear)");
+    try {
+      const report = await invoke<{
+        actions?: string[];
+        already_clean?: boolean;
+        note?: string;
+      }>("daemon_tun_helper_uninstall");
+      setTunHelperMessage(
+        report?.note ??
+          (report?.already_clean
+            ? "Nothing was installed."
+            : "Helper uninstalled."),
+      );
+      log("TUN helper uninstalled");
+      await loadTunStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setTunHelperError(message);
+      setTunHelperMessage("");
+      log(`TUN helper uninstall failed: ${message}`, "error");
+    } finally {
+      setTunHelperBusy(false);
     }
   }
 
@@ -1024,7 +1405,31 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
     if (powerUser && tab === "kindness") {
       void loadKindnessStatus();
     }
+    if (powerUser && tab === "tun") {
+      void loadTunSettings();
+      void loadTunStatus();
+    }
   }, [powerUser, tab]);
+
+  // The mode toggle also lives in the main window. Reflect changes made there
+  // (which are persisted to `tun.enabled`) without clobbering unsaved edits.
+  useEffect(() => {
+    const sync = () => {
+      const enabled = readTunnelMode() === "device";
+      setTun((prev) =>
+        prev.enabled === enabled ? prev : { ...prev, enabled },
+      );
+    };
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === TUNNEL_MODE_KEY) sync();
+    };
+    window.addEventListener(TUNNEL_MODE_EVENT, sync);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(TUNNEL_MODE_EVENT, sync);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
@@ -1271,6 +1676,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyNetworkFromConfig(result.config ?? null);
       applyOutboundFromConfig(result.config ?? null);
       applyKindnessFromConfig(result.config ?? null);
+      applyTunFromConfig(result.config ?? null);
+      syncTunnelModeFromConfig(result.config ?? null);
       setConfigMessages([
         "Loaded current daemon config (redacted; no secrets).",
       ]);
@@ -1365,6 +1772,8 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
       applyNetworkFromConfig(result.config ?? null);
       applyOutboundFromConfig(result.config ?? null);
       applyKindnessFromConfig(result.config ?? null);
+      applyTunFromConfig(result.config ?? null);
+      syncTunnelModeFromConfig(result.config ?? null);
       const lines = ["Config validated and saved (daemon config API)."];
       lines.push(...summarizeEffects(result.effects));
       lines.push(
@@ -3204,6 +3613,295 @@ export function Settings({ onClose, onApplied, appendLog }: SettingsProps) {
                 </li>
               </ul>
             </div>
+          </div>
+
+          <div
+            id="settings-panel-tun"
+            className="advanced-sections tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-tun"
+            hidden={tab !== "tun"}
+          >
+            <div className="settings-section-head">
+              <p className="muted">
+                Full-device VPN routes all system traffic through Tor using the
+                privileged <code>tobro-helper</code>. The helper must be
+                installed first; the operating system asks for permission{" "}
+                <strong>only when you install it</strong>. Saving these settings
+                writes <code>tun.enabled</code> to the daemon config; connecting
+                then applies or tears down the tunnel.
+              </p>
+            </div>
+
+            <div className="settings-section tun-helper">
+              <h3>Privileged helper</h3>
+              <p className="muted">
+                {describeTunInstall(tunStatus?.helper_install)}
+                {tunStatus ? ` ${describeTunState(tunStatus)}` : ""}
+              </p>
+              {tunStatus?.helper?.helper_version ? (
+                <p className="muted">
+                  Helper version {tunStatus.helper.helper_version}
+                  {tunStatus.helper.protocol_version != null
+                    ? ` (protocol v${tunStatus.helper.protocol_version})`
+                    : ""}
+                  .
+                </p>
+              ) : null}
+              {tunStatus?.helper_install?.wintun_installed != null ? (
+                <p className="muted">
+                  Windows wintun driver:{" "}
+                  {tunStatus.helper_install.wintun_installed
+                    ? "installed"
+                    : "missing (reinstall the helper)"}
+                  .
+                </p>
+              ) : null}
+              {tunStatus?.helper_binary?.path ? (
+                <p className="muted">
+                  Helper binary: <code>{tunStatus.helper_binary.path}</code>
+                  {tunStatus.helper_binary.sha256_matches === false
+                    ? " — SHA-256 does not match the configured pin."
+                    : ""}
+                </p>
+              ) : null}
+              {tunStatus?.active?.interface ? (
+                <p className="muted">
+                  Interface <code>{tunStatus.active.interface}</code>
+                  {typeof tunStatus.active.bypass_routes === "number"
+                    ? `, ${tunStatus.active.bypass_routes} split-tunnel route(s)`
+                    : ""}
+                  {typeof tunStatus.active.skipped_domains === "number"
+                    ? `, ${tunStatus.active.skipped_domains} skipped domain(s)`
+                    : ""}
+                  .
+                </p>
+              ) : null}
+              {tunStatus?.error ? (
+                <p className="error" role="alert">
+                  {tunStatus.error}
+                </p>
+              ) : null}
+              {tunStatusError ? (
+                <p className="error" role="alert">
+                  {tunStatusError}
+                </p>
+              ) : null}
+              {tunHelperError ? (
+                <p className="error" role="alert">
+                  {tunHelperError}
+                </p>
+              ) : null}
+              {tunHelperMessage ? (
+                <p className="muted">{tunHelperMessage}</p>
+              ) : null}
+              <div className="actions">
+                <button
+                  type="button"
+                  className="small-button"
+                  disabled={tunStatusBusy || tunHelperBusy}
+                  onClick={() => void loadTunStatus()}
+                >
+                  {tunStatusBusy ? "Refreshing…" : "Refresh status"}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={tunHelperBusy}
+                  onClick={() => void onInstallTunHelper()}
+                >
+                  {tunHelperBusy ? "Waiting for permission…" : "Install helper"}
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={
+                    tunHelperBusy ||
+                    !(
+                      tunStatus?.helper_install?.installed ||
+                      tunStatus?.helper_install?.binary_installed
+                    )
+                  }
+                  onClick={() => void onUninstallTunHelper()}
+                >
+                  Uninstall helper
+                </button>
+              </div>
+              <p className="muted">
+                Installing copies the bundled helper into its privileged
+                location and registers its service. On Windows the{" "}
+                <code>wintun</code> driver is installed next to it. Uninstalling
+                removes the service and the installed binary.
+              </p>
+            </div>
+
+            <form
+              className="settings-section"
+              onSubmit={(e) => void onSaveTun(e)}
+            >
+              <h3>Tunnel settings</h3>
+              <label className="checkbox-label" htmlFor="settings-tun-enabled">
+                <input
+                  id="settings-tun-enabled"
+                  type="checkbox"
+                  checked={tun.enabled}
+                  disabled={tunBusy}
+                  onChange={(e) => onTunChange("enabled", e.target.checked)}
+                />
+                <span>
+                  <strong>Enable full-device VPN (TUN)</strong> — route all
+                  traffic through Tor instead of only the local proxy ports
+                </span>
+              </label>
+
+              <div className="field-row">
+                <label htmlFor="settings-tun-kill-switch">Kill switch</label>
+                <select
+                  id="settings-tun-kill-switch"
+                  value={tun.kill_switch}
+                  disabled={tunBusy}
+                  onChange={(e) =>
+                    onTunChange("kill_switch", e.target.value as TunKillSwitch)
+                  }
+                >
+                  <option value="restore">
+                    Restore networking when the tunnel fails (default)
+                  </option>
+                  <option value="block">
+                    Block traffic until the tunnel is restored (fail closed)
+                  </option>
+                </select>
+              </div>
+              <p className="muted">
+                {tun.kill_switch === "block"
+                  ? "Fail-closed: when the tunnel or helper fails, traffic is blocked until the tunnel is restored or TUN mode is disabled."
+                  : "When the tunnel or helper fails, networking is restored: traffic may bypass Tor until TUN mode is re-enabled or disabled."}
+              </p>
+
+              <div className="field-row">
+                <label htmlFor="settings-tun-udp">UDP policy</label>
+                <select
+                  id="settings-tun-udp"
+                  value={tun.udp_policy}
+                  disabled={tunBusy}
+                  onChange={(e) =>
+                    onTunChange("udp_policy", e.target.value as TunUdpPolicy)
+                  }
+                >
+                  <option value="dns_only">
+                    Intercept DNS, drop other UDP (default)
+                  </option>
+                  <option value="block_all">
+                    Drop all UDP (including DNS)
+                  </option>
+                </select>
+              </div>
+              <p className="muted">
+                {tun.udp_policy === "block_all"
+                  ? "All UDP traffic is dropped, including DNS interception: only TCP connections work, and destinations must be IP literals or resolved without UDP DNS."
+                  : "DNS queries are intercepted and resolved through the tunnel; all other UDP (including QUIC and WebRTC) is dropped. Tor cannot carry UDP, so UDP-capable applications must fall back to TCP."}
+              </p>
+
+              <div className="field-row">
+                <label htmlFor="settings-tun-mtu">Interface MTU (bytes)</label>
+                <input
+                  id="settings-tun-mtu"
+                  type="number"
+                  min={TUN_MIN_MTU}
+                  max={TUN_MAX_MTU}
+                  step={1}
+                  value={tun.mtu}
+                  disabled={tunBusy}
+                  onChange={(e) => onTunChange("mtu", e.target.value)}
+                />
+              </div>
+              <p className="muted">
+                Default 1500. Allowed range: {TUN_MIN_MTU}–{TUN_MAX_MTU}.
+              </p>
+
+              <h3>Split tunneling</h3>
+              <p className="muted">
+                Destinations routed directly instead of through the tunnel.
+                Enter a CIDR prefix (for example <code>192.0.2.0/24</code> or{" "}
+                <code>2001:db8::/32</code>) or a domain suffix (for example{" "}
+                <code>example.com</code>; it also matches subdomains). Every
+                destination may appear only once.
+              </p>
+              {tun.exclude_rules.length === 0 ? (
+                <p className="muted">No split-tunnel rules.</p>
+              ) : (
+                <div className="tun-rules">
+                  {tun.exclude_rules.map((rule, index) => (
+                    <div className="tun-rule" key={index}>
+                      <input
+                        type="text"
+                        aria-label={`Split-tunnel destination ${index + 1}`}
+                        value={rule.destination}
+                        disabled={tunBusy}
+                        placeholder="192.0.2.0/24 or example.com"
+                        spellCheck={false}
+                        autoCapitalize="none"
+                        onChange={(e) =>
+                          updateTunRule(index, "destination", e.target.value)
+                        }
+                      />
+                      <input
+                        type="text"
+                        aria-label={`Split-tunnel comment ${index + 1}`}
+                        value={rule.comment}
+                        disabled={tunBusy}
+                        placeholder="Comment (optional)"
+                        onChange={(e) =>
+                          updateTunRule(index, "comment", e.target.value)
+                        }
+                      />
+                      <button
+                        type="button"
+                        className="small-button"
+                        disabled={tunBusy}
+                        onClick={() => removeTunRule(index)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="actions">
+                <button
+                  type="button"
+                  className="small-button"
+                  disabled={tunBusy}
+                  onClick={() => addTunRule()}
+                >
+                  Add rule
+                </button>
+              </div>
+
+              {tunError ? (
+                <p className="error" role="alert">
+                  {tunError}
+                </p>
+              ) : null}
+              {tunMessage ? <p className="muted">{tunMessage}</p> : null}
+              <div className="actions">
+                <DirtyNote dirty={tunDirty} />
+                <button
+                  className="primary"
+                  type="submit"
+                  disabled={tunBusy || !tunDirty}
+                >
+                  {tunBusy ? "Saving…" : "Save TUN settings"}
+                </button>
+                <button
+                  type="button"
+                  disabled={tunBusy}
+                  onClick={() => void loadTunSettings()}
+                >
+                  Reload
+                </button>
+              </div>
+            </form>
           </div>
 
           <div

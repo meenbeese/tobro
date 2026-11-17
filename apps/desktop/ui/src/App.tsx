@@ -21,7 +21,6 @@ import { StatusIcon } from "./StatusIcon";
 import { ConnectionInfo } from "./ConnectionInfo";
 import { storeDaemonInfo } from "./daemonInfo";
 import {
-  DEVICE_MODE_AVAILABLE,
   TUNNEL_MODE_KEY,
   readTunnelMode,
   setTunnelMode,
@@ -51,6 +50,10 @@ interface DaemonStatus {
   http_port?: number;
   dns_port?: number;
   bind_all_interfaces?: boolean;
+}
+
+interface TunStatusLite {
+  helper_install?: { installed?: boolean } | null;
 }
 
 interface TobroEvent {
@@ -100,6 +103,9 @@ export default function App() {
   const [tunnelMode, setTunnelModeState] = useState<TunnelMode>(() =>
     readTunnelMode(),
   );
+  const [tunHelperInstalled, setTunHelperInstalled] = useState<boolean | null>(
+    null,
+  );
   const idleTimer = useRef<number | null>(null);
 
   // Keep the mode in sync across windows (storage event) and within this
@@ -115,7 +121,31 @@ export default function App() {
     };
   }, []);
 
-  function onTunnelModeChange(mode: TunnelMode) {
+  // Device mode is only usable once the privileged helper is installed. Show
+  // install guidance while it is missing; the OS privilege prompt happens
+  // only when the user actually installs it from Settings.
+  useEffect(() => {
+    if (!reachable) {
+      setTunHelperInstalled(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const tun = await invoke<TunStatusLite>("daemon_tun_status");
+        if (!cancelled) {
+          setTunHelperInstalled(tun?.helper_install?.installed === true);
+        }
+      } catch {
+        if (!cancelled) setTunHelperInstalled(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [reachable, tunnelMode]);
+
+  async function onTunnelModeChange(mode: TunnelMode) {
     if (mode === tunnelMode) return;
     setTunnelMode(mode);
     setTunnelModeState(mode);
@@ -126,6 +156,26 @@ export default function App() {
       "info",
       "ui",
     );
+    if (!reachable) {
+      appendLog(
+        "daemon offline: the tunnel mode is stored and applied on connect",
+        "info",
+        "ui",
+      );
+      return;
+    }
+    try {
+      await invoke("daemon_apply_config", {
+        patch: { tun: { enabled: mode === "device" } },
+      });
+      appendLog(`tun.enabled = ${mode === "device"} (saved)`, "info", "daemon");
+    } catch (e) {
+      appendLog(
+        `could not persist the tunnel mode: ${String(e)}`,
+        "error",
+        "daemon",
+      );
+    }
   }
 
   function appendLog(
@@ -209,6 +259,20 @@ export default function App() {
               s.state === "error" ? "error" : "info",
               "daemon",
             );
+          } else if (e.method === "ui.auto_connect_error") {
+            const p = (e.params ?? {}) as { error?: string };
+            appendLog(
+              `connect failed: ${p.error ?? "unknown error"}`,
+              "error",
+              "daemon",
+            );
+          } else if (e.method === "ui.daemon_spawn") {
+            const p = (e.params ?? {}) as { path?: string };
+            appendLog(
+              `starting tobrod${p.path ? ` (${p.path})` : ""}`,
+              "info",
+              "ui",
+            );
           } else if (e.method) {
             appendLog(`${e.method}`, "info", "daemon");
           }
@@ -243,16 +307,10 @@ export default function App() {
       status?.state === "connected" ||
       status?.state === "serving");
   // Allow Connect even when the local daemon is unavailable so the desktop can
-  // start tobrod and connect with a single button (Orbot parity).
-  // In device mode the TUN engine is not wired up yet, so connecting would
-  // silently run in ports mode — keep Connect disabled there until M7.
-  const deviceModeUnavailable =
-    tunnelMode === "device" && !DEVICE_MODE_AVAILABLE;
-  const canConnect =
-    !deviceModeUnavailable &&
-    !busy &&
-    !isActive &&
-    status?.state !== "stopping";
+  // start tobrod and connect with a single button (Orbot parity). Device mode
+  // is usable too: Connect persists `tun.enabled` before Tor connects and the
+  // daemon reports a clear error if the privileged helper is missing.
+  const canConnect = !busy && !isActive && status?.state !== "stopping";
   const canNewIdentity =
     reachable &&
     !busy &&
@@ -481,7 +539,9 @@ export default function App() {
     setBusy(true);
     appendLog("requesting connect…", "info", "ui");
     try {
-      const result = await invoke<{ status?: string }>("daemon_connect");
+      const result = await invoke<{ status?: string }>("daemon_connect", {
+        tunEnabled: tunnelMode === "device",
+      });
       if (result?.status) appendLog(String(result.status), "info", "ui");
     } catch (e) {
       appendLog(String(e), "error", "ui");
@@ -654,7 +714,7 @@ export default function App() {
               role="radio"
               aria-checked={tunnelMode === "ports"}
               className={tunnelMode === "ports" ? "active" : ""}
-              onClick={() => onTunnelModeChange("ports")}
+              onClick={() => void onTunnelModeChange("ports")}
               title="Route selected apps through local proxies (SOCKS/HTTP/DNS)"
             >
               <Plugs size={16} aria-hidden="true" />
@@ -665,18 +725,18 @@ export default function App() {
               role="radio"
               aria-checked={tunnelMode === "device"}
               className={tunnelMode === "device" ? "active" : ""}
-              onClick={() => onTunnelModeChange("device")}
+              onClick={() => void onTunnelModeChange("device")}
               title="Route all device traffic through Tor via the privileged TUN helper"
             >
               <ShieldCheck size={16} aria-hidden="true" />
               Full device VPN
             </button>
           </div>
-          {deviceModeUnavailable ? (
+          {tunnelMode === "device" && tunHelperInstalled === false ? (
             <p className="muted mode-note" role="note">
-              Full-device VPN is not available in this build yet (planned in
-              milestone M7): it needs the privileged TUN helper and routing
-              engine. Switch back to ports mode to connect.
+              The privileged TUN helper is not installed yet. Install it in
+              Settings → TUN Mode, then connect. The operating system asks for
+              permission only when you install it.
             </p>
           ) : null}
           {!reachable ? (

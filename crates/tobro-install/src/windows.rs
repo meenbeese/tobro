@@ -1,11 +1,14 @@
 //! Windows installer: Windows service + UAC elevation.
 //!
-//! Install = stop any running `tobro-helper` service, copy the binary into
+//! Install = stop any running `tobro-helper` service, copy the binary **and
+//! the `wintun.dll` driver that sits next to it** into
 //! `%ProgramFiles%\Tobro\helper\`, create the demand-start service (run as
 //! `LocalSystem`), grant interactive users start/stop via the service DACL,
 //! and start it. The DACL grant is what lets the *unprivileged daemon* start
 //! and stop the helper with `sc` — no further prompts while TUN mode is
-//! toggled.
+//! toggled. The driver copy is required because the privileged helper lives
+//! outside the app bundle, while `wintun.dll` is loaded from the helper's own
+//! directory.
 //!
 //! Elevation: the generated `.ps1` runs through `Start-Process -Verb RunAs`
 //! (the UAC consent prompt). The elevated script writes a JSON result file
@@ -34,6 +37,8 @@ pub const SERVICE_NAME: &str = "tobro-helper";
 pub struct Locations {
     /// Privileged binary target.
     pub binary: PathBuf,
+    /// The wintun driver target (loaded from beside the helper binary).
+    pub wintun: PathBuf,
 }
 
 impl Locations {
@@ -44,30 +49,54 @@ impl Locations {
             // The standard fallback; only reachable with a broken environment.
             r"C:\Program Files".to_owned()
         });
+        let helper_dir = PathBuf::from(program_files).join("Tobro").join("helper");
         Self {
-            binary: PathBuf::from(program_files)
-                .join("Tobro")
-                .join("helper")
-                .join("tobro-helper.exe"),
+            binary: helper_dir.join("tobro-helper.exe"),
+            wintun: helper_dir.join("wintun.dll"),
         }
     }
 }
 
-/// Install the helper (one elevated script): binary, service, DACL, started.
+/// The `wintun.dll` that must sit next to the source helper binary. Device
+/// creation loads it from the helper's own directory, so packaging ships it
+/// beside the sidecar and this installer carries it into the privileged
+/// directory. Checked before anything is elevated so the failure is clear.
+fn source_wintun(spec: &InstallSpec) -> Result<PathBuf, InstallError> {
+    let dir = spec.source_binary.parent().ok_or_else(|| {
+        InstallError::SourceInvalid("the helper binary path has no parent directory".to_owned())
+    })?;
+    let path = dir.join("wintun.dll");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(InstallError::WintunMissing(path.display().to_string()))
+    }
+}
+
+/// Install the helper (one elevated script): binary, wintun driver, service,
+/// DACL, started.
 pub fn install<R: Runner>(
     runner: &R,
     locations: &Locations,
     spec: &InstallSpec,
     sha256_hex: String,
 ) -> Result<InstallReport, InstallError> {
+    let source_wintun = source_wintun(spec)?;
     let source = spec.source_binary.to_string_lossy().into_owned();
+    let wintun = source_wintun.to_string_lossy().into_owned();
     run_elevated_script(runner, "install", |result_path| {
-        install_script(locations, &source, &result_path.display().to_string())
+        install_script(
+            locations,
+            &source,
+            &wintun,
+            &result_path.display().to_string(),
+        )
     })?;
     Ok(InstallReport {
         target_binary: locations.binary.display().to_string(),
         actions: vec![
             "binary".to_owned(),
+            "wintun".to_owned(),
             "service".to_owned(),
             "dacl".to_owned(),
             "started".to_owned(),
@@ -83,7 +112,7 @@ pub fn uninstall<R: Runner>(
     spec: &InstallSpec,
 ) -> Result<UninstallReport, InstallError> {
     let status = status(runner, locations, spec);
-    if !status.binary_installed && !status.service_registered {
+    if !status.binary_installed && !status.service_registered && !status.wintun_installed() {
         return Ok(UninstallReport {
             actions: Vec::new(),
             already_clean: true,
@@ -97,6 +126,7 @@ pub fn uninstall<R: Runner>(
             "service-stopped".to_owned(),
             "service-deleted".to_owned(),
             "binary-removed".to_owned(),
+            "wintun-removed".to_owned(),
         ],
         already_clean: false,
     })
@@ -124,6 +154,7 @@ pub fn status<R: Runner>(runner: &R, locations: &Locations, spec: &InstallSpec) 
         service_running,
         target_binary: locations.binary.display().to_string(),
         sha256_matches,
+        wintun_installed: Some(locations.wintun.is_file()),
     }
 }
 
@@ -240,9 +271,16 @@ fn parse_result(text: &str) -> Option<ScriptResult> {
 /// The elevated install script (PowerShell). Paths arrive validated and
 /// PowerShell-quoted. `sc.exe` is invoked with the `.exe` suffix deliberately
 /// (`sc` alone is the PowerShell `Set-Content` alias).
-fn install_script(locations: &Locations, source: &str, result_path: &str) -> String {
+fn install_script(
+    locations: &Locations,
+    source: &str,
+    source_wintun: &str,
+    result_path: &str,
+) -> String {
     let src = elevate::powershell_quote(source);
     let dst = elevate::powershell_quote(&locations.binary.display().to_string());
+    let wintun_src = elevate::powershell_quote(source_wintun);
+    let wintun_dst = elevate::powershell_quote(&locations.wintun.display().to_string());
     let dir = elevate::powershell_quote(
         &locations
             .binary
@@ -269,6 +307,8 @@ try {{
     }}
     if (-not $copied) {{ throw 'could not copy the helper binary (service still running?)' }}
     $result.actions += 'binary'
+    Copy-Item -Force {wintun_src} {wintun_dst}
+    $result.actions += 'wintun'
     sc.exe query {SERVICE_NAME} | Out-Null
     if ($LASTEXITCODE -ne 0) {{
         sc.exe create {SERVICE_NAME} binPath= {bin_value} start= demand obj= LocalSystem DisplayName= 'Tobro Helper' | Out-Null
@@ -295,12 +335,14 @@ exit 0
 /// binary. Every step tolerates a missing piece.
 fn uninstall_script(locations: &Locations) -> String {
     let dst = elevate::powershell_quote(&locations.binary.display().to_string());
+    let wintun_dst = elevate::powershell_quote(&locations.wintun.display().to_string());
     format!(
         r#"$ErrorActionPreference = 'Continue'
 sc.exe stop {SERVICE_NAME} | Out-Null
 Start-Sleep -Milliseconds 800
 sc.exe delete {SERVICE_NAME} | Out-Null
 Remove-Item -Force {dst} -ErrorAction SilentlyContinue
+Remove-Item -Force {wintun_dst} -ErrorAction SilentlyContinue
 exit 0
 "#
     )
@@ -386,18 +428,21 @@ mod tests {
         Some(PathBuf::from(&arg[start..end]))
     }
 
-    /// Hermetic locations (temp dir) + a real source binary.
+    /// Hermetic locations (temp dir) + a real source binary with its driver.
     fn ctx() -> (tempfile::TempDir, Locations, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source").join("tobro-helper.exe");
         std::fs::create_dir_all(source.parent().expect("parent")).expect("source dir");
         std::fs::write(&source, b"helper binary").expect("write source");
+        std::fs::write(
+            source.parent().expect("parent").join("wintun.dll"),
+            b"driver",
+        )
+        .expect("write wintun");
+        let target = dir.path().join("target").join("Tobro");
         let locations = Locations {
-            binary: dir
-                .path()
-                .join("target")
-                .join("Tobro")
-                .join("tobro-helper.exe"),
+            binary: target.join("tobro-helper.exe"),
+            wintun: target.join("wintun.dll"),
         };
         (dir, locations, source)
     }
@@ -413,9 +458,11 @@ mod tests {
     #[test]
     fn install_script_creates_and_starts_the_service() {
         let (_dir, locations, source) = ctx();
+        let source_wintun = source.parent().expect("parent").join("wintun.dll");
         let script = install_script(
             &locations,
             source.display().to_string().as_str(),
+            source_wintun.display().to_string().as_str(),
             r"C:\Temp\result.json",
         );
         assert!(script.contains("sc.exe create"), "{script}");
@@ -443,6 +490,30 @@ mod tests {
             script.contains(&format!("Copy-Item -Force '{}'", source.display())),
             "{script}"
         );
+        // The driver is copied into the privileged directory as well.
+        assert!(
+            script.contains(&format!(
+                "Copy-Item -Force '{}' '{}'",
+                source_wintun.display(),
+                locations.wintun.display()
+            )),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn install_requires_the_wintun_driver_next_to_the_source() {
+        let (_dir, locations, source) = ctx();
+        std::fs::remove_file(source.parent().expect("parent").join("wintun.dll"))
+            .expect("remove driver");
+        let runner = RecordingRunner::default();
+        let error = install(&runner, &locations, &spec(&source), "cafe".to_owned())
+            .expect_err("a missing driver must fail before elevation");
+        assert!(matches!(error, InstallError::WintunMissing(_)), "{error}");
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may be elevated when the driver is missing"
+        );
     }
 
     #[test]
@@ -452,6 +523,10 @@ mod tests {
         assert!(script.contains("sc.exe stop"), "{script}");
         assert!(script.contains("sc.exe delete"), "{script}");
         assert!(script.contains("Remove-Item -Force"), "{script}");
+        assert!(
+            script.contains(&locations.wintun.display().to_string()),
+            "the driver is removed too: {script}"
+        );
     }
 
     #[test]
@@ -460,7 +535,10 @@ mod tests {
         let runner = RecordingRunner::default();
         let report = install(&runner, &locations, &spec(&source), "cafe".to_owned())
             .expect("recording runner must succeed");
-        assert_eq!(report.actions, vec!["binary", "service", "dacl", "started"]);
+        assert_eq!(
+            report.actions,
+            vec!["binary", "wintun", "service", "dacl", "started"]
+        );
         assert_eq!(report.sha256_hex, "cafe");
         let (program, args) = runner.calls().first().expect("one elevated call").clone();
         assert_eq!(program, "powershell.exe");
@@ -546,11 +624,15 @@ mod tests {
             "SERVICE_NAME: tobro-helper\n        STATE              : 4  RUNNING\n",
             "",
         );
-        let status = status(&runner, &locations, &spec(std::path::Path::new("/x")));
-        assert!(status.service_registered);
-        assert_eq!(status.service_running, Some(true));
-        assert!(!status.binary_installed);
-        assert_eq!(status.target_binary, locations.binary.display().to_string());
+        let running = status(&runner, &locations, &spec(std::path::Path::new("/x")));
+        assert!(running.service_registered);
+        assert_eq!(running.service_running, Some(true));
+        assert!(!running.binary_installed);
+        assert!(!running.wintun_installed(), "the driver was not installed");
+        assert_eq!(
+            running.target_binary,
+            locations.binary.display().to_string()
+        );
 
         let runner = RecordingRunner::with_response(1060, "", "service does not exist");
         let status = status(&runner, &locations, &spec(std::path::Path::new("/x")));

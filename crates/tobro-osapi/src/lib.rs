@@ -24,8 +24,10 @@
 //!   ([`pf`]) — never `pfctl`, per §10.5's no-shell rule.
 //! - **Windows**: calling the two iphlpapi functions
 //!   (`CreateIpForwardEntry2` / `DeleteIpForwardEntry2`) with a zeroed-out
-//!   struct filled from validated plain-data inputs, and the handful of
-//!   Windows Filtering Platform calls used by the kill switch ([`wfp`]).
+//!   struct filled from validated plain-data inputs, the handful of Windows
+//!   Filtering Platform calls used by the kill switch ([`wfp`]), and the
+//!   named-pipe security/token calls that scope the helper IPC endpoint to
+//!   one user SID ([`win_pipe`]).
 //!
 //! Every public function is safe and takes plain `std::net` types. Nothing
 //! here shells out, listens, or touches anything beyond the routing tables.
@@ -54,6 +56,11 @@ pub mod unix_ids;
 /// Windows Filtering Platform (WFP) kill-switch enforcement (M7 T4c).
 #[cfg(target_os = "windows")]
 pub mod wfp;
+
+/// Windows named-pipe security: the helper IPC endpoint's DACL and the
+/// connecting user's SID (M7 T4c).
+#[cfg(target_os = "windows")]
+pub mod win_pipe;
 
 #[cfg(target_os = "windows")]
 pub mod win_route;

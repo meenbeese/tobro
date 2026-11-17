@@ -29,9 +29,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
     "Win32_System_Rpc",
+    "Win32_System_Threading",
 ] }
 wintun-bindings = { workspace = true }
+# Named-pipe creation with the installer-chosen security descriptor (`win_pipe`).
+# `create_with_security_attributes_raw` needs the raw attributes pointer, which
+# the workspace `unsafe_code = "forbid"` keeps out of `tobro-helper`.
+tokio = { workspace = true, features = ["net"] }
 
 # This is the ONLY workspace crate allowed to use `unsafe`. The workspace
 # default is `unsafe_code = "forbid"`; this crate replaces the lint table

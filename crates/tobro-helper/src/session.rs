@@ -7,10 +7,11 @@
 //!   the socket. The gate locks to the uid of the *first* successful
 //!   handshake and rejects every other uid from then on. A peer whose
 //!   credentials cannot be determined is always denied.
-//! - **Windows** — named pipes do not expose a portable peer user through
-//!   tokio, so peers report [`PeerIdentity::Unknown`]; the gate admits them
-//!   for now and the real check (SID-based, via the pipe's client token)
-//!   lands with the Windows service install (M7 T4c).
+//! - **Windows** — the connecting process's user SID is read from its token
+//!   and compared with the SID the installer recorded (`--allow-sid`). Only
+//!   that user is admitted; the pipe DACL already scopes connections to the
+//!   same user, so the gate is the authoritative check behind it. A peer
+//!   whose SID cannot be read is always denied.
 //!
 //! The first message on any connection must be a handshake; anything else
 //! is answered with an `UNAUTHORIZED` rejection and the connection is
@@ -47,13 +48,13 @@ pub enum ServeExit {
 }
 
 /// The identity of the connecting peer, as far as the transport can tell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerIdentity {
     /// Unix peer credential: the connecting process's effective uid.
     Uid(u32),
-    /// The transport cannot identify the peer (Windows interim). Admitted,
-    /// pending the SID-based check in M7 T4c.
-    Unknown,
+    /// Windows peer credential: the connecting process's user SID, in the
+    /// raw SID byte layout (compared byte-for-byte with the installer's SID).
+    Sid(Vec<u8>),
     /// The transport should be able to identify the peer but could not.
     /// Always denied: an unverifiable peer is an attack signal, not a
     /// compatibility mode.
@@ -62,11 +63,11 @@ pub enum PeerIdentity {
 
 impl PeerIdentity {
     /// Log-safe name of the identity kind (never the value itself; the uid
-    /// is not sensitive, but summaries stay uniform).
+    /// is not sensitive, and SIDs stay out of logs too).
     fn kind(&self) -> &'static str {
         match self {
             PeerIdentity::Uid(_) => "uid",
-            PeerIdentity::Unknown => "unknown",
+            PeerIdentity::Sid(_) => "sid",
             PeerIdentity::Unverifiable => "unverifiable",
         }
     }
@@ -78,32 +79,43 @@ impl PeerIdentity {
 /// no shared locking is needed — `&mut PeerGate` is the entire interface.
 #[derive(Debug, Default)]
 pub struct PeerGate {
-    /// Uid the gate locked onto, if any.
+    /// Uid the gate locked onto, if any (Unix).
     locked_uid: Option<u32>,
+    /// The only SID admitted, from the installer (Windows). `None` denies
+    /// every SID peer: a helper without a configured client must not serve.
+    allowed_sid: Option<Vec<u8>>,
 }
 
 impl PeerGate {
-    /// A fresh, unlocked gate.
+    /// A fresh gate for the Unix uid rule.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Decide whether `peer` may proceed to the handshake. The first
-    /// admissible `Uid` peer locks the gate; later peers must match it.
-    pub fn authorize(&mut self, peer: PeerIdentity) -> bool {
+    /// A gate that admits exactly `sid` (the installer-recorded daemon user).
+    pub fn with_allowed_sid(sid: Vec<u8>) -> Self {
+        Self {
+            locked_uid: None,
+            allowed_sid: Some(sid),
+        }
+    }
+
+    /// Decide whether `peer` may proceed to the handshake. On Unix the first
+    /// admissible `Uid` peer locks the gate; later peers must match it. On
+    /// Windows the peer's SID must equal the installer-recorded SID.
+    pub fn authorize(&mut self, peer: &PeerIdentity) -> bool {
         match peer {
             PeerIdentity::Unverifiable => false,
-            PeerIdentity::Unknown => {
-                // Interim Windows behavior (M7 T4c replaces this with a
-                // SID check against the service's expected client).
-                true
-            }
+            PeerIdentity::Sid(sid) => self
+                .allowed_sid
+                .as_deref()
+                .is_some_and(|allowed| allowed == sid.as_slice()),
             PeerIdentity::Uid(uid) => match self.locked_uid {
                 None => {
-                    self.locked_uid = Some(uid);
+                    self.locked_uid = Some(*uid);
                     true
                 }
-                Some(locked) => locked == uid,
+                Some(locked) => locked == *uid,
             },
         }
     }
@@ -120,7 +132,7 @@ async fn serve_connection<S, P>(
     stream: &mut S,
     service: &mut HelperService<P>,
     gate: &mut PeerGate,
-    peer: PeerIdentity,
+    peer: &PeerIdentity,
 ) where
     S: Stream<Item = Result<HelperMessage, HelperError>>
         + Sink<HelperMessage, Error = HelperError>
@@ -157,8 +169,7 @@ async fn serve_connection<S, P>(
         tracing::warn!(
             "denied {} peer: gate is locked to another client or identity unverifiable",
             peer.kind()
-        );
-        let _ = send_reject(
+        );        let _ = send_reject(
             stream,
             reject_codes::UNAUTHORIZED,
             "peer identity not permitted",
@@ -250,7 +261,7 @@ pub async fn serve_unix<P: Platform>(
                     Ok((stream, _)) => {
                         let peer = peer_identity_unix(&stream);
                         let mut framed = Framed::new(stream, HelperCodec::new());
-                        serve_connection(&mut framed, service, &mut gate, peer).await;
+                        serve_connection(&mut framed, service, &mut gate, &peer).await;
                     }
                     Err(error) => {
                         // Transient accept errors happen (EMFILE, ...);
@@ -282,55 +293,66 @@ fn peer_identity_unix(stream: &tokio::net::UnixStream) -> PeerIdentity {
 /// clients where connections fail; clients retry (see
 /// `TunHelperClient::connect_with_retry`).
 ///
+/// `allow_sid` is the daemon user's SID the installer recorded: it scopes
+/// the pipe DACL ([`tobro_osapi::win_pipe::PipeSecurity`]) and the
+/// handshake gate. A malformed or missing SID fails the loop closed.
+///
 /// See [`serve_unix`] for idle/shutdown semantics.
 #[cfg(windows)]
 pub async fn serve_windows<P: Platform>(
     path: &std::path::Path,
+    allow_sid: &str,
     service: &mut HelperService<P>,
     idle: Option<Duration>,
 ) -> ServeExit {
-    use tokio::net::windows::named_pipe::NamedPipeServer;
+    use tobro_osapi::win_pipe::{PipeSecurity, create_server, peer_sid, sid_from_string};
 
-    let mut gate = PeerGate::new();
+    let (security, expected_sid) =
+        match (PipeSecurity::for_sid(allow_sid), sid_from_string(allow_sid)) {
+            (Ok(security), Ok(sid)) => (security, sid),
+            (Err(error), _) | (_, Err(error)) => {
+                return ServeExit::BindError(format!(
+                    "the allowed client SID (--allow-sid) is not usable: {error}"
+                ));
+            }
+        };
+    let mut gate = PeerGate::with_allowed_sid(expected_sid);
+
     loop {
+        let server = match create_server(path, &security) {
+            Ok(server) => server,
+            Err(error) => return ServeExit::BindError(error.to_string()),
+        };
+        // Wait for a client to connect, but keep honoring shutdown/idle
+        // while waiting.
         tokio::select! {
             exit = shutdown_signal() => {
+                drop(server);
                 teardown_if_active(service, "shutdown signal").await;
                 return exit;
             }
             exit = idle_window(idle) => {
+                drop(server);
                 teardown_if_active(service, "idle timeout").await;
                 return exit;
             }
-            bound = tobro_tun::bind_listener(path) => {
-                let server: NamedPipeServer = match bound {
-                    Ok(server) => server,
+            connected = server.connect() => {
+                if let Err(error) = connected {
+                    tracing::warn!("pipe connect failed: {error}");
+                    continue;
+                }
+                // Read the client's SID before any protocol bytes are
+                // dispatched. A failure is an unverifiable peer, which the
+                // gate denies.
+                let peer = match peer_sid(&server) {
+                    Ok(sid) => PeerIdentity::Sid(sid),
                     Err(error) => {
-                        return ServeExit::BindError(error.to_string());
+                        tracing::warn!("could not read the connecting user's SID: {error}");
+                        PeerIdentity::Unverifiable
                     }
                 };
-                // Wait for a client to connect, but keep honoring
-                // shutdown/idle while waiting.
-                tokio::select! {
-                    exit = shutdown_signal() => {
-                        drop(server);
-                        teardown_if_active(service, "shutdown signal").await;
-                        return exit;
-                    }
-                    exit = idle_window(idle) => {
-                        drop(server);
-                        teardown_if_active(service, "idle timeout").await;
-                        return exit;
-                    }
-                    connected = server.connect() => {
-                        if let Err(error) = connected {
-                            tracing::warn!("pipe connect failed: {error}");
-                            continue;
-                        }
-                        let mut framed = Framed::new(server, HelperCodec::new());
-                        serve_connection(&mut framed, service, &mut gate, PeerIdentity::Unknown).await;
-                    }
-                }
+                let mut framed = Framed::new(server, HelperCodec::new());
+                serve_connection(&mut framed, service, &mut gate, &peer).await;
             }
         }
     }

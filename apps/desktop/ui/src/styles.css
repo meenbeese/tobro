@@ -912,6 +912,31 @@ textarea {
   padding: 8px 10px;
   font: inherit;
 }
+.tun-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0;
+}
+.tun-rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.tun-rule input {
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 8px 10px;
+  font: inherit;
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+.tun-rule input[aria-label*="comment"] {
+  flex: 1 1 160px;
+}
 .settings-section .port-grid label,
 .settings-section > label:not(.checkbox-label) {
   display: flex;

@@ -1,6 +1,9 @@
 # Prepared sidecar binaries (target-suffixed) for Tauri bundling.
 tobrod-*
 tobrod.exe-*
+tobro-helper-*
+tobro-helper.exe-*
+wintun.dll
 *.exe
 !*.gitignore
 !README.md

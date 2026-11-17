@@ -219,5 +219,9 @@ mod tests {
             value["service_running"].is_null() || value["service_running"].is_boolean(),
             "{value}"
         );
+        assert!(
+            value.get("wintun_installed").is_some(),
+            "the status payload reports the Windows driver slot: {value}"
+        );
     }
 }

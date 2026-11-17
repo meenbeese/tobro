@@ -15,9 +15,10 @@
 //! - Routes go through `tobro-osapi`'s iphlpapi FFI. Adds report
 //!   `Exists`/deletes `NotFound`, so convergence mirrors the other backends:
 //!   replace-on-add, idempotent deletes.
-//! - `wintun.dll` must sit next to the helper binary (bundled by packaging,
-//!   M8); until then device creation fails with a clear error. The driver
-//!   library is loaded lazily on first use so `status`/`teardown` still work.
+//! - `wintun.dll` must sit next to the helper binary: packaging ships it with
+//!   the helper sidecar and `tobro-install` copies it into the privileged
+//!   helper directory. The driver library is loaded lazily on first use so
+//!   `status`/`teardown` still work before the driver is available.
 //! - `KillSwitchMode::Block` installs persistent Windows Filtering Platform
 //!   filters through `tobro-osapi`'s WFP FFI (the helper never shells out,
 //!   §10.5): permit loopback, the tunnel adapter (matched by LUID), and each
@@ -256,7 +257,8 @@ impl Platform for WindowsPlatform {
                 })?
                 .map_err(|error| {
                     PlatformError::Device(format!(
-                        "could not load the wintun driver from beside the helper binary: {error}"
+                        "could not load the wintun driver from beside the helper binary \
+                         (reinstall the helper so wintun.dll is copied next to it): {error}"
                     ))
                 })?
             }

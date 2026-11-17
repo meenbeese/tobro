@@ -126,6 +126,7 @@ pub fn status<R: Runner>(runner: &R, locations: &Locations, spec: &InstallSpec) 
         service_running,
         target_binary: locations.binary.display().to_string(),
         sha256_matches,
+        wintun_installed: None,
     }
 }
 

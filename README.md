@@ -348,6 +348,28 @@ and starts it as `tobrod run --socket <path>`. For development, make sure the
 daemon binary is built (for example `cargo build -p tobrod`) so the GUI can find
 it. You can still run the daemon manually: `cargo run -p tobrod -- run`.
 
+### Packaging the desktop app
+
+Packaged builds need both the daemon and the privileged helper as Tauri
+sidecars (and the Windows wintun driver). Stage them for the target, then
+bundle:
+
+```sh
+# macOS/Linux (add --target <triple> when cross-targeting)
+bash apps/desktop/scripts/prepare-tobrod-sidecar.sh
+bash apps/desktop/scripts/prepare-tobro-helper-sidecar.sh
+
+# Windows: wintun.dll must sit next to tobro-helper.exe
+bash apps/desktop/scripts/prepare-tobro-helper-sidecar.sh \
+  --wintun /path/to/wintun.dll --wintun-sha256 <sha256>
+
+cargo tauri build --config apps/desktop/tauri.sidecar.conf.json
+```
+
+`tun.helper.install` copies the bundled helper into its privileged location;
+on Windows the installer also copies `wintun.dll` next to it, because the
+helper loads the driver from its own directory.
+
 The shell connects to `tobrod` over local IPC (default platform state path, or
 `--socket <path>`), shows status/bootstrap progress, provides Connect/Stop/New
 identity, full settings (listeners, outbound proxy, exit country and IP

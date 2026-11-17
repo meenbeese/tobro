@@ -32,7 +32,12 @@ struct TrayState {
 
 #[derive(Debug)]
 enum IpcCommand {
-    Connect(oneshot::Sender<Result<Value, String>>),
+    Connect {
+        /// Tunnel mode to persist (`tun.enabled`) before connecting.
+        /// `None` leaves the stored config untouched.
+        tun_enabled: Option<bool>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     Stop(oneshot::Sender<Result<Value, String>>),
     NewIdentity(oneshot::Sender<Result<Value, String>>),
     ConfigGet(oneshot::Sender<Result<Value, String>>),
@@ -97,6 +102,9 @@ enum IpcCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    TunStatus(oneshot::Sender<Result<Value, String>>),
+    TunHelperInstall(oneshot::Sender<Result<Value, String>>),
+    TunHelperUninstall(oneshot::Sender<Result<Value, String>>),
 }
 
 #[derive(Debug, Default)]
@@ -139,11 +147,17 @@ fn status(state: State<'_, AppState>) -> Value {
 }
 
 #[tauri::command]
-async fn daemon_connect(state: State<'_, AppState>) -> Result<Value, String> {
+async fn daemon_connect(
+    state: State<'_, AppState>,
+    tun_enabled: Option<bool>,
+) -> Result<Value, String> {
     let (tx, rx) = oneshot::channel();
     state
         .commands
-        .send(IpcCommand::Connect(tx))
+        .send(IpcCommand::Connect {
+            tun_enabled,
+            reply: tx,
+        })
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -204,6 +218,46 @@ async fn daemon_apply_config(state: State<'_, AppState>, patch: Value) -> Result
     state
         .commands
         .send(IpcCommand::ConfigApply { patch, reply: tx })
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+#[tauri::command]
+async fn daemon_tun_status(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::TunStatus(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+/// Install the privileged TUN helper. This is the step that triggers the OS
+/// privilege prompt; the daemon drives the platform installer and waits for
+/// the user to answer.
+#[tauri::command]
+async fn daemon_tun_helper_install(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::TunHelperInstall(tx))
+        .await
+        .map_err(|_| "daemon connection task is not running".to_owned())?;
+    rx.await
+        .map_err(|_| "daemon connection task dropped the response".to_owned())?
+}
+
+/// Remove the privileged TUN helper and its service registration.
+#[tauri::command]
+async fn daemon_tun_helper_uninstall(state: State<'_, AppState>) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .commands
+        .send(IpcCommand::TunHelperUninstall(tx))
         .await
         .map_err(|_| "daemon connection task is not running".to_owned())?;
     rx.await
@@ -708,6 +762,9 @@ fn main() {
             daemon_get_config,
             daemon_validate_config,
             daemon_apply_config,
+            daemon_tun_status,
+            daemon_tun_helper_install,
+            daemon_tun_helper_uninstall,
             daemon_test_bridges,
             daemon_kindness_status,
             daemon_kindness_check,
@@ -1007,7 +1064,10 @@ fn dispatch_tray_command(app: &AppHandle, kind: IpcCommandKind) {
     tauri::async_runtime::spawn(async move {
         let (tx, rx) = oneshot::channel();
         let cmd = match kind {
-            IpcCommandKind::Connect => IpcCommand::Connect(tx),
+            IpcCommandKind::Connect => IpcCommand::Connect {
+                tun_enabled: None,
+                reply: tx,
+            },
             IpcCommandKind::Stop => IpcCommand::Stop(tx),
             IpcCommandKind::NewIdentity => IpcCommand::NewIdentity(tx),
         };
@@ -1676,13 +1736,15 @@ async fn watch_daemon(
     mut commands: mpsc::Receiver<IpcCommand>,
 ) {
     let mut last_spawn_attempt: Option<Instant> = None;
-    let mut connect_pending = false;
+    // `Some(tun_enabled)` = a Connect is waiting for IPC (device mode is
+    // persisted right before the actual CONNECT call).
+    let mut connect_pending: Option<Option<bool>> = None;
     loop {
         match connect_once(&handle, &daemon_socket, &mut commands, &mut connect_pending).await {
             Ok(()) => {}
             Err(error) if error == "desktop command channel closed" => return,
             Err(error) => {
-                let should_spawn = connect_pending
+                let should_spawn = connect_pending.is_some()
                     || last_spawn_attempt
                         .map(|t| t.elapsed() >= Duration::from_secs(10))
                         .unwrap_or(true);
@@ -1705,7 +1767,7 @@ async fn watch_daemon(
                             );
                         }
                         Err(spawn_error) => {
-                            connect_pending = false;
+                            connect_pending = None;
                             let msg = format!(
                                 "tobrod is not reachable: {error}. Automatic start failed: {spawn_error}. \
                                  You can set TOBROD_PATH or run `tobrod run --socket {}`.",
@@ -1741,8 +1803,8 @@ async fn watch_daemon(
                 break;
             }
             match tokio::time::timeout(remaining, commands.recv()).await {
-                Ok(Some(IpcCommand::Connect(tx))) => {
-                    connect_pending = true;
+                Ok(Some(IpcCommand::Connect { tun_enabled, reply })) => {
+                    connect_pending = Some(tun_enabled);
                     let should_spawn = last_spawn_attempt
                         .map(|t| t.elapsed() >= Duration::from_secs(2))
                         .unwrap_or(true);
@@ -1750,8 +1812,8 @@ async fn watch_daemon(
                     if should_spawn {
                         last_spawn_attempt = Some(Instant::now());
                         if let Err(spawn_error) = spawn_daemon(&daemon_socket) {
-                            connect_pending = false;
-                            let _ = tx.send(Err(format!(
+                            connect_pending = None;
+                            let _ = reply.send(Err(format!(
                                 "could not start tobrod: {spawn_error}. Set TOBROD_PATH or run `tobrod run --socket {}`.",
                                 daemon_socket.display()
                             )));
@@ -1759,7 +1821,7 @@ async fn watch_daemon(
                         }
                         note = "starting tobrod and connecting...".to_owned();
                     }
-                    let _ = tx.send(Ok(
+                    let _ = reply.send(Ok(
                         json!({ "ok": true, "action": "connect", "status": note }),
                     ));
                 }
@@ -1832,16 +1894,19 @@ fn find_tobrod_binary() -> Result<PathBuf, String> {
 fn reject_command(cmd: IpcCommand, message: &str) {
     let err = Err(message.to_owned());
     match cmd {
-        IpcCommand::Connect(tx)
-        | IpcCommand::Stop(tx)
-        | IpcCommand::NewIdentity(tx)
-        | IpcCommand::ConfigGet(tx)
-        | IpcCommand::KindnessStatus(tx)
-        | IpcCommand::KindnessCheck(tx)
-        | IpcCommand::KindnessResetStats(tx)
-        | IpcCommand::OnionList(tx)
-        | IpcCommand::ClientAuthList(tx) => {
-            let _ = tx.send(err);
+        IpcCommand::Connect { reply, .. }
+        | IpcCommand::Stop(reply)
+        | IpcCommand::NewIdentity(reply)
+        | IpcCommand::ConfigGet(reply)
+        | IpcCommand::KindnessStatus(reply)
+        | IpcCommand::KindnessCheck(reply)
+        | IpcCommand::KindnessResetStats(reply)
+        | IpcCommand::OnionList(reply)
+        | IpcCommand::ClientAuthList(reply)
+        | IpcCommand::TunStatus(reply)
+        | IpcCommand::TunHelperInstall(reply)
+        | IpcCommand::TunHelperUninstall(reply) => {
+            let _ = reply.send(err);
         }
         IpcCommand::ConfigValidate { reply, .. }
         | IpcCommand::ConfigApply { reply, .. }
@@ -1862,11 +1927,32 @@ fn reject_command(cmd: IpcCommand, message: &str) {
     }
 }
 
+/// Persist the requested tunnel mode (`tun.enabled`) before connecting so a
+/// device-mode Connect can never silently run in ports mode. Depending on the
+/// daemon's state the config change may also converge the tunnel immediately.
+async fn apply_tun_mode(client: &mut Client, tun_enabled: Option<bool>) -> Result<(), String> {
+    let Some(enabled) = tun_enabled else {
+        return Ok(());
+    };
+    client
+        .call(
+            methods::CONFIG_APPLY,
+            Some(json!({ "patch": { "tun": { "enabled": enabled } } })),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "could not set tunnel mode (tun.enabled = {enabled}) before connecting: {error}"
+            )
+        })
+}
+
 async fn connect_once(
     handle: &AppHandle,
     daemon_socket: &Path,
     commands: &mut mpsc::Receiver<IpcCommand>,
-    connect_pending: &mut bool,
+    connect_pending: &mut Option<Option<bool>>,
 ) -> Result<(), String> {
     let mut client = Client::connect(daemon_socket)
         .await
@@ -1875,18 +1961,25 @@ async fn connect_once(
     client.handshake().await.map_err(|e| e.to_string())?;
     refresh_status(handle, &mut client).await;
 
-    if *connect_pending {
-        *connect_pending = false;
-        match client.call(methods::CONNECT, None).await {
-            Ok(result) => emit(
-                handle,
-                "event",
-                json!({ "method": "ui.auto_connect", "params": result }),
-            ),
+    if let Some(tun_enabled) = connect_pending.take() {
+        let applied = apply_tun_mode(&mut client, tun_enabled).await;
+        match applied {
+            Ok(()) => match client.call(methods::CONNECT, None).await {
+                Ok(result) => emit(
+                    handle,
+                    "event",
+                    json!({ "method": "ui.auto_connect", "params": result }),
+                ),
+                Err(error) => emit(
+                    handle,
+                    "event",
+                    json!({ "method": "ui.auto_connect_error", "params": { "error": error.to_string() } }),
+                ),
+            },
             Err(error) => emit(
                 handle,
                 "event",
-                json!({ "method": "ui.auto_connect_error", "params": { "error": error.to_string() } }),
+                json!({ "method": "ui.auto_connect_error", "params": { "error": error } }),
             ),
         }
         refresh_status(handle, &mut client).await;
@@ -1922,12 +2015,15 @@ async fn connect_once(
 
 async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand) {
     match cmd {
-        IpcCommand::Connect(tx) => {
-            let result = client
-                .call(methods::CONNECT, None)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(result);
+        IpcCommand::Connect { tun_enabled, reply } => {
+            let result = match apply_tun_mode(client, tun_enabled).await {
+                Ok(()) => client
+                    .call(methods::CONNECT, None)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(result);
             refresh_status(handle, client).await;
         }
         IpcCommand::Stop(tx) => {
@@ -2088,6 +2184,28 @@ async fn handle_command(handle: &AppHandle, client: &mut Client, cmd: IpcCommand
                 .await
                 .map_err(|e| e.to_string());
             let _ = reply.send(result);
+        }
+        IpcCommand::TunStatus(tx) => {
+            let result = client
+                .call(methods::TUN_STATUS, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::TunHelperInstall(tx) => {
+            // Long-running: the OS privilege prompt waits for the user.
+            let result = client
+                .call(methods::TUN_HELPER_INSTALL, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        }
+        IpcCommand::TunHelperUninstall(tx) => {
+            let result = client
+                .call(methods::TUN_HELPER_UNINSTALL, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
         }
     }
 }
