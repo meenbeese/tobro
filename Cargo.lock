@@ -7872,6 +7872,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobro-leak"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "rtnetlink",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tobro-osapi",
+ "tobro-tun",
+ "tokio",
+]
+
+[[package]]
 name = "tobro-osapi"
 version = "0.0.0"
 dependencies = [

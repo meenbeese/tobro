@@ -81,8 +81,9 @@ fn check(result: WIN32_ERROR, already_exists: RouteError) -> Result<(), RouteErr
 /// needs no privileges.
 ///
 /// `None` when the destination is unreachable for now: the family has no
-/// protocol stack (`ERROR_NOT_SUPPORTED`) or the kernel returned no usable
-/// route (no interface, no next hop). Any other error is reported.
+/// protocol stack (`ERROR_NOT_SUPPORTED`), no route matched
+/// (`ERROR_NOT_FOUND`), or the kernel returned no usable route (no
+/// interface, no next hop). Any other error is reported.
 ///
 /// With a null interface LUID and index 0, iphlpapi searches every
 /// interface; the reply's `InterfaceIndex` is the egress adapter.
@@ -109,8 +110,9 @@ pub fn best_route(destination: IpAddr) -> Result<Option<Route>, RouteError> {
     };
     match result {
         NO_ERROR => {}
-        // No protocol stack for the destination's family: nothing routes.
-        ERROR_NOT_SUPPORTED => return Ok(None),
+        // No protocol stack for the destination's family, or no matching
+        // route: nothing routes.
+        ERROR_NOT_SUPPORTED | ERROR_NOT_FOUND => return Ok(None),
         other => return Err(RouteError::Io(io::Error::from_raw_os_error(other as i32))),
     }
     // Interface index 0 is never assigned to an adapter: the kernel found

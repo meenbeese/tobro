@@ -15,6 +15,7 @@ members = [
     "crates/tobro-helper",
     "crates/tobro-install",
     "crates/tobro-ipc",
+    "crates/tobro-leak",
     "crates/tobro-osapi",
     "crates/tobro-store",
     "crates/tobro-tor",

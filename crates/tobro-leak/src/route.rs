@@ -1,0 +1,236 @@
+//! Route-table probes used by the leak assertions.
+//!
+//! A leak test needs ground truth about where the kernel *would* send a
+//! packet, independent of what the helper believes it installed. These
+//! lookups read the live routing table (no privileges required):
+//!
+//! - macOS: `PF_ROUTE` via [`tobro_osapi::bsd_route::route_lookup`].
+//! - Windows: iphlpapi `GetBestRoute2` via
+//!   [`tobro_osapi::win_route::best_route`].
+//! - Linux: an `RTM_GETROUTE` netlink request (the same kernel interface
+//!   the helper's backend uses for route convergence).
+//!
+//! Linux also exposes a route delete, used by the resume/sleep-wake
+//! scenario to simulate kernel state loss (suspend drops route entries).
+
+use std::net::IpAddr;
+
+use anyhow::{Context, Result};
+
+/// Where the kernel would send a packet for one destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Egress {
+    /// A regular route through this interface index.
+    Interface(u32),
+    /// A blackhole route (Linux kill-switch insurance).
+    Blackhole,
+    /// No route at all (for example, an isolated network namespace).
+    Unreachable,
+}
+
+/// Live route-table reader. On Linux the netlink connection must stay
+/// alive for the handle to work, so the helper owns both.
+pub struct Routes {
+    #[cfg(target_os = "linux")]
+    handle: rtnetlink::Handle,
+    #[cfg(target_os = "linux")]
+    connection: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for Routes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Routes").finish_non_exhaustive()
+    }
+}
+
+impl Routes {
+    /// Open the platform route reader.
+    pub async fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let (connection, handle, _messages) =
+                rtnetlink::new_connection().context("could not open a netlink route socket")?;
+            let task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            Ok(Self {
+                handle,
+                connection: task,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Resolve the egress for `destination` (longest-prefix match).
+    pub async fn egress(&self, destination: IpAddr) -> Result<Egress> {
+        #[cfg(target_os = "macos")]
+        {
+            let route = tobro_osapi::bsd_route::route_lookup(destination)
+                .map_err(|error| anyhow::anyhow!("route lookup failed: {error}"))?;
+            Ok(route
+                .map(|route| Egress::Interface(route.interface_index))
+                .unwrap_or(Egress::Unreachable))
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let route = tobro_osapi::win_route::best_route(destination)
+                .map_err(|error| anyhow::anyhow!("route lookup failed: {error}"))?;
+            Ok(route
+                .map(|route| Egress::Interface(route.interface_index))
+                .unwrap_or(Egress::Unreachable))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use futures::TryStreamExt as _;
+            use rtnetlink::packet_route::route::{RouteAttribute, RouteType};
+
+            let prefix = match destination {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            let message = rtnetlink::RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(destination, prefix)
+                .map_err(|error| anyhow::anyhow!("invalid route lookup: {error}"))?
+                .build();
+            let mut replies = self.handle.route().get(message).execute();
+            let reply = match replies.try_next().await {
+                Ok(Some(reply)) => reply,
+                Ok(None) => return Ok(Egress::Unreachable),
+                // The kernel reports "no route" as a netlink error rather
+                // than an empty reply. That is exactly the isolated-network
+                // case these assertions run in, not a probe failure.
+                Err(error) if is_no_route_error(&error) => return Ok(Egress::Unreachable),
+                Err(error) => {
+                    return Err(anyhow::anyhow!("netlink route lookup failed: {error}"));
+                }
+            };
+            if reply.header.kind == RouteType::BlackHole {
+                return Ok(Egress::Blackhole);
+            }
+            if reply.header.kind == RouteType::Unreachable {
+                return Ok(Egress::Unreachable);
+            }
+            let interface = reply
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RouteAttribute::Oif(index) => Some(*index),
+                    _ => None,
+                });
+            Ok(interface
+                .map(Egress::Interface)
+                .unwrap_or(Egress::Unreachable))
+        }
+    }
+
+    /// Delete one device route, simulating the kernel dropping a route
+    /// across suspend/resume. Only used by the harness; no production path
+    /// calls this.
+    pub async fn delete_device_route(
+        &self,
+        destination: IpAddr,
+        prefix_len: u8,
+        interface_index: u32,
+        metric: Option<u32>,
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let route = tobro_osapi::Route {
+                destination,
+                prefix_len,
+                gateway: None,
+                interface_index,
+                metric,
+            };
+            tobro_osapi::bsd_route::delete_route(&route)
+                .map_err(|error| anyhow::anyhow!("could not delete the test route: {error}"))
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let route = tobro_osapi::Route {
+                destination,
+                prefix_len,
+                gateway: None,
+                interface_index,
+                metric,
+            };
+            tobro_osapi::win_route::delete_route(&route)
+                .map_err(|error| anyhow::anyhow!("could not delete the test route: {error}"))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use rtnetlink::packet_route::route::{RouteProtocol, RouteScope};
+
+            let mut builder = rtnetlink::RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(destination, prefix_len)
+                .map_err(|error| anyhow::anyhow!("invalid route delete: {error}"))?
+                .table_id(254)
+                .scope(RouteScope::Universe)
+                .protocol(RouteProtocol::Static)
+                .output_interface(interface_index);
+            if let Some(metric) = metric {
+                builder = builder.priority(metric);
+            }
+            self.handle
+                .route()
+                .del(builder.build())
+                .execute()
+                .await
+                .map_err(|error| anyhow::anyhow!("could not delete the test route: {error}"))
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (destination, prefix_len, interface_index, metric);
+            anyhow::bail!("route deletion is not implemented on this platform")
+        }
+    }
+}
+
+impl Drop for Routes {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.connection.abort();
+    }
+}
+
+/// Resolve an interface name to its OS index.
+pub fn interface_index(name: &str) -> Result<u32> {
+    tobro_osapi::interface_index(name)
+        .with_context(|| format!("could not look up the interface index for {name:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("the interface {name:?} does not exist"))
+}
+
+/// Human-readable name of an egress for check messages.
+pub fn describe(egress: Egress) -> String {
+    match egress {
+        Egress::Interface(index) => format!("interface {index}"),
+        Egress::Blackhole => "a blackhole route".to_owned(),
+        Egress::Unreachable => "no route".to_owned(),
+    }
+}
+
+/// True when a netlink lookup error means "the kernel has no route".
+///
+/// `RTM_GETROUTE` answers a routeless destination with `NLMSG_ERROR` carrying
+/// `-ENETUNREACH` or `-EHOSTUNREACH` instead of an empty route dump. Those
+/// values are the same on every Linux architecture.
+#[cfg(target_os = "linux")]
+fn is_no_route_error(error: &rtnetlink::Error) -> bool {
+    const ENETUNREACH: i32 = 101;
+    const EHOSTUNREACH: i32 = 113;
+    match error {
+        rtnetlink::Error::NetlinkError(message) => message.code.is_some_and(|code| {
+            let code = code.get();
+            code == -ENETUNREACH || code == -EHOSTUNREACH
+        }),
+        _ => false,
+    }
+}

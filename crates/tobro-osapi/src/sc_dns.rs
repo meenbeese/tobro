@@ -57,6 +57,17 @@ fn dns_dictionary(servers: &[IpAddr]) -> CFDictionary {
     dictionary.to_immutable()
 }
 
+/// Capture the current global DNS value without changing it.
+///
+/// The returned bytes are the same XML property-list backup `apply_dns`
+/// produces and `restore_dns` consumes. The TUN leak harness uses this to
+/// restore the resolver after an intentionally killed helper (a crashed
+/// helper loses its in-memory backup). Blocking; call via `spawn_blocking`.
+pub fn backup_dns() -> Result<Option<Vec<u8>>, String> {
+    let store = open_store()?;
+    backup_current(&store)
+}
+
 /// Apply the resolver configuration: back up the current global DNS value
 /// and overwrite the key with the given servers. The backup is
 /// `Some(Option<Vec<u8>>)` when one was taken (`take_backup`): the inner

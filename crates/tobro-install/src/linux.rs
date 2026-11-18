@@ -12,7 +12,7 @@
 //! primary group>` so the unprivileged daemon can connect; the helper's
 //! peer-credential gate remains the client check.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::elevate::{self, Runner};
 use crate::{InstallError, InstallReport, InstallSpec, InstallStatus, UninstallReport};
@@ -281,6 +281,7 @@ systemctl reset-failed 2>/dev/null || true
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     /// Records every command; never spawns anything.
@@ -494,7 +495,8 @@ mod tests {
             .expect("uninstall must succeed");
         assert!(!report.already_clean);
         assert_eq!(report.actions.len(), 3);
-        let (program, args) = runner.calls().first().expect("one elevated call");
+        let calls = runner.calls();
+        let (program, args) = calls.first().expect("one elevated call");
         assert_eq!(program, "pkexec");
         assert!(args[2].contains("systemctl disable --now"), "{:?}", args[2]);
     }

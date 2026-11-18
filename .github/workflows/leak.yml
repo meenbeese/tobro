@@ -1,0 +1,95 @@
+# End-to-end TUN leak tests (M7).
+#
+# These jobs need real TUN devices, route changes, and resolver changes, so
+# they run elevated. They are scheduled/dispatch-only: a PR should not take
+# over the runner's routing table. The Linux job runs inside a private
+# netns/mount namespace (scripts/run-leak-tests.sh); macOS and Windows run the
+# safe tier directly on the runner (reserved test prefixes only, always torn
+# down and resolver-restored).
+#
+# The intrusive tier takes over real default routes and is only run in the
+# isolated Linux namespace, never on a hosted macOS/Windows runner.
+
+name: Leak tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leak-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  linux:
+    name: safe + intrusive tier (Linux netns)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-leak
+      - name: Build helper and harness
+        run: cargo build -p tobro-helper -p tobro-leak
+
+      - name: Safe tier
+        run: |
+          sudo --preserve-env=PATH env TOBRO_LEAK_NO_BUILD=1 \
+            bash scripts/run-leak-tests.sh --fail-on-skip
+
+      - name: Intrusive tier (isolated namespace)
+        run: |
+          sudo --preserve-env=PATH,TOBRO_LEAK_ALLOW_INTRUSIVE \
+            env TOBRO_LEAK_NO_BUILD=1 TOBRO_LEAK_ALLOW_INTRUSIVE=1 \
+            bash scripts/run-leak-tests.sh --intrusive --fail-on-skip \
+              --scenario intrusive-default-route \
+              --scenario intrusive-kill-switch
+
+  macos:
+    name: safe tier (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-leak
+      - name: Build helper and harness
+        run: cargo build -p tobro-helper -p tobro-leak
+      - name: Safe tier
+        run: sudo --preserve-env=PATH ./target/debug/tobro-leak --fail-on-skip
+
+  windows:
+    name: safe tier (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-leak
+      - name: Build helper and harness
+        run: cargo build -p tobro-helper -p tobro-leak
+
+      # wintun.dll must sit next to the helper binary (packaging ships it
+      # there; the harness binary lives in the same directory).
+      - name: Install wintun.dll
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "wintun.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP "wintun") -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP "wintun\bin\amd64\wintun.dll") "target\debug\wintun.dll"
+
+      - name: Safe tier
+        run: ./target/debug/tobro-leak.exe --fail-on-skip

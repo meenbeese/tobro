@@ -1,0 +1,30 @@
+[package]
+name = "tobro-leak"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tobro-leak"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tobro-osapi = { workspace = true }
+tobro-tun = { path = "../tobro-tun" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Route lookups/deletes for the leak assertions (the same netlink API the
+# Linux helper backend uses).
+rtnetlink = { workspace = true }
+
+[lints]
+workspace = true
