@@ -89,9 +89,17 @@ async fn serve(
 async fn serve(
     endpoint: PathBuf,
     service: &mut HelperService<ActivePlatform>,
-    _args: &Args,
+    args: &Args,
     idle: Option<std::time::Duration>,
 ) -> ServeExit {
+    // The installed service is created with `--allow-sid`; a manual run
+    // without one must not open a pipe with a default DACL.
+    let Some(allow_sid) = args.allow_sid.as_deref() else {
+        return ServeExit::BindError(
+            "refusing to serve without --allow-sid (the daemon user's SID recorded at install)"
+                .to_owned(),
+        );
+    };
     tracing::info!("listening on {endpoint:?}");
-    tobro_helper::serve_windows(&endpoint, service, idle).await
+    tobro_helper::serve_windows(&endpoint, allow_sid, service, idle).await
 }

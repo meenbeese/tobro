@@ -14,7 +14,10 @@
 //! - All plan inputs are re-validated on receipt
 //!   ([`tobro_tun::TunnelPlan::validate`]); decoded values are untrusted.
 //! - Peer-identity gating: on Unix the connecting user must match the user
-//!   that performed the first handshake; unverifiable peers are denied.
+//!   that performed the first handshake. On Windows the installer records the
+//!   daemon user's SID (`--allow-sid`); the named pipe DACL is scoped to that
+//!   SID and the handshake gate admits no other one. Unverifiable peers are
+//!   always denied.
 //! - Logs contain operation kinds and counts only — never destinations,
 //!   routes, or DNS servers.
 //! - Logs go to stderr; the service manager captures them into the system
@@ -121,6 +124,13 @@ pub struct Args {
     /// TUN mode needs it.
     #[arg(long, default_value_t = 0)]
     pub idle_exit_secs: u64,
+    /// Windows only: the daemon user's SID (`S-1-...`) recorded by the
+    /// installer. The named pipe DACL and the handshake gate are scoped to
+    /// exactly this user. The installed service always passes it; a manual
+    /// run without it refuses to serve (fail closed).
+    #[cfg(windows)]
+    #[arg(long)]
+    pub allow_sid: Option<String>,
 }
 
 /// Initialize stderr logging. EnvFilter honors `RUST_LOG`; never log

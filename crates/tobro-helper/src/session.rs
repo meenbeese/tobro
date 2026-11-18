@@ -169,7 +169,8 @@ async fn serve_connection<S, P>(
         tracing::warn!(
             "denied {} peer: gate is locked to another client or identity unverifiable",
             peer.kind()
-        );        let _ = send_reject(
+        );
+        let _ = send_reject(
             stream,
             reject_codes::UNAUTHORIZED,
             "peer identity not permitted",
@@ -305,7 +306,7 @@ pub async fn serve_windows<P: Platform>(
     service: &mut HelperService<P>,
     idle: Option<Duration>,
 ) -> ServeExit {
-    use tobro_osapi::win_pipe::{PipeSecurity, create_server, peer_sid, sid_from_string};
+    use tobro_osapi::win_pipe::{PipeSecurity, peer_sid, sid_from_string};
 
     let (security, expected_sid) =
         match (PipeSecurity::for_sid(allow_sid), sid_from_string(allow_sid)) {
@@ -319,7 +320,7 @@ pub async fn serve_windows<P: Platform>(
     let mut gate = PeerGate::with_allowed_sid(expected_sid);
 
     loop {
-        let server = match create_server(path, &security) {
+        let server = match security.create_server(path) {
             Ok(server) => server,
             Err(error) => return ServeExit::BindError(error.to_string()),
         };
@@ -565,29 +566,102 @@ mod gate_tests {
         assert_eq!(gate.locked_uid(), None);
 
         // Unverifiable peers are denied even before anything is locked.
-        assert!(!gate.authorize(PeerIdentity::Unverifiable));
+        assert!(!gate.authorize(&PeerIdentity::Unverifiable));
         assert_eq!(gate.locked_uid(), None);
 
         // First uid peer locks the gate.
-        assert!(gate.authorize(PeerIdentity::Uid(1000)));
+        assert!(gate.authorize(&PeerIdentity::Uid(1000)));
         assert_eq!(gate.locked_uid(), Some(1000));
 
         // Same uid admitted, different uid denied.
-        assert!(gate.authorize(PeerIdentity::Uid(1000)));
-        assert!(!gate.authorize(PeerIdentity::Uid(1001)));
+        assert!(gate.authorize(&PeerIdentity::Uid(1000)));
+        assert!(!gate.authorize(&PeerIdentity::Uid(1001)));
 
         // Unverifiable stays denied after locking too.
-        assert!(!gate.authorize(PeerIdentity::Unverifiable));
+        assert!(!gate.authorize(&PeerIdentity::Unverifiable));
     }
 
     #[test]
-    fn unknown_peers_are_admitted_interim_and_do_not_lock_the_gate() {
+    fn gate_denies_every_sid_without_a_configured_sid() {
+        // A helper that was never told which user it serves must not admit a
+        // SID peer, even a well-formed one.
         let mut gate = PeerGate::new();
-        assert!(gate.authorize(PeerIdentity::Unknown));
-        // Unknown does not lock: a Unix uid can still claim the gate.
+        assert!(!gate.authorize(&PeerIdentity::Sid(vec![
+            1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+        ])));
         assert_eq!(gate.locked_uid(), None);
-        assert!(gate.authorize(PeerIdentity::Uid(1000)));
-        assert_eq!(gate.locked_uid(), Some(1000));
-        assert!(!gate.authorize(PeerIdentity::Uid(1001)));
+    }
+
+    #[test]
+    fn gate_admits_only_the_configured_sid() {
+        let allowed = vec![1u8, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
+        let mut gate = PeerGate::with_allowed_sid(allowed.clone());
+
+        // The installer-recorded SID is admitted, repeatedly (one check per
+        // connection; the gate is not consumed).
+        assert!(gate.authorize(&PeerIdentity::Sid(allowed.clone())));
+        assert!(gate.authorize(&PeerIdentity::Sid(allowed.clone())));
+
+        // Comparison is exact: one changed byte is a different user.
+        let mut other = allowed;
+        *other.last_mut().expect("the SID fixture is non-empty") = 42;
+        assert!(!gate.authorize(&PeerIdentity::Sid(other)));
+
+        // Unverifiable peers stay denied, and the SID rule never locks a uid.
+        assert!(!gate.authorize(&PeerIdentity::Unverifiable));
+        assert_eq!(gate.locked_uid(), None);
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod windows_tests {
+    use super::*;
+    use tobro_tun::TunHelperClient;
+
+    /// A unique pipe name per test, so concurrently running tests cannot
+    /// collide on the machine-wide named-pipe namespace.
+    fn pipe_path(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\tobro-helper-test-{tag}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn current_user_sid_handshakes_against_the_real_loop() {
+        let sid = tobro_osapi::win_pipe::current_user_sid_string()
+            .expect("the test user always has a SID");
+        let path = pipe_path("e2e");
+        let serve_path = path.clone();
+        let mut service = HelperService::new(crate::NullPlatform);
+        let task = tokio::spawn(async move {
+            serve_windows(
+                &serve_path,
+                &sid,
+                &mut service,
+                Some(Duration::from_millis(400)),
+            )
+            .await
+        });
+
+        // The first pipe instance is created immediately; retry briefly in
+        // case the loop has not reached `connect` yet.
+        let mut client = TunHelperClient::connect_with_retry(&path, 50, Duration::from_millis(20))
+            .await
+            .expect("the current user is allowed by the pipe DACL and the gate");
+        let info = client.handshake().await.expect("the SID gate admits us");
+        assert_eq!(info.protocol_version, tobro_tun::PROTOCOL_VERSION);
+        let status = client.status().await.expect("the connection is served");
+        assert!(!status.active);
+
+        drop(client);
+        // The next pipe instance is created for the next client, but none
+        // arrives: the idle window ends the loop.
+        assert_eq!(task.await.unwrap(), ServeExit::IdleTimeout);
     }
 }

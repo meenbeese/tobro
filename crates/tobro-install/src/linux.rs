@@ -349,6 +349,7 @@ mod tests {
             source_binary: source.to_path_buf(),
             socket_group: Some("adm".to_owned()),
             sha256_hex: None,
+            client_sid: None,
         }
     }
 

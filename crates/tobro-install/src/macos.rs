@@ -312,6 +312,7 @@ mod tests {
             source_binary: source.to_path_buf(),
             socket_group: Some("staff".to_owned()),
             sha256_hex: None,
+            client_sid: None,
         }
     }
 
@@ -381,6 +382,7 @@ mod tests {
             source_binary: weird_source.clone(),
             socket_group: Some("staff".to_owned()),
             sha256_hex: None,
+            client_sid: None,
         };
         install(&runner, &Locations::system(), &spec, "cafe".to_owned())
             .expect("recording runner must succeed");

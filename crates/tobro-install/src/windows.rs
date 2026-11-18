@@ -3,7 +3,7 @@
 //! Install = stop any running `tobro-helper` service, copy the binary **and
 //! the `wintun.dll` driver that sits next to it** into
 //! `%ProgramFiles%\Tobro\helper\`, create the demand-start service (run as
-//! `LocalSystem`), grant interactive users start/stop via the service DACL,
+//! `LocalSystem`), grant the daemon user start/stop via the service DACL,
 //! and start it. The DACL grant is what lets the *unprivileged daemon* start
 //! and stop the helper with `sc` — no further prompts while TUN mode is
 //! toggled. The driver copy is required because the privileged helper lives
@@ -15,10 +15,13 @@
 //! back, because the elevated process is a different terminal session; a
 //! missing result file means the prompt was declined or dismissed.
 //!
-//! Interim note (audited): the pipe DACL hardening and the SID-based peer
-//! check (vs. the `Unknown`-peer interim in `tobro-helper`) stay documented
-//! interims; the helper service runs with the idle window disabled (the
-//! daemon stops it when TUN mode is disabled — post-engine wiring).
+//! The daemon user's SID (`InstallSpec::client_sid`) is threaded through both
+//! the service configuration (`--allow-sid`, so the helper scopes its named
+//! pipe) and the service DACL (so only that user can start/stop the service;
+//! the blanket Interactive Users / Authenticated Users grants are gone). The
+//! helper additionally re-checks the connecting process's SID during the
+//! handshake. The service runs with the idle window disabled (the daemon stops
+//! it when TUN mode is disabled).
 
 use std::path::PathBuf;
 
@@ -82,6 +85,20 @@ pub fn install<R: Runner>(
     sha256_hex: String,
 ) -> Result<InstallReport, InstallError> {
     let source_wintun = source_wintun(spec)?;
+    // The SID is required: without it the pipe DACL and the service DACL
+    // cannot be scoped, and the helper refuses to serve (fail closed).
+    let client_sid = spec.client_sid.as_deref().ok_or_else(|| {
+        InstallError::SourceInvalid(
+            "client_sid is required on Windows (the daemon user's SID scopes the \
+             helper's named pipe and the service DACL)"
+                .to_owned(),
+        )
+    })?;
+    if !crate::sid_shape_ok(client_sid) {
+        return Err(InstallError::SourceInvalid(format!(
+            "client_sid {client_sid:?} is not a Windows SID (expected S-1-...)"
+        )));
+    }
     let source = spec.source_binary.to_string_lossy().into_owned();
     let wintun = source_wintun.to_string_lossy().into_owned();
     run_elevated_script(runner, "install", |result_path| {
@@ -89,6 +106,7 @@ pub fn install<R: Runner>(
             locations,
             &source,
             &wintun,
+            client_sid,
             &result_path.display().to_string(),
         )
     })?;
@@ -268,13 +286,14 @@ fn parse_result(text: &str) -> Option<ScriptResult> {
 
 // --- Generated content -----------------------------------------------------
 
-/// The elevated install script (PowerShell). Paths arrive validated and
-/// PowerShell-quoted. `sc.exe` is invoked with the `.exe` suffix deliberately
-/// (`sc` alone is the PowerShell `Set-Content` alias).
+/// The elevated install script (PowerShell). Paths and the client SID arrive
+/// validated and PowerShell-quoted. `sc.exe` is invoked with the `.exe` suffix
+/// deliberately (`sc` alone is the PowerShell `Set-Content` alias).
 fn install_script(
     locations: &Locations,
     source: &str,
     source_wintun: &str,
+    client_sid: &str,
     result_path: &str,
 ) -> String {
     let src = elevate::powershell_quote(source);
@@ -288,8 +307,16 @@ fn install_script(
             .map_or_else(String::new, |p| p.display().to_string()),
     );
     let bin_value = elevate::powershell_quote(&format!(
-        "\"{}\" --idle-exit-secs 0",
+        "\"{}\" --idle-exit-secs 0 --allow-sid {client_sid}",
         locations.binary.display()
+    ));
+    // SYSTEM and Administrators keep full service control (service management
+    // and recovery). The daemon user gets the standard query/start/stop set —
+    // never SERVICE_CHANGE_CONFIG (`DC`). Interactive Users and Authenticated
+    // Users are deliberately absent: only the recorded user may drive the
+    // helper. The SID is shape-validated before it reaches this string.
+    let service_dacl = elevate::powershell_quote(&format!(
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWD;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;{client_sid})"
     ));
     let result_path = elevate::powershell_quote(result_path);
     format!(
@@ -314,7 +341,7 @@ try {{
         sc.exe create {SERVICE_NAME} binPath= {bin_value} start= demand obj= LocalSystem DisplayName= 'Tobro Helper' | Out-Null
         $result.actions += 'service'
     }}
-    sc.exe sdset {SERVICE_NAME} 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWD;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;RPWP;;;AU)' | Out-Null
+    sc.exe sdset {SERVICE_NAME} {service_dacl} | Out-Null
     if ($LASTEXITCODE -ne 0) {{ throw 'could not set the service DACL' }}
     $result.actions += 'dacl'
     sc.exe start {SERVICE_NAME} | Out-Null
@@ -452,8 +479,12 @@ mod tests {
             source_binary: source.to_path_buf(),
             socket_group: None,
             sha256_hex: None,
+            client_sid: Some(TEST_SID.to_owned()),
         }
     }
+
+    /// A well-formed (non-privileged-looking) test SID.
+    const TEST_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 
     #[test]
     fn install_script_creates_and_starts_the_service() {
@@ -463,6 +494,7 @@ mod tests {
             &locations,
             source.display().to_string().as_str(),
             source_wintun.display().to_string().as_str(),
+            TEST_SID,
             r"C:\Temp\result.json",
         );
         assert!(script.contains("sc.exe create"), "{script}");
@@ -470,14 +502,22 @@ mod tests {
             script.contains("binPath= '\""),
             "the binPath value must quote the binary path for sc: {script}"
         );
+        assert!(
+            script.contains(&format!("--allow-sid {TEST_SID}")),
+            "the helper is told which SID to admit: {script}"
+        );
         assert!(script.contains("--idle-exit-secs 0"), "{script}");
         assert!(
             script.contains("start= demand obj= LocalSystem"),
             "{script}"
         );
         assert!(
-            script.contains("(A;;RPWP;;;AU)"),
-            "interactive users get start/stop"
+            script.contains(&format!("(A;;CCLCSWRPWPDTLOCRRC;;;{TEST_SID})")),
+            "the service DACL is scoped to the daemon user: {script}"
+        );
+        assert!(
+            !script.contains(";;;IU)") && !script.contains(";;;AU)"),
+            "blanket interactive/authenticated-user grants are gone: {script}"
         );
         assert!(script.contains("sc.exe start"), "{script}");
         assert!(script.contains("sc.exe sdset"), "{script}");
@@ -499,6 +539,28 @@ mod tests {
             )),
             "{script}"
         );
+    }
+
+    #[test]
+    fn install_requires_the_client_sid_before_elevating() {
+        let (_dir, locations, source) = ctx();
+        let runner = RecordingRunner::default();
+        let mut checked = spec(&source);
+        checked.client_sid = None;
+        let error = install(&runner, &locations, &checked, "cafe".to_owned())
+            .expect_err("a missing SID must fail before elevation");
+        assert!(matches!(error, InstallError::SourceInvalid(_)), "{error}");
+        assert!(
+            runner.calls().is_empty(),
+            "nothing may be elevated without a SID"
+        );
+
+        let mut checked = spec(&source);
+        checked.client_sid = Some("S-1-5-18'".to_owned());
+        let error = install(&runner, &locations, &checked, "cafe".to_owned())
+            .expect_err("a malformed SID must fail before elevation");
+        assert!(matches!(error, InstallError::SourceInvalid(_)), "{error}");
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
@@ -532,7 +594,7 @@ mod tests {
     #[test]
     fn install_writes_a_script_and_runs_the_uac_outer_command() {
         let (_dir, locations, source) = ctx();
-        let runner = RecordingRunner::default();
+        let runner = RecordingRunner::with_elevated_result(r#"{"ok":true,"error":""}"#);
         let report = install(&runner, &locations, &spec(&source), "cafe".to_owned())
             .expect("recording runner must succeed");
         assert_eq!(

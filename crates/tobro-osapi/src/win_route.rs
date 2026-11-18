@@ -282,15 +282,21 @@ mod tests {
     #[test]
     fn sockaddr_addresses_round_trip() {
         let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        assert_eq!(sockaddr_address(sockaddr_inet(v4).unwrap()), Ok(Some(v4)));
+        assert_eq!(
+            sockaddr_address(sockaddr_inet(v4).unwrap()).unwrap(),
+            Some(v4)
+        );
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        assert_eq!(sockaddr_address(sockaddr_inet(v6).unwrap()), Ok(Some(v6)));
+        assert_eq!(
+            sockaddr_address(sockaddr_inet(v6).unwrap()).unwrap(),
+            Some(v6)
+        );
 
         // A zeroed `SOCKADDR_INET` (family unspecified) is the on-link
         // encoding: `None`, not an address.
         // SAFETY: zeroing a pointer-free C union.
         let unspecified: SOCKADDR_INET = unsafe { std::mem::zeroed() };
-        assert_eq!(sockaddr_address(unspecified), Ok(None));
+        assert_eq!(sockaddr_address(unspecified).unwrap(), None);
     }
 
     /// A mismatched family tag (address family set but the union arm zeroed)
@@ -305,8 +311,8 @@ mod tests {
             mixed.si_family = AF_INET6;
         }
         assert_eq!(
-            sockaddr_address(mixed),
-            Ok(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
+            sockaddr_address(mixed).unwrap(),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
         );
     }
 }

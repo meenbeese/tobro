@@ -273,7 +273,7 @@ pub(crate) async fn discover_gateways() -> Gateways {
                 tobro_osapi::win_route::best_route(destination)
                     .ok()
                     .flatten()
-                    .and_then(|route| route.next_hop)
+                    .and_then(|route| route.gateway)
             };
             Gateways {
                 v4: gateway(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),

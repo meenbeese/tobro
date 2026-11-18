@@ -159,9 +159,8 @@ async fn run_daemon(
     let (handle, supervisor_task) = supervisor::spawn();
 
     // TUN wiring (M7): talk to the privileged helper when TUN mode is used.
-    // Until the routing engine lands, `tun.enabled` is rejected by config
-    // validation and this stays idle, but the helper availability probe and
-    // `tun.status` already work.
+    // The routing engine, installer, and supervisor link are wired; the
+    // helper availability probe and `tun.status` work without a connection.
     let tun = match args.helper_socket.clone() {
         Some(endpoint) => tun_manager::TunManager::new(endpoint),
         None => tun_manager::TunManager::with_default_endpoint(),

@@ -10,9 +10,11 @@
 //!    sidecar/bundle locations).
 //! 2. Enforce the configured SHA-256 pin (`tun.helper_sha256_hex`) on the
 //!    source before anything elevated happens (supply chain, §10.6).
-//! 3. Resolve the IPC socket group (Unix): the daemon user's primary group —
-//!    the installed service runs as root, and its socket must be connectable
-//!    by exactly this group.
+//! 3. Resolve the IPC access identity: the daemon user's primary group on
+//!    Unix (the installed service runs as root, and its socket must be
+//!    connectable by exactly this group), and the daemon user's SID on
+//!    Windows (the named-pipe DACL, the service DACL, and the helper's
+//!    `--allow-sid` gate are all scoped to it).
 //! 4. Run the one elevated platform step (pkexec / osascript / UAC — the OS
 //!    privilege prompt is the UI), inside a generous timeout because the
 //!    user has to answer the prompt.
@@ -46,6 +48,7 @@ fn spec(config: &tobro_config::TunConfig) -> Result<tobro_install::InstallSpec, 
         source_binary,
         socket_group: socket_group_for_daemon()?,
         sha256_hex: config.helper_sha256_hex.clone(),
+        client_sid: client_sid_for_daemon()?,
     })
 }
 
@@ -128,6 +131,9 @@ fn spec_without_binary(config: &tobro_config::TunConfig) -> tobro_install::Insta
             None
         },
         sha256_hex: config.helper_sha256_hex.clone(),
+        // Status probes never install, so no access identity is embedded; a
+        // missing SID must not hide a previously installed helper.
+        client_sid: None,
     }
 }
 
@@ -170,6 +176,27 @@ fn socket_group_for_daemon() -> Result<Option<String>, String> {
 /// Non-Unix: no group concept; the service DACL/pipe security handles access.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn socket_group_for_daemon() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// The access identity for the installed helper (Windows only): this user's
+/// SID. The installer scopes the named-pipe DACL, the service DACL, and the
+/// helper's `--allow-sid` gate to it, so a failure to resolve it must fail the
+/// install rather than fall back to a broader default DACL.
+#[cfg(target_os = "windows")]
+fn client_sid_for_daemon() -> Result<Option<String>, String> {
+    Ok(Some(
+        tobro_osapi::win_pipe::current_user_sid_string().ok_or_else(|| {
+            "could not resolve this user's SID (needed to scope the helper's \
+             IPC named pipe and service access)"
+                .to_owned()
+        })?,
+    ))
+}
+
+/// Non-Windows: SIDs do not exist; the Unix socket group carries access.
+#[cfg(not(target_os = "windows"))]
+fn client_sid_for_daemon() -> Result<Option<String>, String> {
     Ok(None)
 }
 

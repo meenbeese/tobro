@@ -5,8 +5,11 @@
 //! module owns the *client-side* connection primitive; the listening side
 //! lives in the helper binary (the [`crate::mock`] module is the prototype).
 //!
-//! Windows ACL hardening (restricting the pipe DACL) lands with the Windows
-//! service install step (M7 T4c); the default DACL is used until then.
+//! The client side only connects. On Windows the *listener's* DACL is the
+//! access boundary: the installed helper creates each pipe instance with a
+//! security descriptor scoped to the daemon user's SID
+//! (`tobro_osapi::win_pipe`). The in-process mock keeps the default DACL,
+//! which is sufficient for tests.
 
 use tokio_util::codec::Framed;
 

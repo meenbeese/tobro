@@ -39,8 +39,10 @@
 //!
 //! macOS `SMAppService`/SMJobBless registration (the plan's target design)
 //! needs the signed GUI app bundle and lands with packaging (M8); the
-//! LaunchDaemon plist is the audited interim. The Windows pipe DACL and
-//! SID-based peer check remain documented interims in `tobro-helper`.
+//! LaunchDaemon plist is the audited interim. On Windows the helper's
+//! named-pipe DACL and the service DACL are scoped to the daemon user's SID
+//! ([`InstallSpec::client_sid`]), and the helper re-checks the connecting
+//! process's SID during the handshake.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -128,6 +130,10 @@ pub struct InstallSpec {
     /// Optional SHA-256 pin (lowercase hex, as `tun.helper_sha256_hex`).
     /// Enforced against the source binary before elevating.
     pub sha256_hex: Option<String>,
+    /// Windows only: the daemon user's SID (`S-1-...`). Scopes the helper's
+    /// named-pipe DACL and the service DACL, and is passed to the helper as
+    /// `--allow-sid`. Required by the Windows installer; `None` elsewhere.
+    pub client_sid: Option<String>,
 }
 
 impl InstallSpec {
@@ -176,6 +182,13 @@ impl InstallSpec {
                     "sha256_hex must be 64 lowercase hex characters".to_owned(),
                 ));
             }
+        }
+        if let Some(sid) = &self.client_sid
+            && !sid_shape_ok(sid)
+        {
+            return Err(InstallError::SourceInvalid(format!(
+                "client_sid {sid:?} is not a Windows SID (expected S-1-...)"
+            )));
         }
         Ok(())
     }
@@ -284,6 +297,27 @@ impl InstallStatus {
 
 // --- Shared helpers --------------------------------------------------------
 
+/// Shape check for a Windows SID string (`S-1-5-21-...`).
+///
+/// This is deliberately not an OS-level validity check: the daemon may build a
+/// spec on any host, and [`tobro_osapi::win_pipe`] canonicalizes and validates
+/// the SID again on Windows before it is used. The check guarantees the value
+/// is a plain, embeddable SID-shaped string (no quotes, whitespace, or SDDL
+/// syntax) before it reaches an elevated script.
+pub(crate) fn sid_shape_ok(sid: &str) -> bool {
+    /// The longest possible SID string (Microsoft's documented limit).
+    const MAX_SID_STRING_LEN: usize = 184;
+    let Some(rest) = sid.strip_prefix("S-1-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    sid.len() <= MAX_SID_STRING_LEN
+        && parts.len() >= 2
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.len() <= 10 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 /// SHA-256 of a file as lowercase hex; `None` when unreadable.
 pub(crate) fn sha256_file_hex(path: &std::path::Path) -> Option<String> {
     use sha2::{Digest, Sha256};
@@ -344,6 +378,7 @@ mod tests {
                 None
             },
             sha256_hex: None,
+            client_sid: None,
         }
     }
 
@@ -353,6 +388,7 @@ mod tests {
             source_binary: PathBuf::from("relative/tobro-helper"),
             socket_group: None,
             sha256_hex: None,
+            client_sid: None,
         }
         .validate()
         .expect_err("relative paths must be rejected");
@@ -403,6 +439,57 @@ mod tests {
     }
 
     #[test]
+    fn spec_accepts_sid_shapes_and_rejects_everything_else() {
+        for good in [
+            "S-1-5-18",
+            "S-1-5-21-1111111111-2222222222-3333333333-1001",
+            "S-1-5-32-544",
+        ] {
+            assert!(sid_shape_ok(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            "S-1",
+            "S-1-5",
+            "S-2-5-18",
+            "S-1-5-",
+            "S-1-5-18 ",
+            "S-1-5-18'",
+            "S-1-5-18)(A;;GA;;;WD",
+            "S-1-5-21-",
+            "s-1-5-18",
+            "S-1-x-18",
+            "S-1-5-12345678901",
+        ] {
+            assert!(!sid_shape_ok(bad), "{bad:?}");
+        }
+        assert!(
+            !sid_shape_ok(&format!("S-1-5-{}", "1".repeat(180))),
+            "the length limit is enforced"
+        );
+    }
+
+    #[test]
+    fn spec_rejects_malformed_client_sids() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tobro-helper");
+        std::fs::write(&source, b"binary").unwrap();
+
+        let mut checked = spec(&source);
+        checked.client_sid = Some("S-1-5-18'".to_owned());
+        let error = checked
+            .validate()
+            .expect_err("quotes must never reach an elevated script");
+        assert!(error.to_string().contains("Windows SID"), "{error}");
+
+        let mut checked = spec(&source);
+        checked.client_sid = Some("S-1-5-21-1-2-3-1001".to_owned());
+        checked
+            .validate()
+            .expect("a well-formed SID passes shape validation");
+    }
+
+    #[test]
     fn status_shapes_pass_without_a_source() {
         // Status probes must work when no source binary exists (a previous
         // install may still be present at the privileged target).
@@ -414,6 +501,7 @@ mod tests {
                 None
             },
             sha256_hex: None,
+            client_sid: None,
         };
         assert!(checked.validate_shapes().is_ok());
         assert!(
