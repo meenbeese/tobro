@@ -25,7 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-use rand::{RngCore, thread_rng};
+use rand::Rng as _;
 use serde::Serialize;
 
 /// STUN servers used when `kindness.stun_url` is not configured. Upstream
@@ -196,7 +196,7 @@ fn build_binding_request_with(mut fill_random: impl FnMut(&mut [u8])) -> ([u8; 2
 
 /// Bind a request with OS randomness.
 fn build_binding_request() -> ([u8; 20], [u8; 12]) {
-    build_binding_request_with(|buf| thread_rng().fill_bytes(buf))
+    build_binding_request_with(|buf| rand::rng().fill_bytes(buf))
 }
 
 /// Parse a STUN Binding success response into the mapped address. Prefers

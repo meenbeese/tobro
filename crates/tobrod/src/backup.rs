@@ -24,7 +24,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
 use data_encoding::BASE64;
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore as _;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -303,9 +303,9 @@ fn derive_key(
 
 fn encrypt_payload(passphrase: &str, payload: &BackupPayload) -> Result<BackupEnvelope, String> {
     let mut salt = Zeroizing::new([0u8; 16]);
-    rand::thread_rng().fill_bytes(salt.as_mut());
+    rand::rng().fill_bytes(salt.as_mut());
     let mut nonce_bytes = Zeroizing::new([0u8; 12]);
-    rand::thread_rng().fill_bytes(nonce_bytes.as_mut());
+    rand::rng().fill_bytes(nonce_bytes.as_mut());
 
     let key = derive_key(passphrase, &hex::encode(salt.as_ref()), PBKDF2_ITERATIONS)?;
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())

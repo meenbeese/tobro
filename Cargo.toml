@@ -76,13 +76,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # --- Storage / secrets ----------------------------------------------------
 # Embedded/local libSQL (Turso-compatible) for tobro-store.
-libsql = "0.6"
+libsql = "0.10"
 keyring = "4"
 zeroize = "1"
 hickory-proto = "0.26"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10"
 hex = "0.4"
 
 # --- HTTP (Moat, bridge data, updates) -----------------------------------

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use data_encoding::BASE32_NOPAD;
-use rand::RngCore as _;
+use rand::Rng as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -97,7 +97,7 @@ fn public_key_from_secret_bytes(secret: &[u8; 32]) -> String {
 fn generate_secret_bytes() -> [u8; 32] {
     let mut bytes = [0u8; 32];
     // Use thread-local CSPRNG; acceptable for local credential generation.
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     rng.fill_bytes(&mut bytes);
     // Clamp for X25519 (defense in depth; dalek clamps during DH).
     bytes[0] &= 248;

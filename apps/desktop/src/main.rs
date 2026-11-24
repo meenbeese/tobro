@@ -1547,10 +1547,10 @@ fn normalize_idle_minutes(minutes: u16) -> u16 {
 
 fn hash_password(password: &str) -> Result<PasswordVerifier, String> {
     use pbkdf2::pbkdf2_hmac;
-    use rand::RngCore;
+    use rand::Rng as _;
     use sha2::Sha256;
     let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     let iterations: u32 = 600_000;
     let mut hash = [0u8; 32];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut hash);
