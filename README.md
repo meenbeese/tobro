@@ -363,8 +363,18 @@ bash apps/desktop/scripts/prepare-tobro-helper-sidecar.sh
 bash apps/desktop/scripts/prepare-tobro-helper-sidecar.sh \
   --wintun /path/to/wintun.dll --wintun-sha256 <sha256>
 
+# macOS/Linux
 cargo tauri build --config apps/desktop/tauri.sidecar.conf.json
+
+# Windows also bundles wintun.dll as a resource
+cargo tauri build --config apps/desktop/tauri.sidecar.conf.json \
+  --config apps/desktop/tauri.wintun.conf.json
 ```
+
+Note: the sidecar and wintun configs are passed explicitly (and are
+deliberately not named `tauri.windows.conf.json`), so ordinary
+`cargo build`/`clippy`/`test` runs do not require the staged sidecars or
+`wintun.dll` on any platform.
 
 `tun.helper.install` copies the bundled helper into its privileged location;
 on Windows the installer also copies `wintun.dll` next to it, because the

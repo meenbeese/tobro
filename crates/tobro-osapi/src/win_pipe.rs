@@ -188,7 +188,7 @@ pub fn sid_from_string(sid: &str) -> io::Result<Vec<u8>> {
             format!("{sid:?} is not a valid Windows SID"),
         ));
     }
-    let _guard = LocalAlloc(raw as *mut c_void);
+    let _guard = LocalAlloc(raw);
     copy_sid(raw)
 }
 
@@ -252,7 +252,7 @@ fn canonical_sid_string(sid: &str) -> io::Result<String> {
             format!("{sid:?} is not a valid Windows SID"),
         ));
     }
-    let _guard = LocalAlloc(raw as *mut c_void);
+    let _guard = LocalAlloc(raw);
     sid_to_string(raw)
 }
 

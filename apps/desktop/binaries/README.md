@@ -16,8 +16,10 @@ the same directory.
 
 Windows additionally needs `wintun.dll` next to `tobro-helper.exe`:
 
-- `binaries/wintun.dll` is bundled by `tauri.windows.conf.json` as a resource
-  and lands next to the sidecars in the install directory.
+- `binaries/wintun.dll` is bundled by `tauri.wintun.conf.json` as a resource
+  (pass it to `tauri build` with `--config`, alongside
+  `tauri.sidecar.conf.json`) and lands next to the sidecars in the install
+  directory.
 - `tobro-install` copies it next to the installed helper
   (`%ProgramFiles%\Tobro\helper\wintun.dll`), because the privileged helper
   lives outside the app install directory.

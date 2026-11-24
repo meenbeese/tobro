@@ -74,7 +74,7 @@ if [[ "$target" != *windows* ]]; then
 fi
 
 # Windows: stage wintun.dll next to the helper. The Tauri resource mapping in
-# tauri.windows.conf.json copies it next to the bundled sidecar; the installer
+# tauri.wintun.conf.json copies it next to the bundled sidecar; the installer
 # (tobro-install) copies it into the privileged helper directory, which is a
 # different directory from the app bundle.
 wintun_dest="$binaries_dir/wintun.dll"
