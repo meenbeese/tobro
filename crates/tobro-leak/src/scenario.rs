@@ -143,6 +143,7 @@ impl Session {
         &self.routes
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn dns_backup(&self) -> &DnsBackup {
         &self.dns_backup
     }
@@ -440,6 +441,9 @@ async fn tcp_forwarded(config: &HarnessConfig) -> Result<ScenarioRun> {
 
 async fn dns_intercepted(config: &HarnessConfig) -> Result<ScenarioRun> {
     run_body!(config, "dns-intercepted", |session, checks| {
+        // Windows scopes the resolver to the wintun adapter, so there is no
+        // pre-tunnel value worth comparing against after teardown.
+        #[cfg(not(target_os = "windows"))]
         let before = session.dns_backup().snapshot.clone();
         let plan = plan::build(
             Routing::TestPrefixes,
@@ -797,6 +801,38 @@ async fn route_change(config: &HarnessConfig) -> Result<ScenarioRun> {
     })
 }
 
+fn request_live_suspend() -> Result<Option<&'static str>> {
+    if std::env::var("TOBRO_LEAK_ALLOW_LIVE_SLEEP").ok().as_deref() != Some("1") {
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["suspend", "--no-block"])
+            .status()?;
+        Ok(status.success().then_some("systemctl suspend"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("pmset")
+            .arg("sleepnow")
+            .status()?;
+        Ok(status.success().then_some("pmset sleepnow"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("rundll32.exe")
+            .args(["powrprof.dll,SetSuspendState", "0", "1", "0"])
+            .status()?;
+        Ok(status.success().then_some("SetSuspendState"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Ok(None)
+    }
+}
+
 async fn sleep_wake(config: &HarnessConfig) -> Result<ScenarioRun> {
     run_body!(config, "sleep-wake", |session, checks| {
         let plan = plan::build(
@@ -814,6 +850,22 @@ async fn sleep_wake(config: &HarnessConfig) -> Result<ScenarioRun> {
             "the tunnel is up before suspend",
         )
         .await?;
+
+        match request_live_suspend()? {
+            Some(method) => {
+                checks.check(
+                    "the live OS suspend request was accepted",
+                    true,
+                    format!("requested suspend with {method}"),
+                )?;
+                tokio::time::sleep(Duration::from_secs(8)).await;
+            }
+            None => {
+                checks.note(
+                    "live suspend was not gated; set TOBRO_LEAK_ALLOW_LIVE_SLEEP=1 on a dedicated host",
+                );
+            }
+        }
 
         // Suspend/resume: the kernel does not keep routes across a sleep on
         // every platform. Simulate the loss by deleting the entries while
@@ -897,7 +949,7 @@ async fn helper_crash(config: &HarnessConfig) -> Result<ScenarioRun> {
             Routing::TestPrefixes,
             UdpMode::DnsOnly,
             Some(forwarding(session)),
-            KillSwitchMode::Disabled,
+            KillSwitchMode::Block,
         );
         session.apply(&plan).await?;
         let echoed = crate::traffic::tcp_echo(
@@ -977,32 +1029,8 @@ async fn helper_crash(config: &HarnessConfig) -> Result<ScenarioRun> {
             )?;
         }
 
-        // The harness plays the operator's recovery: restore the resolver it
-        // captured before the run, then restart the helper.
-        resolver::restore(session.dns_backup()).await?;
-        #[cfg(target_os = "windows")]
-        checks.note(
-            "the Windows resolver is adapter-scoped and vanished with the adapter; there is no \
-             host-wide value to restore"
-                .to_owned(),
-        );
-        #[cfg(not(target_os = "windows"))]
-        {
-            let restored = resolver::snapshot(Some(session.interface())).await?;
-            #[cfg(target_os = "linux")]
-            checks.check(
-                "the harness restores the original resolver after the crash",
-                same_servers(&restored, &session.dns_backup().snapshot),
-                format!("resolvers: {}", format_servers(&restored)),
-            )?;
-            #[cfg(target_os = "macos")]
-            checks.check(
-                "the harness restores the original resolver after the crash",
-                contains_all(&restored, &session.dns_backup().snapshot),
-                format!("resolvers: {}", format_servers(&restored)),
-            )?;
-        }
-
+        // Recovery must come from the helper-owned persistent journal.  Do
+        // not restore the harness resolver snapshot before relaunch.
         session.relaunch().await?;
         session.apply(&plan).await?;
         check_tunnel_egress(
@@ -1036,7 +1064,7 @@ async fn daemon_crash(config: &HarnessConfig) -> Result<ScenarioRun> {
             Routing::TestPrefixes,
             UdpMode::DnsOnly,
             Some(forwarding(session)),
-            KillSwitchMode::Disabled,
+            KillSwitchMode::Block,
         );
         session.apply(&plan).await?;
         let echoed = crate::traffic::tcp_echo(

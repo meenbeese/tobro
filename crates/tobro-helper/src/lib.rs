@@ -47,6 +47,7 @@ pub mod platform_linux;
 pub mod platform_macos;
 #[cfg(target_os = "windows")]
 pub mod platform_windows;
+pub mod recovery;
 pub mod service;
 pub mod session;
 

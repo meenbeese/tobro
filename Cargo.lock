@@ -7839,6 +7839,8 @@ dependencies = [
  "futures",
  "netstack-smoltcp",
  "rtnetlink",
+ "serde",
+ "serde_json",
  "system-configuration",
  "tempfile",
  "thiserror 2.0.21",

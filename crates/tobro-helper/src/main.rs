@@ -55,6 +55,12 @@ async fn run(endpoint: PathBuf, args: &Args) -> ExitCode {
             tracing::info!("no client connected within the idle window; exiting");
             ExitCode::SUCCESS
         }
+        ServeExit::DisconnectTimeout => {
+            tracing::info!(
+                "daemon disconnected; disconnect grace elapsed and tunnel was torn down"
+            );
+            ExitCode::SUCCESS
+        }
         ServeExit::BindError(error) => {
             tracing::error!("could not serve on the IPC endpoint: {error}");
             ExitCode::FAILURE

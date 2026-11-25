@@ -129,16 +129,26 @@ pub fn uninstall<R: Runner>(
     locations: &Locations,
     spec: &InstallSpec,
 ) -> Result<UninstallReport, InstallError> {
-    let status = status(runner, locations, spec);
-    if !status.binary_installed && !status.service_registered && !status.wintun_installed() {
+    let current = status(runner, locations, spec);
+    if !current.binary_installed && !current.service_registered && !current.wintun_installed() {
         return Ok(UninstallReport {
             actions: Vec::new(),
             already_clean: true,
         });
     }
-    run_elevated_script(runner, "uninstall", |_result_path| {
-        uninstall_script(locations)
+    run_elevated_script(runner, "uninstall", |result_path| {
+        uninstall_script(locations, &result_path.display().to_string())
     })?;
+    let remaining = status(runner, locations, spec);
+    if remaining.binary_installed
+        || remaining.service_registered
+        || remaining.wintun_installed == Some(true)
+    {
+        return Err(InstallError::Script(
+            "post-uninstall verification found helper, service, or wintun artifacts still installed"
+                .to_owned(),
+        ));
+    }
     Ok(UninstallReport {
         actions: vec![
             "service-stopped".to_owned(),
@@ -339,8 +349,12 @@ try {{
     sc.exe query {SERVICE_NAME} | Out-Null
     if ($LASTEXITCODE -ne 0) {{
         sc.exe create {SERVICE_NAME} binPath= {bin_value} start= demand obj= LocalSystem DisplayName= 'Tobro Helper' | Out-Null
-        $result.actions += 'service'
+        if ($LASTEXITCODE -ne 0) {{ throw 'could not create the helper service' }}
+    }} else {{
+        sc.exe config {SERVICE_NAME} binPath= {bin_value} start= demand obj= LocalSystem DisplayName= 'Tobro Helper' | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw 'could not converge the helper service configuration' }}
     }}
+    $result.actions += 'service'
     sc.exe sdset {SERVICE_NAME} {service_dacl} | Out-Null
     if ($LASTEXITCODE -ne 0) {{ throw 'could not set the service DACL' }}
     $result.actions += 'dacl'
@@ -360,16 +374,42 @@ exit 0
 /// The elevated uninstall script (PowerShell): stop + delete the service
 /// (service stop makes the helper tear down device/routes/DNS), remove the
 /// binary. Every step tolerates a missing piece.
-fn uninstall_script(locations: &Locations) -> String {
+fn uninstall_script(locations: &Locations, result_path: &str) -> String {
     let dst = elevate::powershell_quote(&locations.binary.display().to_string());
     let wintun_dst = elevate::powershell_quote(&locations.wintun.display().to_string());
+    let result_path = elevate::powershell_quote(result_path);
     format!(
-        r#"$ErrorActionPreference = 'Continue'
-sc.exe stop {SERVICE_NAME} | Out-Null
-Start-Sleep -Milliseconds 800
-sc.exe delete {SERVICE_NAME} | Out-Null
-Remove-Item -Force {dst} -ErrorAction SilentlyContinue
-Remove-Item -Force {wintun_dst} -ErrorAction SilentlyContinue
+        r#"$ErrorActionPreference = 'Stop'
+$result = [ordered]@{{ ok = $false; error = ''; actions = @() }}
+try {{
+    sc.exe query {SERVICE_NAME} | Out-Null
+    if ($LASTEXITCODE -eq 0) {{
+        sc.exe stop {SERVICE_NAME} | Out-Null
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{
+            throw 'could not stop the helper service'
+        }}
+        for ($i = 0; $i -lt 20; $i++) {{
+            sc.exe query {SERVICE_NAME} | Out-Null
+            if ($LASTEXITCODE -ne 0) {{ break }}
+            Start-Sleep -Milliseconds 100
+        }}
+        sc.exe delete {SERVICE_NAME} | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw 'could not delete the helper service' }}
+        $result.actions += 'service-deleted'
+    }}
+    Remove-Item -Force {dst} -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath {dst}) {{ throw 'could not remove the helper binary' }}
+    $result.actions += 'binary-removed'
+    Remove-Item -Force {wintun_dst} -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath {wintun_dst}) {{ throw 'could not remove wintun.dll' }}
+    $result.actions += 'wintun-removed'
+    sc.exe query {SERVICE_NAME} | Out-Null
+    if ($LASTEXITCODE -eq 0) {{ throw 'helper service registration remains after uninstall' }}
+    $result.ok = $true
+}} catch {{
+    $result.error = $_.Exception.Message
+}}
+$result | ConvertTo-Json -Compress | Set-Content -LiteralPath {result_path} -Encoding UTF8
 exit 0
 "#
     )
@@ -498,6 +538,7 @@ mod tests {
             r"C:\Temp\result.json",
         );
         assert!(script.contains("sc.exe create"), "{script}");
+        assert!(script.contains("sc.exe config"), "{script}");
         assert!(
             script.contains("binPath= '\""),
             "the binPath value must quote the binary path for sc: {script}"
@@ -581,10 +622,22 @@ mod tests {
     #[test]
     fn uninstall_script_stops_and_deletes() {
         let (_dir, locations, _source) = ctx();
-        let script = uninstall_script(&locations);
+        let script = uninstall_script(&locations, r"C:\Temp\tobro.result.json");
         assert!(script.contains("sc.exe stop"), "{script}");
         assert!(script.contains("sc.exe delete"), "{script}");
         assert!(script.contains("Remove-Item -Force"), "{script}");
+        assert!(
+            script.contains("could not stop the helper service"),
+            "{script}"
+        );
+        assert!(
+            script.contains("helper service registration remains after uninstall"),
+            "{script}"
+        );
+        assert!(
+            script.contains("Set-Content -LiteralPath"),
+            "uninstall must report its elevated result: {script}"
+        );
         assert!(
             script.contains(&locations.wintun.display().to_string()),
             "the driver is removed too: {script}"

@@ -405,10 +405,27 @@ impl Platform for MacosPlatform {
         // later applies only overwrite (they are our own settings).
         let take_backup = state.dns_backup.is_none();
         let servers = dns.servers.clone();
-        let backup =
-            sc_blocking(move || tobro_osapi::sc_dns::apply_dns(servers, take_backup)).await?;
+        let backup: Option<Option<Vec<u8>>> = if state.dns_backup.is_none() {
+            let journal = crate::recovery::load();
+            match journal.mac_dns_backup {
+                Some(backup) => {
+                    sc_blocking(move || tobro_osapi::sc_dns::apply_dns(servers, false)).await?;
+                    Some(backup)
+                }
+                None => {
+                    sc_blocking(move || tobro_osapi::sc_dns::apply_dns(servers, take_backup))
+                        .await?
+                }
+            }
+        } else {
+            sc_blocking(move || tobro_osapi::sc_dns::apply_dns(servers, false)).await?;
+            None
+        };
         if state.dns_backup.is_none() {
-            state.dns_backup = backup;
+            state.dns_backup = backup.clone();
+            let mut journal = crate::recovery::load();
+            journal.mac_dns_backup = backup.clone();
+            crate::recovery::save(&journal).map_err(PlatformError::Dns)?;
         }
         tracing::info!(
             "apply_dns: system resolver set ({} server(s))",
@@ -432,6 +449,9 @@ impl Platform for MacosPlatform {
         })?;
         match mode {
             KillSwitchMode::Block => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = true;
+                crate::recovery::save(&journal).map_err(PlatformError::KillSwitch)?;
                 let bypass = bypass_pairs(bypass_routes);
                 let interface = state.name.clone();
                 if let Some(enforcement) = state.kill_switch.as_ref() {
@@ -512,6 +532,9 @@ impl Platform for MacosPlatform {
                 state.kill_switch = Some(enforcement);
             }
             KillSwitchMode::Restore | KillSwitchMode::Disabled => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = false;
+                let _ = crate::recovery::save(&journal);
                 // Teardown order is fail-closed: routes are already gone, so
                 // the block keeps covering the leak direction until the
                 // rules themselves are removed.
@@ -614,6 +637,14 @@ impl Platform for MacosPlatform {
         if let Err(error) = restore {
             tracing::warn!("teardown: {error}");
         }
+        let mut journal = crate::recovery::load();
+        journal.mac_dns_backup = None;
+        journal.block_all = false;
+        let _ = if journal.linux_resolv_conf.is_none() && !journal.block_all {
+            crate::recovery::clear()
+        } else {
+            crate::recovery::save(&journal)
+        };
         tracing::info!(
             "teardown: done ({tracked} tracked route(s), {removed} removed successfully)"
         );

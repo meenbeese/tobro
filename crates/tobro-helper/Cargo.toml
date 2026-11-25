@@ -23,6 +23,8 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux TUN backend (T4a): device creation + netlink configuration.

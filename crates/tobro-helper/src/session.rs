@@ -35,6 +35,11 @@ use tobro_tun::{
 use crate::platform::Platform;
 use crate::service::HelperService;
 
+/// Short grace for daemon reconnection after an IPC disconnect.  Heartbeats
+/// normally reconnect well inside this window; an actual daemon exit tears down
+/// the tunnel instead of leaving networking changed for the idle window.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(30);
+
 /// How the serve loop ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeExit {
@@ -43,6 +48,8 @@ pub enum ServeExit {
     ShutdownSignal,
     /// No client connected within the idle window.
     IdleTimeout,
+    /// The authorized daemon disconnected and did not reconnect during grace.
+    DisconnectTimeout,
     /// The IPC endpoint could not be (re)bound.
     BindError(String),
 }
@@ -257,6 +264,10 @@ pub async fn serve_unix<P: Platform>(
                 teardown_if_active(service, "idle timeout").await;
                 return exit;
             }
+            _exit = disconnect_window(service.state().active) => {
+                teardown_if_active(service, "daemon disconnect grace").await;
+                return ServeExit::DisconnectTimeout;
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
@@ -337,6 +348,11 @@ pub async fn serve_windows<P: Platform>(
                 teardown_if_active(service, "idle timeout").await;
                 return exit;
             }
+            _exit = disconnect_window(service.state().active) => {
+                drop(server);
+                teardown_if_active(service, "daemon disconnect grace").await;
+                return ServeExit::DisconnectTimeout;
+            }
             connected = server.connect() => {
                 if let Err(error) = connected {
                     tracing::warn!("pipe connect failed: {error}");
@@ -356,6 +372,16 @@ pub async fn serve_windows<P: Platform>(
                 serve_connection(&mut framed, service, &mut gate, &peer).await;
             }
         }
+    }
+}
+
+/// Start a disconnect grace only while a plan is active.  Reconnecting
+/// through any new accept resets this arm because the accept loop is rebuilt.
+async fn disconnect_window(active: bool) -> () {
+    if active {
+        tokio::time::sleep(DISCONNECT_GRACE).await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 

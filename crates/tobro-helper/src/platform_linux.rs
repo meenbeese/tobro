@@ -633,7 +633,14 @@ impl Platform for LinuxPlatform {
             PlatformError::Dns("no active TUN device; DNS follows device creation".to_owned())
         })?;
         if state.dns_backup.is_none() {
-            state.dns_backup = Some(read_dns_backup()?);
+            let mut journal = crate::recovery::load();
+            let backup = match journal.linux_resolv_conf.take() {
+                Some(backup) => backup,
+                None => read_dns_backup()?,
+            };
+            state.dns_backup = Some(backup.clone());
+            journal.linux_resolv_conf = Some(backup);
+            crate::recovery::save(&journal).map_err(PlatformError::Dns)?;
         }
         write_resolv_conf(&render_resolv_conf(&dns.servers))?;
         tracing::info!(
@@ -657,6 +664,9 @@ impl Platform for LinuxPlatform {
         })?;
         match mode {
             KillSwitchMode::Block => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = true;
+                crate::recovery::save(&journal).map_err(PlatformError::KillSwitch)?;
                 // Insurance only makes sense when the plan routes a default
                 // prefix through the device (see module docs).
                 let Some(tun_metric) = state.tun_default_metric else {
@@ -694,6 +704,9 @@ impl Platform for LinuxPlatform {
                 );
             }
             KillSwitchMode::Restore | KillSwitchMode::Disabled => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = false;
+                let _ = crate::recovery::save(&journal);
                 if !state.blackholes.is_empty() {
                     self.remove_tracked_routes_for_blackholes(state).await;
                     tracing::info!("apply_kill_switch: insurance routes removed");
@@ -711,6 +724,14 @@ impl Platform for LinuxPlatform {
         let tracked = state.tracked_route_count();
         let removed = self.remove_tracked_routes(&state).await;
         Self::restore_dns(&mut state);
+        let mut journal = crate::recovery::load();
+        journal.linux_resolv_conf = None;
+        journal.block_all = false;
+        let _ = if journal.mac_dns_backup.is_none() && !journal.block_all {
+            crate::recovery::clear()
+        } else {
+            crate::recovery::save(&journal)
+        };
         // The device itself is closed by the service (it stops the routing
         // engine after this teardown); the kernel then removes the interface
         // and its device routes.

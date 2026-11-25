@@ -455,6 +455,9 @@ impl Platform for WindowsPlatform {
         })?;
         match mode {
             KillSwitchMode::Block => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = true;
+                crate::recovery::save(&journal).map_err(PlatformError::KillSwitch)?;
                 // The WFP apply is replace-semantics (the sublayer is swept
                 // first), so re-applying converges the enforcement with the
                 // current bypass set; no early return for an already-active
@@ -488,6 +491,9 @@ impl Platform for WindowsPlatform {
                 tracing::info!("apply_kill_switch: WFP enforcement active ({filters} filter(s))");
             }
             KillSwitchMode::Restore | KillSwitchMode::Disabled => {
+                let mut journal = crate::recovery::load();
+                journal.block_all = false;
+                let _ = crate::recovery::save(&journal);
                 // Teardown order is fail-closed: routes are already gone, so
                 // the block keeps covering the leak direction until the
                 // filters themselves are removed.
@@ -566,6 +572,9 @@ impl Platform for WindowsPlatform {
         tracing::info!(
             "teardown: done ({tracked} tracked route(s), {removed} removed successfully)"
         );
+        let mut journal = crate::recovery::load();
+        journal.block_all = false;
+        let _ = crate::recovery::clear();
         Ok(())
     }
 }
