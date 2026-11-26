@@ -17,14 +17,17 @@
 //! fully internal:
 //!
 //! - **macOS**: opening a `PF_ROUTE` routing socket, writing a request
-//!   message, reading the reply. All message bytes are built from validated
-//!   plain-data inputs (`std::net` types + interface indices); no attacker
-//!   controlled lengths, pointers, or format strings exist. The kill switch
-//!   additionally speaks `/dev/pf` ioctls with fixed-size structures
-//!   ([`pf`]) — never `pfctl`, per §10.5's no-shell rule.
-//! - **Windows**: calling the two iphlpapi functions
-//!   (`CreateIpForwardEntry2` / `DeleteIpForwardEntry2`) with a zeroed-out
-//!   struct filled from validated plain-data inputs, the handful of Windows
+//!   message, reading the reply; assigning the utun's IPv6 address through
+//!   the `SIOCAIFADDR_IN6` ioctl ([`bsd_ifaddr`]). All message bytes are
+//!   built from validated plain-data inputs (`std::net` types + interface
+//!   indices); no attacker controlled lengths, pointers, or format strings
+//!   exist. The kill switch additionally speaks `/dev/pf` ioctls with
+//!   fixed-size structures ([`pf`]) — never `pfctl`, per §10.5's no-shell
+//!   rule.
+//! - **Windows**: calling the iphlpapi route functions
+//!   (`CreateIpForwardEntry2` / `DeleteIpForwardEntry2`) and the unicast
+//!   address call (`CreateUnicastIpAddressEntry`) with a zeroed-out struct
+//!   filled from validated plain-data inputs, the handful of Windows
 //!   Filtering Platform calls used by the kill switch ([`wfp`]), and the
 //!   named-pipe security/token calls that scope the helper IPC endpoint to
 //!   one user SID ([`win_pipe`]).
@@ -38,6 +41,9 @@
 //! `io::Error`; the caller (privileged helper) owns logging policy.
 
 #![allow(clippy::module_name_repetitions)]
+
+#[cfg(target_os = "macos")]
+pub mod bsd_ifaddr;
 
 #[cfg(target_os = "macos")]
 pub mod bsd_route;

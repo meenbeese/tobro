@@ -178,15 +178,13 @@ or in a namespace.
 
 ## Platform notes
 
-- **Linux** exercises the full path for both address families: the device
-  gets IPv4 and IPv6 addresses, so IPv6 TCP/DNS interception is asserted
-  end-to-end.
-- **macOS** and **Windows** currently address the TUN device with IPv4 only
-  (the platform backends use `tun2`'s single-address creation). IPv6 routes
-  are still installed and asserted to keep traffic inside the tunnel, but
-  IPv6 TCP/DNS fails closed (no source address) rather than being forwarded.
-  The `ipv6-routed` and `dns-intercepted` scenarios record this as a note
-  and still fail on any observed physical egress.
+- **Linux**, **macOS**, and **Windows** address the TUN device with both
+  families: IPv4 at creation, IPv6 through the platform's privileged API
+  (netlink on Linux, `SIOCAIFADDR_IN6` on macOS, `CreateUnicastIpAddressEntry`
+  on Windows). IPv6 TCP/DNS interception is therefore asserted end-to-end;
+  the suite still fails on any observed physical egress, and on hosts without
+  an IPv6 stack it skips the `ipv6-routed` scenario and notes that the IPv6
+  DNS check was not exercised.
 - **macOS** sets the global `State:/Network/Global/DNS` key; `scutil --dns`
   also lists per-service resolvers, so the suite asserts the tunnel servers
   are present (and restored) rather than that the output is exclusive.

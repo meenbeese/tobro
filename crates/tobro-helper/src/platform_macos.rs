@@ -6,10 +6,13 @@
 //! - The kernel names utun devices itself (`utunN`); the requested plan name
 //!   is ignored and the actual name is returned to the daemon, which uses it
 //!   for subsequent calls.
-//! - tun2 addresses the device at creation only (`SIOCAIFADDR`); macOS
-//!   cannot re-address a live utun device, so a changed address is an error
-//!   asking for a teardown first. MTU *can* be changed via an ioctl and is
-//!   converged idempotently.
+//! - `tun2` addresses the device at creation with the plan's first IPv4
+//!   address (`SIOCAIFADDR`); the plan's IPv6 addresses are added right
+//!   after creation through `SIOCAIFADDR_IN6` (`tobro-osapi`'s `bsd_ifaddr`
+//!   module), giving the utun the same dual-stack addressing as the Linux
+//!   backend. Every apply gets a fresh utun, so address changes need no
+//!   live convergence: the service removes the old device and its addresses.
+//!   MTU *can* be changed via an ioctl and is converged idempotently.
 //! - Routes go through `tobro-osapi`'s PF_ROUTE FFI (the helper never shells
 //!   out, §10.5). Add is replace-on-add (`EEXIST` → delete + re-add);
 //!   deletes are idempotent (`ESRCH` → success). Route metrics are ignored:
@@ -31,7 +34,7 @@
 //!   inside `tokio::task::spawn_blocking`. Logs carry counts only, never
 //!   addresses or destinations (§10.5).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -262,6 +265,32 @@ impl Platform for MacosPlatform {
             .map_err(|error| PlatformError::Device(format!("utun device has no index: {error}")))?;
         let index = u32::try_from(index)
             .map_err(|_| PlatformError::Device("utun index overflow".to_owned()))?;
+
+        // tun2 only assigns the first IPv4 address, at creation. Add the
+        // plan's IPv6 addresses now (SIOCAIFADDR_IN6 through tobro-osapi), so
+        // the device carries the full dual-stack plan like the Linux backend.
+        // If an assignment fails the local handle drops, which closes the
+        // utun and takes any partially assigned addresses with it.
+        let ipv6: Vec<(Ipv6Addr, u8)> = device
+            .addresses
+            .iter()
+            .filter_map(|prefix| match prefix.addr {
+                IpAddr::V6(address) => Some((address, prefix.prefix_len)),
+                IpAddr::V4(_) => None,
+            })
+            .collect();
+        for (address, prefix_len) in &ipv6 {
+            tobro_osapi::bsd_ifaddr::add_ipv6_address(&name, *address, *prefix_len).map_err(
+                |error| {
+                    PlatformError::Device(format!(
+                        "could not assign an IPv6 address to the utun device: {error}"
+                    ))
+                },
+            )?;
+        }
+        if !ipv6.is_empty() {
+            tracing::info!("create_device: assigned {} IPv6 address(es)", ipv6.len());
+        }
 
         // Carry the state a new device does not reset: the resolver backup
         // and the PF enforcement both outlive the utun, and so do the bypass
@@ -667,10 +696,16 @@ mod macos_integration {
         let platform = MacosPlatform::new();
         let device = TunDevice {
             name: String::new(), // the kernel assigns utunN
-            addresses: vec![Prefix {
-                addr: IpAddr::V4(Ipv4Addr::new(10, 111, 222, 252)),
-                prefix_len: 30,
-            }],
+            addresses: vec![
+                Prefix {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 111, 222, 252)),
+                    prefix_len: 30,
+                },
+                Prefix {
+                    addr: IpAddr::V6(Ipv6Addr::new(0xfd6b, 0x626f, 0x6272, 0x6f, 0, 0, 0, 0)),
+                    prefix_len: 64,
+                },
+            ],
             mtu: 1400,
         };
         let created = platform.create_device(&device).await.expect("create");

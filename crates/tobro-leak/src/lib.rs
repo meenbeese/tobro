@@ -14,7 +14,7 @@
 //! | `tcp-forwarded` | TCP bypassing the engine/SOCKS path |
 //! | `dns-intercepted` | DNS queries bypassing the tunnel resolver |
 //! | `udp-blocked` | QUIC/other UDP escaping, DNS in `block_all` mode |
-//! | `ipv6-routed` | IPv6 ignoring the IPv4-only tunnel policy |
+//! | `ipv6-routed` | IPv6 bypassing the tunnel (dual-stack source address) |
 //! | `route-change` | stale routes after a plan change or external change |
 //! | `sleep-wake` | traffic/DNS escaping after kernel state loss |
 //! | `helper-crash` | resolver left pointing at a dead tunnel (fail open) |

@@ -11,9 +11,17 @@
 //! Route metrics are interface-relative on Windows; [`Route::metric`] (or 0)
 //! is stored directly.
 //!
+//! Interface addresses are added with `CreateUnicastIpAddressEntry`
+//! (`MIB_UNICASTIPADDRESS_ROW`): tun2 gives a new wintun adapter its first
+//! IPv4 address, and [`add_unicast_address`] adds the plan's IPv6 address
+//! (and any other family entry the backend needs). The row asks for manual
+//! origins, infinite lifetimes, and (Windows 10+) optimistic DAD so the
+//! address is usable immediately. Addresses are not persistent: deleting the
+//! adapter removes them, matching the backend's teardown story.
+//!
 //! # Unsafe scope
 //!
-//! All `unsafe` here is the FFI: the two iphlpapi calls and zeroing/fields of
+//! All `unsafe` here is the FFI: the iphlpapi calls and zeroing/fields of
 //! fixed-layout C structs. Every field is written from validated
 //! `std::net`/`u32` inputs; no pointers beyond the (stack) row struct are
 //! passed. `load_wintun` wraps the `unsafe` DLL load behind a safe function
@@ -27,12 +35,14 @@ use windows_sys::Win32::Foundation::{
     ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR, WIN32_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, GetBestRoute2, IP_ADDRESS_PREFIX,
-    MIB_IPFORWARD_ROW2,
+    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, GetBestRoute2,
+    IP_ADDRESS_PREFIX, InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2,
+    MIB_UNICASTIPADDRESS_ROW,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, NL_ROUTE_PROTOCOL,
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
+    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IpDadStatePreferred,
+    IpPrefixOriginManual, IpSuffixOriginManual, NL_ROUTE_PROTOCOL, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_IN6_0, SOCKADDR_INET,
 };
 
 use super::{Route, RouteError};
@@ -59,6 +69,74 @@ pub fn delete_route(route: &Route) -> Result<(), RouteError> {
     // SAFETY: `row` is a fully initialized, pointer-free struct on the stack.
     let result = unsafe { DeleteIpForwardEntry2(&row) };
     check(result, RouteError::NotFound)
+}
+
+/// Assign a unicast address to the interface with `interface_index`
+/// (`CreateUnicastIpAddressEntry`).
+///
+/// The address is adapter-scoped and not persistent: it disappears with the
+/// adapter, so teardown needs no explicit removal. [`RouteError::Exists`]
+/// reports a duplicate address; a missing interface or a disabled family's
+/// stack surfaces as [`RouteError::Io`].
+///
+/// On Windows 10 and later the row's preferred DAD state asks the stack for
+/// optimistic duplicate-address detection, so the address is usable without
+/// the one-second tentative wait that would otherwise race the first packet
+/// after an apply.
+pub fn add_unicast_address(
+    interface_index: u32,
+    address: IpAddr,
+    prefix_len: u8,
+) -> Result<(), RouteError> {
+    let row = build_address_row(interface_index, address, prefix_len)?;
+    // SAFETY: `row` is a fully initialized, pointer-free struct on the stack.
+    let result = unsafe { CreateUnicastIpAddressEntry(&row) };
+    // Unlike route deletes, `ERROR_NOT_FOUND` here means the interface (or
+    // the address family's stack) is missing: an error, not idempotence.
+    match result {
+        NO_ERROR => Ok(()),
+        ERROR_OBJECT_ALREADY_EXISTS => Err(RouteError::Exists),
+        other => Err(RouteError::Io(io::Error::from_raw_os_error(other as i32))),
+    }
+}
+
+/// Build the `MIB_UNICASTIPADDRESS_ROW` for one address request.
+fn build_address_row(
+    interface_index: u32,
+    address: IpAddr,
+    prefix_len: u8,
+) -> Result<MIB_UNICASTIPADDRESS_ROW, RouteError> {
+    let max_prefix = if matches!(address, IpAddr::V4(_)) {
+        32
+    } else {
+        128
+    };
+    if u32::from(prefix_len) > max_prefix {
+        return Err(RouteError::Invalid(format!(
+            "prefix length {prefix_len} does not fit a {max_prefix}-bit address"
+        )));
+    }
+
+    // Initialize the row with the API's defaults (infinite lifetimes) before
+    // overriding the fields that describe our address.
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: `row` is a valid, initialized out-parameter; the call only
+    // writes default values into it.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.Address = sockaddr_inet(address)?;
+    // A zeroed LUID makes iphlpapi resolve the interface by index.
+    row.InterfaceIndex = interface_index;
+    // A manual origin pair is required together: one `Unchanged` with a
+    // concrete other is rejected by the API.
+    row.PrefixOrigin = IpPrefixOriginManual;
+    row.SuffixOrigin = IpSuffixOriginManual;
+    row.ValidLifetime = INFINITE_LIFETIME;
+    row.PreferredLifetime = INFINITE_LIFETIME;
+    row.OnLinkPrefixLength = prefix_len;
+    row.SkipAsSource = false;
+    // Ignored before Windows 10; asks for optimistic DAD there.
+    row.DadState = IpDadStatePreferred;
+    Ok(row)
 }
 
 /// Map a `WIN32_ERROR` to a result, treating `not_found` as success (the
@@ -308,13 +386,36 @@ mod tests {
     fn sockaddr_family_selects_the_arm() {
         // SAFETY: zeroing a pointer-free C union before setting the tag.
         let mut mixed: SOCKADDR_INET = unsafe { std::mem::zeroed() };
-        // SAFETY: writing the `Ipv6` arm of the union.
-        unsafe {
-            mixed.si_family = AF_INET6;
-        }
+        // Writing a union field is safe; reads are the unsafe part.
+        mixed.si_family = AF_INET6;
         assert_eq!(
             sockaddr_address(mixed).unwrap(),
             Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
         );
+    }
+
+    /// The address row names the interface by index, carries the requested
+    /// prefix, and is manual/infinite so the stack does not age it out.
+    #[test]
+    fn address_rows_are_manual_and_dual_stack() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0xfd6b, 0x626f, 0x6272, 0x6f, 0, 0, 0, 0));
+        let row = build_address_row(42, v6, 64).unwrap();
+        assert_eq!(row.InterfaceIndex, 42);
+        assert_eq!(row.OnLinkPrefixLength, 64);
+        assert_eq!(row.PrefixOrigin, IpPrefixOriginManual);
+        assert_eq!(row.SuffixOrigin, IpSuffixOriginManual);
+        assert_eq!(row.ValidLifetime, INFINITE_LIFETIME);
+        assert_eq!(row.PreferredLifetime, INFINITE_LIFETIME);
+        assert_eq!(row.DadState, IpDadStatePreferred);
+        assert_eq!(sockaddr_address(row.Address).unwrap(), Some(v6));
+
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 111, 222, 253));
+        assert_eq!(
+            sockaddr_address(build_address_row(7, v4, 30).unwrap().Address).unwrap(),
+            Some(v4)
+        );
+
+        assert!(build_address_row(42, v6, 129).is_err());
+        assert!(build_address_row(42, v4, 33).is_err());
     }
 }

@@ -3,10 +3,13 @@
 //!
 //! Design notes:
 //!
-//! - The device is a wintun adapter created through `tun2`; addressing and
-//!   MTU are set at creation (tun2 calls `set_network_addresses_tuple` with
-//!   our address + netmask and no gateway). Every apply gets a fresh adapter:
-//!   the service stops the routing engine (which owns the device) first, and
+//! - The device is a wintun adapter created through `tun2`; the first IPv4
+//!   address, MTU, and the up state are set at creation (tun2 calls
+//!   `set_network_addresses_tuple` with our address + netmask and no
+//!   gateway). The plan's IPv6 addresses are then added through iphlpapi
+//!   (`CreateUnicastIpAddressEntry` in `tobro-osapi`), so the adapter is
+//!   dual-stack like the Linux device. Every apply gets a fresh adapter: the
+//!   service stops the routing engine (which owns the device) first, and
 //!   closing the last wintun handle removes the adapter.
 //! - The adapter index and DNS settings are managed through
 //!   `wintun-bindings` by re-opening the adapter by name (DNS set on our own
@@ -314,6 +317,31 @@ impl Platform for WindowsPlatform {
             .map_err(|error| {
                 PlatformError::Device(format!("adapter discovery task failed: {error}"))
             })?;
+
+        // tun2 only assigns the first IPv4 address, at creation. Add the
+        // plan's IPv6 addresses through iphlpapi (`CreateUnicastIpAddressEntry`)
+        // so the adapter is dual-stack like the Linux device. The address is
+        // adapter-scoped: closing the adapter removes it, so teardown needs no
+        // explicit cleanup.
+        let ipv6: Vec<(IpAddr, u8)> = device
+            .addresses
+            .iter()
+            .filter(|prefix| matches!(prefix.addr, IpAddr::V6(_)))
+            .map(|prefix| (prefix.addr, prefix.prefix_len))
+            .collect();
+        for (address, prefix_len) in &ipv6 {
+            tobro_osapi::win_route::add_unicast_address(index, *address, *prefix_len).map_err(
+                |error| {
+                    PlatformError::Device(format!(
+                        "could not assign an IPv6 address to the wintun adapter: {error}"
+                    ))
+                },
+            )?;
+        }
+        if !ipv6.is_empty() {
+            tracing::info!("create_device: assigned {} IPv6 address(es)", ipv6.len());
+        }
+
         // Carry what the adapter does not take with it: the WFP enforcement
         // outlives the adapter and must be removed by a later apply/teardown.
         let kill_switch = guard.as_ref().is_some_and(|state| state.kill_switch);

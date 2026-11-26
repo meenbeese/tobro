@@ -500,30 +500,27 @@ async fn dns_intercepted(config: &HarnessConfig) -> Result<ScenarioRun> {
             format!("received {} byte(s)", reply.len()),
         )?;
 
-        // The IPv6 interception path is only reachable where the backend
-        // assigns the tunnel's IPv6 address (Linux). Elsewhere the tunnel
-        // still routes IPv6 but has no source address, so traffic fails
-        // closed; record that instead of pretending it worked.
-        match crate::traffic::dns_echo(
-            dns_socket(IpAddr::V6(plan::TUNNEL_DNS_V6)),
-            DNS_QUERY,
-            config.timeout,
-        )
-        .await
-        {
-            Ok(reply) => checks.check(
+        // Every backend assigns the tunnel's IPv6 address, so on a host with
+        // an IPv6 stack the interception path is a required assertion (the
+        // fake daemon only has a v6 resolver socket when `::1` binds).
+        if host_has_ipv6() {
+            let reply = crate::traffic::dns_echo(
+                dns_socket(IpAddr::V6(plan::TUNNEL_DNS_V6)),
+                DNS_QUERY,
+                config.timeout,
+            )
+            .await
+            .context("the IPv6 DNS query was not intercepted")?;
+            checks.check(
                 "the IPv6 DNS reply is relayed and spoofed from the tunnel resolver",
                 reply == DNS_QUERY,
                 format!("received {} byte(s)", reply.len()),
-            )?,
-            Err(error) => checks.note(format!(
-                "IPv6 DNS interception could not be exercised on this platform \
-                 (traffic fails closed): {error:#}"
-            )),
+            )?;
+        } else {
+            checks.note("the host has no IPv6 stack; the IPv6 DNS path was not exercised");
         }
 
-        // Both families use the same local resolver socket. The IPv6 query
-        // may not have been sent on platforms without a tunnel v6 address.
+        // Both families use the same local resolver socket.
         let observed = session.daemon().dns_queries(false) - before_queries;
         checks.check(
             "intercepted queries reached the daemon's resolver",
@@ -663,35 +660,27 @@ async fn ipv6_routed(config: &HarnessConfig) -> Result<ScenarioRun> {
         )
         .await?;
 
-        // Where the backend assigns the tunnel's IPv6 address (Linux), the
-        // full forwarding path must work. Elsewhere it must at least fail
-        // closed: the route stays in the tunnel and nothing reaches the
-        // physical network.
-        match crate::traffic::tcp_echo(
+        // Every backend assigns the tunnel's IPv6 address, so the full
+        // forwarding path is a required assertion; a failure is a leak-suite
+        // failure, not a platform note.
+        let echoed = crate::traffic::tcp_echo(
             socket(plan::test_v6_host(), 443),
             b"tobro leak test: ipv6",
             config.timeout,
         )
         .await
-        {
-            Ok(echoed) => {
-                checks.check(
-                    "IPv6 TCP is forwarded through the tunnel",
-                    echoed == b"tobro leak test: ipv6",
-                    format!("received {} byte(s)", echoed.len()),
-                )?;
-                let destinations = session.daemon().socks_destinations();
-                checks.check(
-                    "the engine dialed the IPv6 destination",
-                    destinations.iter().any(|dest| dest == "2001:db8::1:443"),
-                    format!("destinations: {destinations:?}"),
-                )?;
-            }
-            Err(error) => checks.note(format!(
-                "IPv6 TCP failed closed (the route stays in the tunnel; no physical \
-                 egress): {error:#}"
-            )),
-        }
+        .context("IPv6 TCP was not forwarded through the tunnel")?;
+        checks.check(
+            "IPv6 TCP is forwarded through the tunnel",
+            echoed == b"tobro leak test: ipv6",
+            format!("received {} byte(s)", echoed.len()),
+        )?;
+        let destinations = session.daemon().socks_destinations();
+        checks.check(
+            "the engine dialed the IPv6 destination",
+            destinations.iter().any(|dest| dest == "2001:db8::1:443"),
+            format!("destinations: {destinations:?}"),
+        )?;
 
         session.teardown().await?;
         check_not_tunnel_egress(

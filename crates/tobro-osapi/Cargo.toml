@@ -9,7 +9,8 @@ publish.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 
-# macOS route socket FFI (PF_ROUTE / RTM_ADD / RTM_DELETE).
+# macOS route socket FFI (PF_ROUTE / RTM_ADD / RTM_DELETE) and interface
+# address ioctl (SIOCAIFADDR_IN6) — see `bsd_route` and `bsd_ifaddr`.
 # macOS SystemConfiguration DNS FFI (dynamic store) — see `sc_dns`.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
@@ -19,8 +20,9 @@ system-configuration = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 
-# Windows routing table FFI (iphlpapi CreateIpForwardEntry2/DeleteIpForwardEntry2)
-# and kill-switch FFI (Windows Filtering Platform / fwpuclnt).
+# Windows routing/address FFI (iphlpapi CreateIpForwardEntry2 /
+# DeleteIpForwardEntry2 / CreateUnicastIpAddressEntry) and kill-switch FFI
+# (Windows Filtering Platform / fwpuclnt).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
