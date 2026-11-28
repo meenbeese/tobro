@@ -5,7 +5,7 @@ technologies that reproduces the useful surface of Orbot using Rust/Arti and Tau
 Supports connect/disconnect, bridges and pluggable transports, local proxy services,
 onion hosting, Kindness Mode, as well as numerous circumvention methods.
 
-**Status:** M0-M6 shipped; M7 in progress.
+**Status:** M0-M7 shipped; M8 in progress.
 
 - [Read the full plan](TOBRO_PLAN.md) — architecture, technology decisions, Orbot feature-parity matrix, milestones, and risks.
 
@@ -167,7 +167,7 @@ feature is not (yet) available on a given OS.
 | App lock via OS auth (Touch ID / Windows Hello) | ❌ (planned; password fallback) | ❌ (planned; password fallback) | ❌ (planned; password fallback) |
 | Window capture protection | Best-effort | Best-effort | Best-effort (varies by DE/WM) |
 | Headless daemon + `tobroctl` | ✅ (launchd example) | ✅ | ✅ (systemd example) |
-| TUN mode + privileged helper (`tobro-helper`) | 🚧 M7 in progress (utun + PF_ROUTE + SC DNS + PF kill switch; routing engine in the helper) | 🚧 M7 in progress (wintun + iphlpapi + WFP kill switch; routing engine in the helper) | 🚧 M7 in progress (netlink + TUN + blackhole-route kill switch; routing engine in the helper) |
+| TUN mode + privileged helper (`tobro-helper`) | ✅ utun + PF_ROUTE + SC DNS + PF kill switch; routing engine in the helper | ✅ wintun + iphlpapi + WFP kill switch; routing engine in the helper | ✅ netlink + TUN + blackhole-route kill switch; routing engine in the helper |
 | System proxy integration / proxy env vars | ❌ (planned post-1.0) | ❌ (planned post-1.0) | ❌ (planned post-1.0) |
 
 ¹ Requires a running Secret Service provider (GNOME Keyring, KWallet). When no

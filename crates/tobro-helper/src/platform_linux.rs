@@ -667,21 +667,22 @@ impl Platform for LinuxPlatform {
                 let mut journal = crate::recovery::load();
                 journal.block_all = true;
                 crate::recovery::save(&journal).map_err(PlatformError::KillSwitch)?;
-                // Insurance only makes sense when the plan routes a default
-                // prefix through the device (see module docs).
-                let Some(tun_metric) = state.tun_default_metric else {
-                    tracing::info!(
-                        "apply_kill_switch: no device default route; route-level insurance not applicable"
-                    );
-                    return Ok(());
-                };
+                // `KillSwitchMode::Block` is fail-closed: block traffic
+                // until the tunnel is restored. We install blackhole default
+                // insurance one metric worse than the TUN default. When the
+                // plan routes a default prefix through the device we use its
+                // metric; otherwise (test-prefix / split-tunnel-only plans)
+                // we still install block-all blackholes, because `block`
+                // means block everything, matching PF/WFP on macOS/Windows.
+                // The block is removed by teardown / restoring `apply_kill_switch`.
+                let tun_metric = state.tun_default_metric;
                 // A re-apply may carry insurance from a previous plan whose
                 // default route had a different metric: replace the tracked
                 // set instead of accumulating routes at stale metrics.
                 if !state.blackholes.is_empty() {
                     self.remove_tracked_routes_for_blackholes(state).await;
                 }
-                let metric = blackhole_metric(Some(tun_metric));
+                let metric = blackhole_metric(tun_metric);
                 let mut blackholes = Vec::with_capacity(2);
                 for ipv4 in [true, false] {
                     let message = blackhole_message(ipv4, metric);
@@ -852,12 +853,24 @@ mod tests {
         assert_eq!(message.header.scope, ROUTE_SCOPE);
         assert_eq!(message.header.protocol, ROUTE_PROTOCOL);
         // A device route pins the output interface regardless of an oif for
-        // a gateway (it has none).
+        // a gateway (it has none). Match on containment, not slice order or
+        // exhaustiveness (rtnetlink may add `Destination`, etc.).
         let attributes = message.attributes.clone();
-        assert!(matches!(
-            attributes.as_slice(),
-            [RouteAttribute::Oif(7), RouteAttribute::Priority(50)]
-        ));
+        assert!(
+            attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Oif(7)))
+        );
+        assert!(
+            attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Priority(50)))
+        );
+        assert!(
+            !attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Gateway(_)))
+        );
     }
 
     #[test]
@@ -887,10 +900,17 @@ mod tests {
         );
         let message = route_message(&link_local, 7, Some(3));
         let attributes = message.attributes.clone();
-        assert!(matches!(
-            attributes.as_slice(),
-            [RouteAttribute::Oif(3), RouteAttribute::Gateway(_)]
-        ));
+        // Containment, not exact slice (rtnetlink may add other attributes).
+        assert!(
+            attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Oif(3)))
+        );
+        assert!(
+            attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Gateway(_)))
+        );
     }
 
     #[test]

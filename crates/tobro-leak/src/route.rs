@@ -104,7 +104,17 @@ impl Routes {
                 // The kernel reports "no route" as a netlink error rather
                 // than an empty reply. That is exactly the isolated-network
                 // case these assertions run in, not a probe failure.
-                Err(error) if is_no_route_error(&error) => return Ok(Egress::Unreachable),
+                // `RTM_GETROUTE` also answers `-EINVAL` when the only
+                // matching route is a blackhole/unreachable kill-switch
+                // route; inspect the table to distinguish a kill-switch
+                // blackhole from genuinely no route.
+                Err(error) if is_no_route_error(&error) => {
+                    return Ok(if ip_route_shows_blackhole(destination) {
+                        Egress::Blackhole
+                    } else {
+                        Egress::Unreachable
+                    });
+                }
                 Err(error) => {
                     return Err(anyhow::anyhow!("netlink route lookup failed: {error}"));
                 }
@@ -224,13 +234,90 @@ pub fn describe(egress: Egress) -> String {
 /// values are the same on every Linux architecture.
 #[cfg(target_os = "linux")]
 fn is_no_route_error(error: &rtnetlink::Error) -> bool {
+    const EINVAL: i32 = 22;
     const ENETUNREACH: i32 = 101;
     const EHOSTUNREACH: i32 = 113;
     match error {
         rtnetlink::Error::NetlinkError(message) => message.code.is_some_and(|code| {
             let code = code.get();
-            code == -ENETUNREACH || code == -EHOSTUNREACH
+            code == -ENETUNREACH || code == -EHOSTUNREACH || code == -EINVAL
         }),
         _ => false,
     }
+}
+
+/// Best-effort: does the main table contain a `blackhole` route matching
+/// `destination`? `RTM_GETROUTE` can return `-EINVAL` for a
+/// blackhole-only match instead of a reply, so check `ip route show`.
+/// Non-Linux or `ip`-absent hosts report `false`.
+#[cfg(target_os = "linux")]
+fn ip_route_shows_blackhole(destination: IpAddr) -> bool {
+    let Ok(output) = std::process::Command::new("ip")
+        .args(["route", "show", "table", "main"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .any(|line| blackhole_line_matches(line, destination))
+}
+
+#[cfg(target_os = "linux")]
+fn blackhole_line_matches(line: &str, destination: IpAddr) -> bool {
+    let line = line.trim();
+    if !line.starts_with("blackhole") {
+        return false;
+    }
+    // `blackhole default`, `blackhole 0.0.0.0/0`, `blackhole ::/0`, ...
+    let rest = line["blackhole".len()..].trim();
+    let prefix_token = rest.split_whitespace().next().unwrap_or("");
+    if prefix_token == "default" {
+        return true;
+    }
+    let (addr_str, len_str) = match prefix_token.split_once('/') {
+        Some((a, l)) => (a, l),
+        None => (
+            prefix_token,
+            match destination {
+                IpAddr::V4(_) => "32",
+                IpAddr::V6(_) => "128",
+            },
+        ),
+    };
+    let Ok(prefix_len) = len_str.parse::<u8>() else {
+        return false;
+    };
+    let Ok(net_addr) = addr_str.parse::<IpAddr>() else {
+        return false;
+    };
+    match (net_addr, destination) {
+        (IpAddr::V4(net), IpAddr::V4(dest)) => ipv4_in_prefix(dest, net, prefix_len),
+        (IpAddr::V6(net), IpAddr::V6(dest)) => ipv6_in_prefix(dest, net, prefix_len),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ipv4_in_prefix(dest: std::net::Ipv4Addr, net: std::net::Ipv4Addr, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if len > 32 {
+        return false;
+    }
+    let shift = 32 - len;
+    (u32::from(dest) >> shift) == (u32::from(net) >> shift)
+}
+
+#[cfg(target_os = "linux")]
+fn ipv6_in_prefix(dest: std::net::Ipv6Addr, net: std::net::Ipv6Addr, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if len > 128 {
+        return false;
+    }
+    let shift = 128 - len;
+    (u128::from(dest) >> shift) == (u128::from(net) >> shift)
 }

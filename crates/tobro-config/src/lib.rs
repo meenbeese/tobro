@@ -80,7 +80,8 @@ pub struct Config {
     pub kindness: KindnessConfig,
     /// TUN mode settings (M7, §4.7): system-wide routing, split tunneling,
     /// kill switch, and UDP policy. Defaults to fully disabled; `tun.enabled`
-    /// is rejected by validation until the M7 engine lands.
+    /// validates (the M7 privileged-helper + routing engine exists) and is
+    /// only applied to the system when the privileged helper is installed.
     pub tun: TunConfig,
     /// Logging settings.
     pub logging: LoggingConfig,

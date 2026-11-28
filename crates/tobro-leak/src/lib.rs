@@ -7,6 +7,13 @@
 //! packet that escapes the tunnel is *observable* instead of silently
 //! reaching the internet.
 //!
+//! Scope (honest): proves **"no escape + reaches forwarder"** — nothing
+//! bypasses the tunnel / kill switch, tunneled TCP reaches the SOCKS5
+//! forwarder, DNS is intercepted to the tunnel resolver, no physical
+//! egress, no DNS/IPv6/QUIC leaks. It does **not** prove the forwarder
+//! routes through **Tor**; Tor-routing is verified separately by
+//! `tobrod`/`tobro-tor` (Arti) tests, not a real-Tor run here.
+//!
 //! Coverage (safe tier, no default-route takeover):
 //!
 //! | Scenario | Leak it rules out |

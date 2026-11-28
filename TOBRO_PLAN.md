@@ -227,7 +227,7 @@ These are **not** parity requirements; they are replaced or dropped:
 | IPC | **JSON-RPC 2.0 over Unix socket / Windows named pipe** | — | Local-only, debuggable, no TCP exposure, easy CLI |
 | HTTP client | `reqwest` (rustls) | — | Moat, bridge data, update metadata; no OpenSSL dependency |
 | Pluggable transports | Arti `pt-client` + sidecars: **lyrebird**, **snowflake-client**, **dnstt-client** | — | Reuse Tor Project's maintained PT implementations |
-| TUN (post-1.0) | `tun2proxy` / `netstack-smoltcp` + platform TUN | — | Rust userspace TCP/IP stack; no C tor transparent proxy |
+| TUN (post-1.0) | `netstack-smoltcp` (in-house engine) + platform TUN | — | Rust userspace TCP/IP stack; no C tor transparent proxy; no external `tun2proxy` |
 | Packaging | Tauri bundler + platform packaging | — | DMG, MSI/NSIS, deb/rpm/AppImage |
 | Updates | Tauri updater with signed manifest | — | Signature verification, staged rollout |
 | CI | GitHub Actions matrix (macOS/Windows/Linux) | — | Cross-platform build/test/sign |
@@ -421,7 +421,7 @@ Use the `directories` crate and platform conventions:
 | SOCKS5 | Arti's built-in SOCKS proxy | `127.0.0.1:9050` | Loopback only by default; optional all-interfaces with warning |
 | HTTP CONNECT | Arti's built-in HTTP proxy | `127.0.0.1:8118` | For apps that only speak HTTP proxy |
 | DNS | Arti's DNS proxy | `127.0.0.1:9053` | UDP + TCP; `.onion` resolution; optional system DNS later |
-| Transparent/TUN | `tun2proxy` + TUN device | off | Post-1.0, privileged helper |
+| Transparent/TUN | `netstack-smoltcp` (in-house engine) + TUN device | off | Post-1.0, privileged helper |
 | System proxy | Platform adapter | off | Best-effort; not all apps honor it |
 | Proxy env vars | Launch environment / `environment.d` | off | `ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` |
 | Outbound proxy | Arti `ChannelConfig::outbound_proxy` | none | HTTP CONNECT / SOCKS; Shadowsocks via local `sslocal` sidecar |
@@ -1074,7 +1074,7 @@ Deliverables:
 
 - Privileged helper per OS with a minimal, audited protocol.
 - TUN device creation, route/DNS configuration, teardown.
-- `tun2proxy` integration; TCP forwarding; DNS interception; UDP policy.
+- `netstack-smoltcp` routing engine (in-house `tobro-helper::engine`, no external `tun2proxy`); TCP forwarding; DNS interception; UDP policy.
 - Split tunneling by destination CIDR/domain; UI and validation.
 - Kill switch with fail-closed behavior and a persistent journal for crash recovery.
 - Leak test suite: DNS, IPv6, QUIC/UDP, route changes, sleep/wake, helper crash.
@@ -1082,7 +1082,7 @@ Deliverables:
 
 Exit criteria:
 
-- All TCP traffic routes through Tor in TUN mode; DNS leaks are zero in the test suite.
+- No traffic escapes in TUN mode; tunneled TCP reaches the forwarding target and DNS is intercepted (no DNS/IPv6/QUIC leaks) in the test suite. "no escape + reaches forwarder," not a separate real-Tor assertion. Tor-routing itself is verified separately by `tobrod`/`tobro-tor` (Arti) tests.
 - Killing the daemon/helper restores networking or blocks it per the chosen policy.
 - Helper passes a security review; no arbitrary command execution surface.
 - Uninstall removes the helper, routes, and DNS settings.

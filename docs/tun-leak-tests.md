@@ -8,6 +8,12 @@ through ordinary host sockets — no mocks, no shortcuts. A fake daemon
 that escapes the tunnel is observable instead of silently reaching the
 internet.
 
+**Scope (honest):** proves **"no escape + reaches forwarder"**, not that the
+forwarder routes through **Tor**. The fake daemon is not Tor; all-tunneled
+TCP reaching it + no physical egress + DNS interception + kill switch are
+what is asserted. **Tor-routing is verified separately by `tobrod` /
+`tobro-tor` (Arti) tests**, not a real-Tor run here.
+
 ## What it covers
 
 | Scenario | Leak class it rules out |
