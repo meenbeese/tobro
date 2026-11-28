@@ -200,6 +200,24 @@ pub enum KillSwitchMode {
     Block,
 }
 
+impl KillSwitchMode {
+    /// Whether a tunnel loss (the daemon or helper being killed, the device
+    /// disappearing) must leave traffic **blocked** rather than restoring
+    /// normal networking. This is the kill-switch policy reading of
+    /// `Killing the daemon/helper restores networking or blocks it per the
+    /// chosen policy`: `block` fails closed, `restore`/`disabled` restore.
+    pub fn blocks_on_tunnel_loss(self) -> bool {
+        matches!(self, KillSwitchMode::Block)
+    }
+
+    /// Whether a tunnel loss must restore pre-tunnel networking. Inverse of
+    /// [`KillSwitchMode::blocks_on_tunnel_loss`]; `disabled` restores because
+    /// no kill switch was installed to hold anything blocked.
+    pub fn restores_on_tunnel_loss(self) -> bool {
+        !self.blocks_on_tunnel_loss()
+    }
+}
+
 /// A validated IP prefix (`addr/prefix_len`) with host bits zeroed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1175,5 +1193,15 @@ mod tests {
         )
         .expect("decodes");
         assert!(hostile.validate().is_err());
+    }
+
+    #[test]
+    fn kill_switch_policy_for_tunnel_loss() {
+        assert!(KillSwitchMode::Block.blocks_on_tunnel_loss());
+        assert!(!KillSwitchMode::Block.restores_on_tunnel_loss());
+        assert!(!KillSwitchMode::Restore.blocks_on_tunnel_loss());
+        assert!(KillSwitchMode::Restore.restores_on_tunnel_loss());
+        assert!(!KillSwitchMode::Disabled.blocks_on_tunnel_loss());
+        assert!(KillSwitchMode::Disabled.restores_on_tunnel_loss());
     }
 }

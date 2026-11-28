@@ -227,6 +227,37 @@ where
 /// Best-effort teardown before the helper stops. Only acts when a plan is
 /// still applied (e.g. the daemon vanished without a teardown); otherwise a
 /// no-op.
+/// The daemon went away (killed / vanished) without an explicit teardown.
+///
+/// Per the kill-switch policy of the applied plan, tunnel loss either
+/// **restores** pre-tunnel networking or leaves it **blocked**:
+///
+/// - `KillSwitchMode::Block`: fail closed. The applied routes, DNS, TUN
+///   device, and kill-switch enforcement are left in place; forwarding has
+///   no daemon to reach, so nothing escapes. No teardown. (Recovered by a
+///   re-applied plan or an explicit teardown.)
+/// - `restore`/`disabled`: restore normal networking via teardown.
+async fn conclude_on_disconnect<P: Platform>(service: &mut HelperService<P>, reason: &str) {
+    if !service.state().active {
+        return;
+    }
+    if service.state().kill_switch.blocks_on_tunnel_loss() {
+        tracing::warn!(
+            "daemon lost ({reason}); kill switch=block -> staying fail-closed, not restoring"
+        );
+        return;
+    }
+    // restore policy: best-effort teardown (same as an explicit teardown).
+    match service.handle(HelperRequest::Teardown {}).await {
+        HelperResponse::TornDown { .. } => {
+            tracing::info!("torn down before exit ({reason})");
+        }
+        other => {
+            tracing::warn!("teardown before exit ({reason}) did not complete: {other:?}");
+        }
+    }
+}
+
 async fn teardown_if_active<P: Platform>(service: &mut HelperService<P>, reason: &str) {
     if !service.state().active {
         return;
@@ -261,11 +292,13 @@ pub async fn serve_unix<P: Platform>(
                 return exit;
             }
             exit = idle_window(idle) => {
-                teardown_if_active(service, "idle timeout").await;
+                // No client within the idle window: if a plan is applied the
+                // daemon is gone; conclude per kill-switch policy.
+                conclude_on_disconnect(service, "idle timeout").await;
                 return exit;
             }
             _exit = disconnect_window(service.state().active) => {
-                teardown_if_active(service, "daemon disconnect grace").await;
+                conclude_on_disconnect(service, "daemon disconnect grace").await;
                 return ServeExit::DisconnectTimeout;
             }
             accepted = listener.accept() => {
@@ -345,12 +378,12 @@ pub async fn serve_windows<P: Platform>(
             }
             exit = idle_window(idle) => {
                 drop(server);
-                teardown_if_active(service, "idle timeout").await;
+                conclude_on_disconnect(service, "idle timeout").await;
                 return exit;
             }
             _exit = disconnect_window(service.state().active) => {
                 drop(server);
-                teardown_if_active(service, "daemon disconnect grace").await;
+                conclude_on_disconnect(service, "daemon disconnect grace").await;
                 return ServeExit::DisconnectTimeout;
             }
             connected = server.connect() => {
@@ -430,6 +463,118 @@ pub async fn shutdown_signal() -> ServeExit {
         tracing::warn!("ctrl_c registration failed; relying on service stop");
     }
     ServeExit::ShutdownSignal
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod conclude_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tobro_tun::{DnsConfig, KillSwitchMode, Prefix, RouteSpec, TunDevice, TunnelPlan};
+
+    /// Minimal platform that records `teardown` calls; applies always succeed.
+    #[derive(Default)]
+    struct RecordingPlatform {
+        teardowns: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Platform for RecordingPlatform {
+        async fn create_device(
+            &self,
+            _device: &TunDevice,
+        ) -> Result<crate::platform::CreatedDevice, crate::platform::PlatformError> {
+            Ok(crate::platform::CreatedDevice {
+                interface: "tobro0".to_owned(),
+                packet_io: None,
+            })
+        }
+        async fn apply_routes(
+            &self,
+            _interface: &str,
+            _routes: &[RouteSpec],
+            _bypass_routes: &[RouteSpec],
+        ) -> Result<(), crate::platform::PlatformError> {
+            Ok(())
+        }
+        async fn apply_dns(&self, _dns: &DnsConfig) -> Result<(), crate::platform::PlatformError> {
+            Ok(())
+        }
+        async fn apply_kill_switch(
+            &self,
+            _mode: KillSwitchMode,
+            _bypass_routes: &[RouteSpec],
+        ) -> Result<(), crate::platform::PlatformError> {
+            Ok(())
+        }
+        async fn teardown(&self) -> Result<(), crate::platform::PlatformError> {
+            *self.teardowns.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn plan(kill_switch: KillSwitchMode) -> TunnelPlan {
+        TunnelPlan {
+            device: TunDevice {
+                name: "tobro0".to_owned(),
+                addresses: vec![Prefix {
+                    addr: "10.111.222.252".parse().unwrap(),
+                    prefix_len: 30,
+                }],
+                mtu: tobro_tun::DEFAULT_TUN_MTU,
+            },
+            routes: Vec::new(),
+            bypass_routes: Vec::new(),
+            dns: DnsConfig {
+                servers: vec!["9.9.9.9".parse().unwrap()],
+            },
+            kill_switch,
+            udp_policy: tobro_tun::UdpPolicy::default(),
+            forwarding: None,
+        }
+    }
+
+    async fn active_service(kill_switch: KillSwitchMode) -> HelperService<RecordingPlatform> {
+        let mut service = HelperService::new(RecordingPlatform::default());
+        let resp = service
+            .handle(HelperRequest::ApplyPlan {
+                plan: plan(kill_switch),
+            })
+            .await;
+        assert!(matches!(resp, HelperResponse::Applied { .. }), "{resp:?}");
+        assert!(service.state().active);
+        service
+    }
+
+    // killing the daemon + restore -> teardown/restore, kill switch cleared.
+    #[tokio::test]
+    async fn killing_daemon_with_restore_tears_down() {
+        let mut service = active_service(KillSwitchMode::Restore).await;
+        let before = service.platform().teardowns.lock().unwrap().clone();
+        conclude_on_disconnect(&mut service, "test").await;
+        assert_eq!(*service.platform().teardowns.lock().unwrap(), before + 1);
+        assert!(!service.state().active);
+        assert_eq!(service.state().kill_switch, KillSwitchMode::Disabled);
+    }
+
+    // killing the daemon + block -> NO teardown; stays fail-closed.
+    #[tokio::test]
+    async fn killing_daemon_with_block_does_not_tear_down() {
+        let mut service = active_service(KillSwitchMode::Block).await;
+        let before = service.platform().teardowns.lock().unwrap().clone();
+        conclude_on_disconnect(&mut service, "test").await;
+        assert_eq!(*service.platform().teardowns.lock().unwrap(), before);
+        // kill-switch policy still recorded; nothing restored.
+        assert_eq!(service.state().kill_switch, KillSwitchMode::Block);
+    }
+
+    // inactive service: concluding is a no-op (no teardown).
+    #[tokio::test]
+    async fn conclude_when_inactive_is_noop() {
+        let mut service = HelperService::new(RecordingPlatform::default());
+        conclude_on_disconnect(&mut service, "test").await;
+        assert_eq!(*service.platform().teardowns.lock().unwrap(), 0);
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -109,6 +109,21 @@ pub trait Platform: Send + Sync {
     /// kill switch. Must be safe to call repeatedly (idempotent) and must
     /// restore the pre-helper state even after partial failures.
     async fn teardown(&self) -> Result<(), PlatformError>;
+
+    /// Recover after a killing process left state behind.
+    ///
+    /// Called on a freshly constructed backend at startup (a restarted
+    /// helper) and from the watchdog child that survives a killed helper.
+    /// Uses the persistent [`crate::recovery`] journal. Per the kill-switch
+    /// policy recorded there, a tunnel lost because the daemon or helper was
+    /// killed **restores** pre-tunnel networking (`restore`/`disabled`) or
+    /// stays **blocked** (`block`); in-memory state is gone, but anything
+    /// still applied in the kernel is only undone when restoring.
+    ///
+    /// Best-effort and idempotent; a no-op when nothing was left applied.
+    async fn recover_on_startup(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
 }
 
 /// Placeholder backend (M7 T3): the protocol works end-to-end, but every

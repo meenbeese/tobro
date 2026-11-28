@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tobro_tun::KillSwitchMode;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryJournal {
@@ -16,6 +17,11 @@ pub struct RecoveryJournal {
     pub mac_dns_backup: Option<Option<Vec<u8>>>,
     /// Whether persistent block-all enforcement was requested.
     pub block_all: bool,
+    /// The kill-switch policy of the applied plan, persisted so a killing
+    /// process's recovery (a restarted helper or a watchdog child) knows
+    /// whether a torn-down tunnel must restore networking or stay blocked.
+    #[serde(default)]
+    pub kill_switch: KillSwitchMode,
 }
 
 fn journal_path() -> Option<PathBuf> {
@@ -54,6 +60,10 @@ pub fn load() -> RecoveryJournal {
 }
 
 pub fn save(journal: &RecoveryJournal) -> Result<(), String> {
+    // Unit tests must never touch the real root-owned journal.
+    if cfg!(test) {
+        return Ok(());
+    }
     let Some(path) = journal_path() else {
         return Ok(());
     };
@@ -79,6 +89,10 @@ pub fn save(journal: &RecoveryJournal) -> Result<(), String> {
 }
 
 pub fn clear() -> Result<(), String> {
+    // Unit tests must never remove a real root-owned journal.
+    if cfg!(test) {
+        return Ok(());
+    }
     let Some(path) = journal_path() else {
         return Ok(());
     };
@@ -86,5 +100,29 @@ pub fn clear() -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("could not remove recovery journal: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn kill_switch_policy_round_trips_and_defaults() {
+        // New field; an old journal without it still loads as `disabled`.
+        let old = r#"{"linux_resolv_conf":null,"mac_dns_backup":null,"block_all":true}"#;
+        let parsed: RecoveryJournal = serde_json::from_str(old).expect("old journal loads");
+        assert!(parsed.block_all);
+        assert_eq!(parsed.kill_switch, KillSwitchMode::Disabled);
+
+        let blocked = RecoveryJournal {
+            block_all: true,
+            kill_switch: KillSwitchMode::Block,
+            ..RecoveryJournal::default()
+        };
+        let json = serde_json::to_string(&blocked).expect("serialize");
+        let back: RecoveryJournal = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, blocked);
     }
 }

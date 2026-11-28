@@ -605,4 +605,20 @@ impl Platform for WindowsPlatform {
         let _ = crate::recovery::clear();
         Ok(())
     }
+
+    async fn recover_on_startup(&self) -> Result<(), PlatformError> {
+        let journal = crate::recovery::load();
+        if !journal.block_all {
+            // Windows DNS is adapter-scoped and disappears with the wintun
+            // adapter when the killed helper's handles close; nothing to
+            // restore. Just clear a stale journal.
+            let _ = crate::recovery::clear();
+            return Ok(());
+        }
+        // `block`: WFP filters are not tied to the helper process and
+        // survive it; stay fail-closed until a re-applied plan or teardown.
+        let _ = crate::recovery::save(&journal);
+        tracing::info!("recover_on_startup: kill switch remains fail-closed (block policy)");
+        Ok(())
+    }
 }

@@ -50,6 +50,7 @@ pub mod platform_windows;
 pub mod recovery;
 pub mod service;
 pub mod session;
+pub mod watchdog;
 
 pub use platform::{NullPlatform, Platform, PlatformError};
 #[cfg(target_os = "linux")]
@@ -78,24 +79,43 @@ pub type ActivePlatform = NullPlatform;
 
 /// Construct the active backend, failing fast on OS-level setup errors
 /// (e.g. netlink unavailable).
+///
+/// On a freshly started helper this also runs [`Platform::recover_on_startup`]
+/// against the persistent [`recovery`] journal, restoring pre-tunnel
+/// networking — or holding it blocked, per the kill-switch policy — after a
+/// killing daemon/helper left state applied. Recovery is best-effort: a
+/// recovery error is logged, never fatal, so the helper can still serve.
 #[cfg(target_os = "linux")]
-pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
-    LinuxPlatform::connect()
+pub async fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    let platform = LinuxPlatform::connect()?;
+    recover_or_log(&platform).await;
+    Ok(platform)
 }
 
 #[cfg(target_os = "macos")]
-pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
-    Ok(MacosPlatform::new())
+pub async fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    let platform = MacosPlatform::new();
+    recover_or_log(&platform).await;
+    Ok(platform)
 }
 
 #[cfg(target_os = "windows")]
-pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
-    Ok(WindowsPlatform::new())
+pub async fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+    let platform = WindowsPlatform::new();
+    recover_or_log(&platform).await;
+    Ok(platform)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
+pub async fn new_active_platform() -> Result<ActivePlatform, PlatformError> {
     Ok(NullPlatform)
+}
+
+/// Run startup recovery, logging rather than failing on a best-effort error.
+async fn recover_or_log<P: Platform + ?Sized>(platform: &P) {
+    if let Err(error) = platform.recover_on_startup().await {
+        tracing::warn!("startup recovery did not complete: {error}");
+    }
 }
 
 use clap::Parser;
@@ -132,6 +152,11 @@ pub struct Args {
     #[cfg(windows)]
     #[arg(long)]
     pub allow_sid: Option<String>,
+    /// Internal: run as a killing-process watchdog, not as a serving helper.
+    /// Spawned by the real helper; reads EOF on an inherited pipe to learn
+    /// the parent is gone, then recovers per policy. Not for direct use.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub watchdog: bool,
 }
 
 /// Initialize stderr logging. EnvFilter honors `RUST_LOG`; never log

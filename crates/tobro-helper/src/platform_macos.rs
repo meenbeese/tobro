@@ -679,6 +679,30 @@ impl Platform for MacosPlatform {
         );
         Ok(())
     }
+
+    async fn recover_on_startup(&self) -> Result<(), PlatformError> {
+        let journal = crate::recovery::load();
+        if journal.mac_dns_backup.is_none() && !journal.block_all {
+            return Ok(()); // nothing was left applied
+        }
+        // `block`: PF fail-closed rules are not helper-owned references (the
+        // reference dies with the process); stay blocked, do NOT restore.
+        if journal.block_all {
+            tracing::info!("recover_on_startup: kill switch remains fail-closed (block policy)");
+            return Ok(());
+        }
+        // restore/disabled: a killed process cannot restore itself; the utun
+        // interface and its device routes are removed by the kernel, but
+        // system DNS was rewritten and must be put back from the journal.
+        let backup = journal.mac_dns_backup.clone();
+        let restore = sc_blocking(move || tobro_osapi::sc_dns::restore_dns(backup)).await;
+        if let Err(error) = restore {
+            tracing::warn!("recover_on_startup: {error}");
+        }
+        let _ = crate::recovery::clear();
+        tracing::info!("recover_on_startup: pre-tunnel networking restored");
+        Ok(())
+    }
 }
 
 /// Real-host integration test: needs root and a real macOS host (run with

@@ -138,6 +138,15 @@ impl<P: Platform> HelperService<P> {
         {
             return self.reject(error).await;
         }
+        // Persist the kill-switch policy so a killing daemon/helper is
+        // recovered per the chosen policy (restore vs block) from the
+        // durable journal, not just in-memory state.
+        {
+            let mut journal = crate::recovery::load();
+            journal.kill_switch = plan.kill_switch;
+            journal.block_all = plan.kill_switch.blocks_on_tunnel_loss();
+            let _ = crate::recovery::save(&journal);
+        }
         // The engine consumes the device; on failure the device is dropped
         // and the rollback below tears the system back down.
         if let Err(error) = self.start_engine(created, &plan) {
@@ -250,6 +259,9 @@ impl<P: Platform> HelperService<P> {
                 self.state.kill_switch = KillSwitchMode::Disabled;
                 self.state.applied_at_ms = None;
                 self.last_plan = None;
+                // Explicit teardown ends any kill-switch hold: clear the
+                // durable policy so a later killing process cannot re-apply it.
+                let _ = crate::recovery::clear();
                 tracing::info!("teardown: ok (generation {})", self.state.generation);
                 HelperResponse::TornDown {
                     generation: self.state.generation,

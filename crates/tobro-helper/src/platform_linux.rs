@@ -740,6 +740,45 @@ impl Platform for LinuxPlatform {
         );
         Ok(())
     }
+
+    async fn recover_on_startup(&self) -> Result<(), PlatformError> {
+        let journal = crate::recovery::load();
+        // Nothing was left applied: a clean or already-recovered start.
+        if journal.linux_resolv_conf.is_none() && !journal.block_all {
+            return Ok(());
+        }
+        // Per policy: `block` (killing process under a fail-closed kill
+        // switch) stays blocked — do NOT restore networking. Blackholes are
+        // not device-bound and survive the killed helper. (And nothing must
+        // be torn down here; a re-applied plan or explicit teardown clears.)
+        if journal.block_all {
+            tracing::info!("recover_on_startup: kill switch remains fail-closed (block policy)");
+            return Ok(());
+        }
+        // restore/disabled: a killed process cannot restore itself; the TUN
+        // interface and its device routes are removed by the kernel, but
+        // `/etc/resolv.conf` was rewritten and must be put back from the
+        // persistent journal.
+        match &journal.linux_resolv_conf {
+            Some(Some(original)) => match write_resolv_conf(original) {
+                Ok(()) => tracing::info!("recover_on_startup: resolver configuration restored"),
+                Err(error) => {
+                    tracing::warn!("recover_on_startup: could not restore resolver: {error}")
+                }
+            },
+            Some(None) => {
+                if let Err(error) = std::fs::remove_file(RESOLV_CONF_PATH) {
+                    tracing::warn!(
+                        "recover_on_startup: could not remove generated resolver config: {error}"
+                    );
+                }
+            }
+            None => {}
+        }
+        let _ = crate::recovery::clear();
+        tracing::info!("recover_on_startup: pre-tunnel networking restored");
+        Ok(())
+    }
 }
 
 impl LinuxPlatform {

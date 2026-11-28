@@ -1049,11 +1049,13 @@ async fn helper_crash(config: &HarnessConfig) -> Result<ScenarioRun> {
 
 async fn daemon_crash(config: &HarnessConfig) -> Result<ScenarioRun> {
     run_body!(config, "daemon-crash", |session, checks| {
+        // Killing the daemon restores networking only under `restore`
+        // (and `disabled`); under `block` it would stay fail-closed.
         let plan = plan::build(
             Routing::TestPrefixes,
             UdpMode::DnsOnly,
             Some(forwarding(session)),
-            KillSwitchMode::Block,
+            KillSwitchMode::Restore,
         );
         session.apply(&plan).await?;
         let echoed = crate::traffic::tcp_echo(

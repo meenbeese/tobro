@@ -14,6 +14,11 @@ use tobro_tun::default_endpoint;
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    // Watchdog child mode: not a serving helper. Recover once the parent
+    // (our stdin pipe) is gone, then exit. No logging to the daemon, no IPC.
+    if args.watchdog {
+        return tobro_helper::watchdog::run_child();
+    }
     init_logging();
     let endpoint = args
         .socket
@@ -27,6 +32,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Killing this process runs no cleanup in-process; a surviving watchdog
+    // child recovers (or holds blocked) per policy once we are gone. Kept
+    // alive until `main` returns; dropping it closes the pipe.
+    let _watchdog = tobro_helper::watchdog::spawn();
     let exit = runtime.block_on(run(endpoint, &args));
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     exit
@@ -36,7 +45,7 @@ fn main() -> ExitCode {
 async fn run(endpoint: PathBuf, args: &Args) -> ExitCode {
     let idle =
         (args.idle_exit_secs > 0).then(|| std::time::Duration::from_secs(args.idle_exit_secs));
-    let platform = match new_active_platform() {
+    let platform = match new_active_platform().await {
         Ok(platform) => platform,
         Err(error) => {
             tracing::error!("could not initialize the platform backend: {error}");
